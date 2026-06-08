@@ -1,0 +1,2 @@
+drop table if exists knowledge_base_dataset_configuration_snapshots;
+drop table if exists knowledge_base_dataset_configurations;

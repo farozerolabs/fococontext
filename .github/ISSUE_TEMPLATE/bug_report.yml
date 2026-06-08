@@ -1,0 +1,94 @@
+name: Bug report
+description: Report a reproducible product, API, runtime, or documentation bug.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please include enough detail for another contributor to reproduce it.
+        Do not include real API keys, passwords, private documents, tenant data, or exploit details.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+      placeholder: Describe the failing behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest workflow that reproduces the issue.
+      placeholder: |
+        1. Start the stack with ...
+        2. Call ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: What should have happened?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: Include error messages, status codes, or UI state when useful.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - API
+        - Worker / ingest
+        - Retrieval
+        - Graph
+        - Parser
+        - Admin Console
+        - SDK
+        - Docker / deployment
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Share versions and runtime details that affect the issue.
+      placeholder: |
+        FocoContext version or commit:
+        Deployment: Docker Compose / source development / other
+        OS:
+        Node / pnpm:
+        Browser:
+        Model provider:
+        Storage provider:
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Redact secrets before posting.
+      render: shell
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and discussions.
+          required: true
+        - label: I removed secrets, credentials, private documents, and tenant data from this report.
+          required: true

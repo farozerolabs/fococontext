@@ -1,0 +1,133 @@
+# Copy this file to docker-compose.yml for release deployment from published images
+# when OCR should stay optional on constrained hosts.
+# Set FOCOCONTEXT_IMAGE_TAG to pin a released version.
+# Set FOCOCONTEXT_IMAGE_NAMESPACE only when using a custom image registry namespace.
+name: fococontext
+
+x-fococontext-env: &fococontext-env
+  # Runtime provider settings and concurrency values live
+  # in the env file and are shared by API, Worker, Admin, and optional OCR.
+  env_file:
+    - ${FOCOCONTEXT_ENV_FILE:-.env}
+
+services:
+  api:
+    <<: *fococontext-env
+    image: "${FOCOCONTEXT_IMAGE_NAMESPACE:-ghcr.io/farozerolabs}/fococontext-api:${FOCOCONTEXT_IMAGE_TAG:?Set FOCOCONTEXT_IMAGE_TAG to a released Docker image tag, for example 0.1.0}"
+    environment:
+      OCR_ENABLED: ${OCR_ENABLED:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${FOCOCONTEXT_BIND_HOST:-127.0.0.1}:${FOCOCONTEXT_API_PORT:-18080}:${FOCOCONTEXT_API_PORT:-18080}"
+    volumes:
+      - ${FOCOCONTEXT_SOURCE_WATCH_HOST_DIR:-./examples/source-watch}:${FOCOCONTEXT_SOURCE_WATCH_CONTAINER_DIR:-/source-watch}:ro
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "const port=process.env.FOCOCONTEXT_API_PORT||'18080';fetch('http://127.0.0.1:'+port+'/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  worker:
+    <<: *fococontext-env
+    image: "${FOCOCONTEXT_IMAGE_NAMESPACE:-ghcr.io/farozerolabs}/fococontext-worker:${FOCOCONTEXT_IMAGE_TAG:?Set FOCOCONTEXT_IMAGE_TAG to a released Docker image tag, for example 0.1.0}"
+    environment:
+      OCR_ENABLED: ${OCR_ENABLED:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/fococontext-worker-ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  ocr-service:
+    <<: *fococontext-env
+    profiles:
+      - ocr
+    image: "${FOCOCONTEXT_IMAGE_NAMESPACE:-ghcr.io/farozerolabs}/fococontext-ocr-service:${FOCOCONTEXT_IMAGE_TAG:?Set FOCOCONTEXT_IMAGE_TAG to a released Docker image tag, for example 0.1.0}"
+    expose:
+      - "18082"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os,urllib.request;port=os.environ.get('OCR_SERVICE_PORT','18082');urllib.request.urlopen('http://127.0.0.1:'+port+'/health',timeout=5).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  admin:
+    <<: *fococontext-env
+    image: "${FOCOCONTEXT_IMAGE_NAMESPACE:-ghcr.io/farozerolabs}/fococontext-admin:${FOCOCONTEXT_IMAGE_TAG:?Set FOCOCONTEXT_IMAGE_TAG to a released Docker image tag, for example 0.1.0}"
+    environment:
+      OCR_ENABLED: ${OCR_ENABLED:-false}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${FOCOCONTEXT_BIND_HOST:-127.0.0.1}:${FOCOCONTEXT_ADMIN_PORT:-18081}:${FOCOCONTEXT_ADMIN_PORT:-18081}"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "const port=process.env.FOCOCONTEXT_ADMIN_PORT||'18081';fetch('http://127.0.0.1:'+port+'/').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+    ports:
+      - "${FOCOCONTEXT_BIND_HOST:-127.0.0.1}:${FOCOCONTEXT_POSTGRES_PORT:-18432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "${FOCOCONTEXT_BIND_HOST:-127.0.0.1}:${FOCOCONTEXT_REDIS_PORT:-18379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  postgres-data:
+  redis-data:

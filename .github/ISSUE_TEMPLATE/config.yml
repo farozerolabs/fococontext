@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://docs.fococontext.com
+    about: Read product concepts, integration flows, and self-hosting guidance.
+  - name: Security vulnerability
+    url: https://github.com/farozerolabs/fococontext/security/advisories/new
+    about: Report vulnerabilities privately. Do not open public issues with exploit details.

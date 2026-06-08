@@ -1,0 +1,21 @@
+{
+  "name": "@fococontext/worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/runtime.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@fococontext/contracts": "workspace:*",
+    "@fococontext/core": "workspace:*",
+    "@fococontext/db": "workspace:*",
+    "@fococontext/llm": "workspace:*",
+    "@fococontext/parsers": "workspace:*",
+    "@fococontext/storage": "workspace:*",
+    "bullmq": "^5.78.0",
+    "kysely": "0.29.2"
+  }
+}

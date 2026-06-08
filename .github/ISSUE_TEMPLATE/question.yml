@@ -1,0 +1,56 @@
+name: Question or integration help
+description: Ask about product behavior, integration patterns, deployment, or self-hosting.
+title: "[Question]: "
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for focused questions. For security issues, follow SECURITY.md instead of posting publicly.
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What are you trying to understand or integrate?
+      placeholder: Describe the goal, the current setup, and where you are stuck.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - API integration
+        - Admin Console
+        - Docker / self-hosting
+        - Models / embeddings / rerank
+        - Object storage
+        - Retrieval / graph
+        - SDK
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Share the relevant public configuration or workflow. Redact secrets.
+      placeholder: |
+        Version or commit:
+        Deployment:
+        Endpoint or command:
+        What you already tried:
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and discussions.
+          required: true
+        - label: I removed secrets, credentials, private documents, and tenant data from this question.
+          required: true

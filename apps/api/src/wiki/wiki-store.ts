@@ -1,0 +1,2661 @@
+import { sql, type Kysely } from "kysely";
+import { ApiError, createResourceId } from "@fococontext/contracts";
+import { requireKnowledgeBaseTenantProject, type DatabaseSchema } from "@fococontext/db";
+import {
+  EmbeddingIndexService,
+  createInMemoryRetrievalRepository,
+  type GraphInsightStatus,
+  type RetrievalEmbeddingObjectType,
+  type RetrievalEmbeddingProvider,
+  type RetrievalEmbeddingRecord,
+  type RetrievalKnowledgeBaseScopeRecord,
+  type RetrievalRepository,
+  type RetrievalSourceRef,
+  type RetrievalTraceRecord,
+  type RetrievalVisibilityOrigin,
+} from "@fococontext/retrieval";
+
+export const wikiStoreToken = Symbol("wikiStore");
+
+export interface WikiStore {
+  listPages(knowledgeBaseId: string): Promise<WikiPageApiRecord[]>;
+  getPage(pageId: string): Promise<WikiPageApiRecord>;
+  updatePage(pageId: string, input: UpdateWikiPageInput): Promise<Record<string, unknown>>;
+  listRelatedPages(pageId: string): Promise<Record<string, unknown>[]>;
+  listPageVersions(pageId: string): Promise<Record<string, unknown>[]>;
+  listKnowledgeBasePageVersions(knowledgeBaseId: string): Promise<Record<string, unknown>[]>;
+  listKnowledgeVersions(knowledgeBaseId: string): Promise<Record<string, unknown>[]>;
+  getChangeSet(changeSetId: string): Promise<Record<string, unknown>>;
+  applyChangeSet(changeSetId: string): Promise<Record<string, unknown>>;
+  discardChangeSet(changeSetId: string): Promise<Record<string, unknown>>;
+  getGraphInsightStatus(knowledgeBaseId: string): Promise<GraphInsightStatus>;
+  rollbackKnowledgeBase(
+    knowledgeBaseId: string,
+    input: RollbackKnowledgeBaseInput,
+  ): Promise<Record<string, unknown>>;
+  rollbackPage(pageId: string, input: RollbackPageInput): Promise<Record<string, unknown>>;
+  syncForkFromUpstream(input: SyncForkFromUpstreamInput): Promise<SyncForkFromUpstreamResult>;
+  loadRetrievalRepository(knowledgeBaseId: string): Promise<RetrievalRepository>;
+  rebuildRetrievalIndex(
+    knowledgeBaseId: string,
+    provider: RetrievalEmbeddingProvider,
+  ): Promise<RetrievalIndexStats>;
+  saveRetrievalTrace(trace: RetrievalTraceRecord): Promise<void>;
+}
+
+export interface RetrievalIndexStats {
+  indexedEdgeCount: number;
+  indexedEmbeddingCount: number;
+  indexedPageCount: number;
+}
+
+export interface WikiPageApiRecord {
+  id: string;
+  knowledge_base_id: string;
+  slug: string;
+  title: string;
+  type: string;
+  status: string;
+  current_version_id: string | null;
+  markdown: string;
+  frontmatter: Record<string, unknown>;
+  media_refs?: Record<string, unknown>[];
+  source_document_ids: string[];
+  source_refs?: Record<string, unknown>[];
+  wikilink_targets?: Record<string, unknown>[];
+  metadata: Record<string, unknown>;
+  visibility_origin?: RetrievalVisibilityOrigin;
+  owner_knowledge_base_id?: string | null;
+  upstream_resource_id?: string | null;
+  fork_tombstoned_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RetrievalSourceDocumentMetadata {
+  id: string;
+  name: string;
+  metadata: Record<string, unknown>;
+}
+
+export interface UpdateWikiPageInput {
+  title?: string;
+  markdown?: string;
+  frontmatter?: Record<string, unknown>;
+  summary?: string;
+}
+
+export interface RollbackKnowledgeBaseInput {
+  target_version_id?: string;
+  reason?: string;
+}
+
+export interface RollbackPageInput {
+  target_page_version_id?: string;
+  reason?: string;
+}
+
+export interface SyncForkFromUpstreamInput {
+  forkId: string;
+  upstreamKnowledgeBaseId: string;
+  sourceUpstreamVersionId: string | null;
+  targetUpstreamVersionId: string;
+  baseForkVersionId: string;
+  conflicts: readonly Record<string, unknown>[];
+}
+
+export interface SyncForkFromUpstreamResult {
+  changeSetId: string;
+  knowledgeVersionId: string;
+}
+
+interface ChangeSetRow {
+  id: string;
+  knowledge_base_id: string;
+  base_version_id: string | null;
+  target_version_id: string | null;
+  status: string;
+  trigger_type: string;
+  title: string;
+  description: string | null;
+  diff: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  applied_at: string | null;
+  discarded_at: string | null;
+}
+
+interface WikiDraftChangeContent {
+  title: string;
+  markdown: string;
+  tags: string[];
+  sources: Record<string, unknown>[];
+  metadata: Record<string, unknown>;
+}
+
+interface KnowledgeBaseScopeContext {
+  knowledgeBaseType: "canonical" | "fork";
+  upstreamKnowledgeBaseId: string | null;
+  upstreamSyncedVersionId: string | null;
+}
+
+export function createNoopWikiStore(): WikiStore {
+  return {
+    async listPages() {
+      return [];
+    },
+    async getPage() {
+      throw new ApiError("page_not_found");
+    },
+    async updatePage() {
+      throw new ApiError("page_not_found");
+    },
+    async listRelatedPages() {
+      return [];
+    },
+    async listPageVersions() {
+      return [];
+    },
+    async listKnowledgeBasePageVersions() {
+      return [];
+    },
+    async listKnowledgeVersions() {
+      return [];
+    },
+    async getChangeSet() {
+      throw new ApiError("invalid_request", {
+        messageKey: "api.validation.change_set_not_found",
+      });
+    },
+    async applyChangeSet(changeSetId: string) {
+      return { id: changeSetId, status: "applied" };
+    },
+    async discardChangeSet(changeSetId: string) {
+      return { id: changeSetId, status: "discarded" };
+    },
+    async getGraphInsightStatus() {
+      return createDefaultGraphInsightStatus();
+    },
+    async rollbackKnowledgeBase() {
+      throw new ApiError("version_not_found");
+    },
+    async rollbackPage() {
+      throw new ApiError("version_not_found");
+    },
+    async syncForkFromUpstream() {
+      return {
+        changeSetId: createResourceId("changeSet"),
+        knowledgeVersionId: createResourceId("knowledgeVersion"),
+      };
+    },
+    async loadRetrievalRepository() {
+      return createInMemoryRetrievalRepository();
+    },
+    async rebuildRetrievalIndex() {
+      return {
+        indexedEdgeCount: 0,
+        indexedEmbeddingCount: 0,
+        indexedPageCount: 0,
+      };
+    },
+    async saveRetrievalTrace() {},
+  };
+}
+
+export function createPostgresWikiStore(db: Kysely<DatabaseSchema>): WikiStore {
+  return new PostgresWikiStore(db);
+}
+
+class PostgresWikiStore implements WikiStore {
+  constructor(private readonly db: Kysely<DatabaseSchema>) {}
+
+  async listPages(knowledgeBaseId: string): Promise<WikiPageApiRecord[]> {
+    const scope = await this.getKnowledgeBaseScope(knowledgeBaseId);
+
+    if (scope.knowledgeBaseType === "fork" && scope.upstreamKnowledgeBaseId !== null) {
+      const result = await sql<WikiPageApiRecord>`
+        with fork_page_tombstones as (
+          select upstream_resource_id
+          from wiki_pages
+          where owner_knowledge_base_id = ${knowledgeBaseId}
+            and fork_tombstoned_at is not null
+            and upstream_resource_id is not null
+        )
+        select *
+        from (
+          select
+            wiki_pages.id,
+            ${knowledgeBaseId}::text as knowledge_base_id,
+            wiki_pages.slug,
+            wiki_pages.title,
+            wiki_pages.page_type as "type",
+            wiki_pages.status,
+            wiki_pages.current_version_id,
+            wiki_pages.markdown,
+            wiki_pages.frontmatter,
+            wiki_pages.source_document_ids,
+            coalesce(current_page_version.source_snapshot, '[]'::jsonb) as source_refs,
+            wiki_pages.metadata,
+            'upstream_inherited'::text as visibility_origin,
+            ${knowledgeBaseId}::text as owner_knowledge_base_id,
+            wiki_pages.id as upstream_resource_id,
+            null::timestamptz as fork_tombstoned_at,
+            wiki_pages.created_at,
+            wiki_pages.updated_at
+          from wiki_pages
+          left join wiki_page_versions current_page_version
+            on current_page_version.id = wiki_pages.current_version_id
+          where wiki_pages.knowledge_base_id = ${scope.upstreamKnowledgeBaseId}
+            and wiki_pages.owner_knowledge_base_id is null
+            and wiki_pages.deleted_at is null
+            and wiki_pages.fork_tombstoned_at is null
+            and not exists (
+              select 1
+              from fork_page_tombstones
+              where fork_page_tombstones.upstream_resource_id = wiki_pages.id
+            )
+          union all
+          select
+            wiki_pages.id,
+            ${knowledgeBaseId}::text as knowledge_base_id,
+            wiki_pages.slug,
+            wiki_pages.title,
+            wiki_pages.page_type as "type",
+            wiki_pages.status,
+            wiki_pages.current_version_id,
+            wiki_pages.markdown,
+            wiki_pages.frontmatter,
+            wiki_pages.source_document_ids,
+            coalesce(current_page_version.source_snapshot, '[]'::jsonb) as source_refs,
+            wiki_pages.metadata,
+            'fork_owned'::text as visibility_origin,
+            ${knowledgeBaseId}::text as owner_knowledge_base_id,
+            wiki_pages.upstream_resource_id,
+            wiki_pages.fork_tombstoned_at,
+            wiki_pages.created_at,
+            wiki_pages.updated_at
+          from wiki_pages
+          left join wiki_page_versions current_page_version
+            on current_page_version.id = wiki_pages.current_version_id
+          where (wiki_pages.knowledge_base_id = ${knowledgeBaseId}
+              or wiki_pages.owner_knowledge_base_id = ${knowledgeBaseId})
+            and wiki_pages.deleted_at is null
+            and wiki_pages.fork_tombstoned_at is null
+        ) visible_pages
+        order by updated_at desc, title asc
+      `.execute(this.db);
+
+      return result.rows.map(normalizePageRow);
+    }
+
+    const result = await sql<WikiPageApiRecord>`
+      select
+        wiki_pages.id,
+        wiki_pages.knowledge_base_id,
+        wiki_pages.slug,
+        wiki_pages.title,
+        wiki_pages.page_type as "type",
+        wiki_pages.status,
+        wiki_pages.current_version_id,
+        wiki_pages.markdown,
+        wiki_pages.frontmatter,
+        wiki_pages.source_document_ids,
+        coalesce(current_page_version.source_snapshot, '[]'::jsonb) as source_refs,
+        wiki_pages.metadata,
+        'canonical'::text as visibility_origin,
+        null::text as owner_knowledge_base_id,
+        null::text as upstream_resource_id,
+        null::timestamptz as fork_tombstoned_at,
+        wiki_pages.created_at,
+        wiki_pages.updated_at
+      from wiki_pages
+      left join wiki_page_versions current_page_version
+        on current_page_version.id = wiki_pages.current_version_id
+      where wiki_pages.knowledge_base_id = ${knowledgeBaseId}
+        and wiki_pages.owner_knowledge_base_id is null
+        and wiki_pages.fork_tombstoned_at is null
+        and wiki_pages.deleted_at is null
+      order by wiki_pages.updated_at desc, wiki_pages.title asc
+    `.execute(this.db);
+
+    return result.rows.map(normalizePageRow);
+  }
+
+  async getPage(pageId: string): Promise<WikiPageApiRecord> {
+    const result = await sql<WikiPageApiRecord>`
+      select
+        wiki_pages.id,
+        wiki_pages.knowledge_base_id,
+        wiki_pages.slug,
+        wiki_pages.title,
+        wiki_pages.page_type as "type",
+        wiki_pages.status,
+        wiki_pages.current_version_id,
+        wiki_pages.markdown,
+        wiki_pages.frontmatter,
+        wiki_pages.source_document_ids,
+        coalesce(current_page_version.source_snapshot, '[]'::jsonb) as source_refs,
+        wiki_pages.metadata,
+        wiki_pages.created_at,
+        wiki_pages.updated_at
+      from wiki_pages
+      left join wiki_page_versions current_page_version
+        on current_page_version.id = wiki_pages.current_version_id
+      where wiki_pages.id = ${pageId}
+        and wiki_pages.deleted_at is null
+    `.execute(this.db);
+    const page = result.rows[0];
+
+    if (page === undefined) {
+      throw new ApiError("page_not_found");
+    }
+
+    await this.assertKnowledgeBaseLive(page.knowledge_base_id);
+
+    return normalizePageRow(page);
+  }
+
+  async updatePage(pageId: string, input: UpdateWikiPageInput): Promise<Record<string, unknown>> {
+    const current = await this.getPage(pageId);
+    const title = input.title?.trim() || current.title;
+    const markdown = input.markdown ?? current.markdown;
+    const frontmatter = input.frontmatter ?? current.frontmatter;
+    const pageVersionId = createResourceId("pageVersion");
+    const changeSetId = createResourceId("changeSet");
+    const knowledgeVersionId = createResourceId("knowledgeVersion");
+    const pageVersionNumber = await this.nextPageVersionNumber(pageId);
+    const knowledgeVersionNumber = await this.nextKnowledgeVersionNumber(current.knowledge_base_id);
+    const baseVersionId = await this.currentKnowledgeVersionId(current.knowledge_base_id);
+    const now = new Date().toISOString();
+
+    await this.createAppliedChangeSet({
+      id: changeSetId,
+      knowledgeBaseId: current.knowledge_base_id,
+      baseVersionId,
+      targetVersionId: knowledgeVersionId,
+      title: input.summary ?? `Update ${title}`,
+      description: "Update Wiki Page through API.",
+      diff: {
+        before: { title: current.title, markdown: current.markdown },
+        after: { title, markdown },
+      },
+      now,
+    });
+    await this.insertPageVersion({
+      id: pageVersionId,
+      pageId,
+      knowledgeBaseId: current.knowledge_base_id,
+      knowledgeVersionId,
+      versionNumber: pageVersionNumber,
+      title,
+      markdown,
+      frontmatter,
+      createdBy: "api",
+      now,
+    });
+    await this.insertKnowledgeVersion({
+      id: knowledgeVersionId,
+      knowledgeBaseId: current.knowledge_base_id,
+      versionNumber: knowledgeVersionNumber,
+      summary: input.summary ?? `Updated ${title}.`,
+      changeSetId,
+      createdBy: "api",
+      now,
+    });
+    const visibility = await this.createWriteVisibilityMetadata(current.knowledge_base_id);
+
+    await sql`
+      update wiki_pages
+      set title = ${title},
+          markdown = ${markdown},
+          frontmatter = ${JSON.stringify(frontmatter)}::jsonb,
+          current_version_id = ${pageVersionId},
+          owner_knowledge_base_id = ${visibility.ownerKnowledgeBaseId},
+          visibility_origin = ${visibility.visibilityOrigin},
+          upstream_resource_id = coalesce(upstream_resource_id, null),
+          fork_tombstoned_at = null,
+          updated_at = ${now}
+      where id = ${pageId}
+    `.execute(this.db);
+    await this.updateKnowledgeBaseVersion(current.knowledge_base_id, knowledgeVersionId, now);
+    await this.insertChangeSetItem(changeSetId, "wiki_page", pageId, "update", {
+      before: { page_version_id: current.current_version_id },
+      after: { page_version_id: pageVersionId },
+    });
+    await this.recordGraphInsightRefresh(current.knowledge_base_id, changeSetId, now);
+
+    return {
+      page: await this.getPage(pageId),
+      change_set_id: changeSetId,
+      knowledge_version_id: knowledgeVersionId,
+      page_version_id: pageVersionId,
+    };
+  }
+
+  async listRelatedPages(pageId: string): Promise<Record<string, unknown>[]> {
+    await this.getPage(pageId);
+
+    const result = await sql<Record<string, unknown>>`
+      select
+        wiki_edges.id as edge_id,
+        wiki_edges.relation_type,
+        wiki_edges.weight,
+        wiki_edges.explanation,
+        wiki_edges.source_document_ids,
+        wiki_pages.id as page_id,
+        wiki_pages.title,
+        wiki_pages.page_type as type,
+        wiki_pages.current_version_id
+      from wiki_edges
+      join wiki_pages on wiki_pages.id = wiki_edges.to_page_id
+      where wiki_edges.from_page_id = ${pageId}
+      order by wiki_edges.weight desc
+    `.execute(this.db);
+
+    return result.rows;
+  }
+
+  async listPageVersions(pageId: string): Promise<Record<string, unknown>[]> {
+    await this.getPage(pageId);
+
+    const result = await sql<Record<string, unknown>>`
+      select
+        wiki_page_versions.id,
+        wiki_page_versions.id as page_version_id,
+        wiki_page_versions.page_id,
+        wiki_page_versions.knowledge_version_id,
+        wiki_page_versions.version_number,
+        wiki_page_versions.title,
+        wiki_page_versions.markdown,
+        wiki_page_versions.frontmatter,
+        wiki_page_versions.source_snapshot,
+        wiki_page_versions.prompt_version,
+        wiki_page_versions.created_by,
+        to_char(
+          wiki_page_versions.created_at at time zone 'UTC',
+          'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+        ) as created_at,
+        knowledge_versions.change_set_id,
+        knowledge_versions.summary,
+        change_sets.trigger_type as trigger,
+        (wiki_pages.current_version_id = wiki_page_versions.id) as is_current
+      from wiki_page_versions
+      join wiki_pages on wiki_pages.id = wiki_page_versions.page_id
+      left join knowledge_versions on knowledge_versions.id = wiki_page_versions.knowledge_version_id
+      left join change_sets on change_sets.id = knowledge_versions.change_set_id
+      where wiki_page_versions.page_id = ${pageId}
+      order by wiki_page_versions.version_number desc
+    `.execute(this.db);
+
+    return result.rows;
+  }
+
+  async listKnowledgeBasePageVersions(knowledgeBaseId: string): Promise<Record<string, unknown>[]> {
+    const scope = await this.getKnowledgeBaseScope(knowledgeBaseId);
+
+    if (scope.knowledgeBaseType === "fork" && scope.upstreamKnowledgeBaseId !== null) {
+      const result = await sql<Record<string, unknown>>`
+        with fork_page_tombstones as (
+          select upstream_resource_id
+          from wiki_pages
+          where owner_knowledge_base_id = ${knowledgeBaseId}
+            and fork_tombstoned_at is not null
+            and upstream_resource_id is not null
+        ),
+        visible_pages as (
+          select
+            wiki_pages.id,
+            ${knowledgeBaseId}::text as knowledge_base_id,
+            wiki_pages.slug,
+            wiki_pages.title,
+            wiki_pages.current_version_id
+          from wiki_pages
+          where wiki_pages.knowledge_base_id = ${scope.upstreamKnowledgeBaseId}
+            and wiki_pages.owner_knowledge_base_id is null
+            and wiki_pages.deleted_at is null
+            and wiki_pages.fork_tombstoned_at is null
+            and not exists (
+              select 1
+              from fork_page_tombstones
+              where fork_page_tombstones.upstream_resource_id = wiki_pages.id
+            )
+          union all
+          select
+            wiki_pages.id,
+            ${knowledgeBaseId}::text as knowledge_base_id,
+            wiki_pages.slug,
+            wiki_pages.title,
+            wiki_pages.current_version_id
+          from wiki_pages
+          where (wiki_pages.knowledge_base_id = ${knowledgeBaseId}
+              or wiki_pages.owner_knowledge_base_id = ${knowledgeBaseId})
+            and wiki_pages.deleted_at is null
+            and wiki_pages.fork_tombstoned_at is null
+        )
+        select
+          wiki_page_versions.id,
+          wiki_page_versions.id as page_version_id,
+          wiki_page_versions.page_id,
+          visible_pages.title as page_title,
+          visible_pages.slug as page_slug,
+          wiki_page_versions.knowledge_version_id,
+          wiki_page_versions.version_number,
+          wiki_page_versions.title,
+          wiki_page_versions.markdown,
+          wiki_page_versions.frontmatter,
+          wiki_page_versions.source_snapshot,
+          wiki_page_versions.prompt_version,
+          wiki_page_versions.created_by,
+          to_char(
+            wiki_page_versions.created_at at time zone 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+          ) as created_at,
+          knowledge_versions.change_set_id,
+          knowledge_versions.summary,
+          change_sets.trigger_type as trigger,
+          (visible_pages.current_version_id = wiki_page_versions.id) as is_current
+        from wiki_page_versions
+        join visible_pages on visible_pages.id = wiki_page_versions.page_id
+        left join knowledge_versions on knowledge_versions.id = wiki_page_versions.knowledge_version_id
+        left join change_sets on change_sets.id = knowledge_versions.change_set_id
+        order by wiki_page_versions.created_at desc, wiki_page_versions.id desc
+      `.execute(this.db);
+
+      return result.rows;
+    }
+
+    await this.assertKnowledgeBaseLive(knowledgeBaseId);
+
+    const result = await sql<Record<string, unknown>>`
+      select
+        wiki_page_versions.id,
+        wiki_page_versions.id as page_version_id,
+        wiki_page_versions.page_id,
+        wiki_pages.title as page_title,
+        wiki_pages.slug as page_slug,
+        wiki_page_versions.knowledge_version_id,
+        wiki_page_versions.version_number,
+        wiki_page_versions.title,
+        wiki_page_versions.markdown,
+        wiki_page_versions.frontmatter,
+        wiki_page_versions.source_snapshot,
+        wiki_page_versions.prompt_version,
+        wiki_page_versions.created_by,
+        to_char(
+          wiki_page_versions.created_at at time zone 'UTC',
+          'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+        ) as created_at,
+        knowledge_versions.change_set_id,
+        knowledge_versions.summary,
+        change_sets.trigger_type as trigger,
+        (wiki_pages.current_version_id = wiki_page_versions.id) as is_current
+      from wiki_page_versions
+      join wiki_pages on wiki_pages.id = wiki_page_versions.page_id
+      left join knowledge_versions on knowledge_versions.id = wiki_page_versions.knowledge_version_id
+      left join change_sets on change_sets.id = knowledge_versions.change_set_id
+      where wiki_pages.knowledge_base_id = ${knowledgeBaseId}
+        and wiki_pages.owner_knowledge_base_id is null
+        and wiki_pages.fork_tombstoned_at is null
+        and wiki_pages.deleted_at is null
+      order by wiki_page_versions.created_at desc, wiki_page_versions.id desc
+    `.execute(this.db);
+
+    return result.rows;
+  }
+
+  async listKnowledgeVersions(knowledgeBaseId: string): Promise<Record<string, unknown>[]> {
+    await this.assertKnowledgeBaseLive(knowledgeBaseId);
+
+    const result = await sql<Record<string, unknown>>`
+      select
+        knowledge_versions.id,
+        knowledge_versions.id as version_id,
+        knowledge_versions.knowledge_base_id,
+        knowledge_versions.version_number,
+        knowledge_versions.status,
+        knowledge_versions.summary,
+        knowledge_versions.change_set_id,
+        knowledge_versions.created_by,
+        to_char(
+          knowledge_versions.created_at at time zone 'UTC',
+          'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+        ) as created_at,
+        change_sets.trigger_type as trigger,
+        (knowledge_bases.current_version_id = knowledge_versions.id) as is_current
+      from knowledge_versions
+      join knowledge_bases on knowledge_bases.id = knowledge_versions.knowledge_base_id
+      left join change_sets on change_sets.id = knowledge_versions.change_set_id
+      where knowledge_versions.knowledge_base_id = ${knowledgeBaseId}
+      order by knowledge_versions.version_number desc
+    `.execute(this.db);
+
+    return result.rows;
+  }
+
+  async getChangeSet(changeSetId: string): Promise<Record<string, unknown>> {
+    const changeSet = await this.requireChangeSet(changeSetId);
+
+    await this.assertKnowledgeBaseLive(changeSet.knowledge_base_id);
+
+    return {
+      ...changeSet,
+      items: await this.listChangeSetItems(changeSetId),
+    };
+  }
+
+  async applyChangeSet(changeSetId: string): Promise<Record<string, unknown>> {
+    const changeSet = await this.requireChangeSet(changeSetId);
+    const now = new Date().toISOString();
+
+    await this.assertKnowledgeBaseLive(changeSet.knowledge_base_id);
+
+    if (changeSet.status === "applied") {
+      return this.getChangeSet(changeSetId);
+    }
+
+    if (readWikiDraftChangeContent(changeSet.diff) !== null) {
+      await this.applyWikiDraftChangeSet(changeSet, now);
+      await this.recordGraphInsightRefresh(changeSet.knowledge_base_id, changeSet.id, now);
+      return this.getChangeSet(changeSetId);
+    }
+
+    await sql`
+      update change_sets
+      set status = 'applied', applied_at = coalesce(applied_at, ${now})
+      where id = ${changeSetId}
+    `.execute(this.db);
+    await this.recordGraphInsightRefresh(changeSet.knowledge_base_id, changeSet.id, now);
+
+    return this.getChangeSet(changeSetId);
+  }
+
+  async getGraphInsightStatus(knowledgeBaseId: string): Promise<GraphInsightStatus> {
+    const result = await sql<{
+      error: Record<string, unknown> | null;
+      finished_at: string | null;
+      id: string;
+      progress_message: string | null;
+      queued_at: string;
+      started_at: string | null;
+      status: string;
+      updated_at: string;
+    }>`
+      select
+        id,
+        status,
+        progress_message,
+        error,
+        queued_at,
+        started_at,
+        finished_at,
+        updated_at
+      from jobs
+      where knowledge_base_id = ${knowledgeBaseId}
+        and job_type = 'graph.insights.refresh'
+      order by queued_at desc
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    if (row === undefined) {
+      return createDefaultGraphInsightStatus();
+    }
+
+    const state = toGraphInsightStatusState(row.status);
+
+    return {
+      failure_reason:
+        state === "failed" ? readFailureReason(row.error, row.progress_message) : null,
+      source_job_id: row.id,
+      started_at: row.started_at,
+      state,
+      updated_at: row.finished_at ?? row.updated_at ?? row.queued_at,
+    };
+  }
+
+  async discardChangeSet(changeSetId: string): Promise<Record<string, unknown>> {
+    const now = new Date().toISOString();
+    const changeSet = await this.requireChangeSet(changeSetId);
+
+    await this.assertKnowledgeBaseLive(changeSet.knowledge_base_id);
+
+    await sql`
+      update change_sets
+      set status = 'discarded', discarded_at = coalesce(discarded_at, ${now})
+      where id = ${changeSetId}
+    `.execute(this.db);
+
+    return this.getChangeSet(changeSetId);
+  }
+
+  async rollbackKnowledgeBase(
+    knowledgeBaseId: string,
+    input: RollbackKnowledgeBaseInput,
+  ): Promise<Record<string, unknown>> {
+    await this.assertKnowledgeBaseLive(knowledgeBaseId);
+
+    const targetVersionId = readRequired(input.target_version_id, "target_version_id");
+    const target = await this.requireKnowledgeVersion(targetVersionId);
+    const currentVersionId = await this.currentKnowledgeVersionId(knowledgeBaseId);
+    const changeSetId = createResourceId("changeSet");
+    const rollbackId = `rb_${cryptoSafeId()}`;
+    const knowledgeVersionId = createResourceId("knowledgeVersion");
+    const versionNumber = await this.nextKnowledgeVersionNumber(knowledgeBaseId);
+    const now = new Date().toISOString();
+
+    if (target.knowledge_base_id !== knowledgeBaseId) {
+      throw new ApiError("version_not_found");
+    }
+
+    await this.createAppliedChangeSet({
+      id: changeSetId,
+      knowledgeBaseId,
+      baseVersionId: currentVersionId,
+      targetVersionId: knowledgeVersionId,
+      title: "Roll back Knowledge Base",
+      description: input.reason ?? "Rollback requested through API.",
+      diff: { target_version_id: targetVersionId },
+      now,
+    });
+    await this.insertKnowledgeVersion({
+      id: knowledgeVersionId,
+      knowledgeBaseId,
+      versionNumber,
+      summary: input.reason ?? "Knowledge Base rollback.",
+      changeSetId,
+      createdBy: "api",
+      now,
+    });
+    const visibility = await this.createWriteVisibilityMetadata(knowledgeBaseId);
+
+    await sql`
+      insert into rollback_records (
+        id,
+        knowledge_base_id,
+        source_version_id,
+        target_version_id,
+        change_set_id,
+        rollback_type,
+        reason,
+        metadata,
+        owner_knowledge_base_id,
+        visibility_origin,
+        upstream_resource_id,
+        fork_tombstoned_at,
+        created_at
+      )
+      values (
+        ${rollbackId},
+        ${knowledgeBaseId},
+        ${currentVersionId},
+        ${targetVersionId},
+        ${changeSetId},
+        'knowledge_base',
+        ${input.reason ?? null},
+        ${JSON.stringify({ created_knowledge_version_id: knowledgeVersionId })}::jsonb,
+        ${visibility.ownerKnowledgeBaseId},
+        ${visibility.visibilityOrigin},
+        null,
+        null,
+        ${now}
+      )
+    `.execute(this.db);
+    await this.updateKnowledgeBaseVersion(knowledgeBaseId, knowledgeVersionId, now);
+    await this.recordGraphInsightRefresh(knowledgeBaseId, changeSetId, now);
+
+    return {
+      rollback_id: rollbackId,
+      change_set_id: changeSetId,
+      knowledge_version_id: knowledgeVersionId,
+      source_knowledge_version_id: currentVersionId,
+      target_knowledge_version_id: targetVersionId,
+    };
+  }
+
+  async rollbackPage(pageId: string, input: RollbackPageInput): Promise<Record<string, unknown>> {
+    const targetPageVersionId = readRequired(
+      input.target_page_version_id,
+      "target_page_version_id",
+    );
+    const current = await this.getPage(pageId);
+    const target = await this.requirePageVersion(targetPageVersionId);
+    const changeSetId = createResourceId("changeSet");
+    const rollbackId = `rb_${cryptoSafeId()}`;
+    const pageVersionId = createResourceId("pageVersion");
+    const knowledgeVersionId = createResourceId("knowledgeVersion");
+    const pageVersionNumber = await this.nextPageVersionNumber(pageId);
+    const knowledgeVersionNumber = await this.nextKnowledgeVersionNumber(current.knowledge_base_id);
+    const baseVersionId = await this.currentKnowledgeVersionId(current.knowledge_base_id);
+    const now = new Date().toISOString();
+
+    if (target.page_id !== pageId) {
+      throw new ApiError("version_not_found");
+    }
+
+    await this.createAppliedChangeSet({
+      id: changeSetId,
+      knowledgeBaseId: current.knowledge_base_id,
+      baseVersionId,
+      targetVersionId: knowledgeVersionId,
+      title: `Roll back ${target.title}`,
+      description: input.reason ?? "Page rollback requested through API.",
+      diff: { target_page_version_id: targetPageVersionId },
+      now,
+    });
+    await this.insertPageVersion({
+      id: pageVersionId,
+      pageId,
+      knowledgeBaseId: current.knowledge_base_id,
+      knowledgeVersionId,
+      versionNumber: pageVersionNumber,
+      title: String(target.title),
+      markdown: String(target.markdown),
+      frontmatter: normalizeJsonObject(target.frontmatter),
+      createdBy: "api",
+      now,
+    });
+    await this.insertKnowledgeVersion({
+      id: knowledgeVersionId,
+      knowledgeBaseId: current.knowledge_base_id,
+      versionNumber: knowledgeVersionNumber,
+      summary: input.reason ?? `Rolled back ${target.title}.`,
+      changeSetId,
+      createdBy: "api",
+      now,
+    });
+    const visibility = await this.createWriteVisibilityMetadata(current.knowledge_base_id);
+
+    await sql`
+      update wiki_pages
+      set title = ${String(target.title)},
+          markdown = ${String(target.markdown)},
+          frontmatter = ${JSON.stringify(normalizeJsonObject(target.frontmatter))}::jsonb,
+          current_version_id = ${pageVersionId},
+          owner_knowledge_base_id = ${visibility.ownerKnowledgeBaseId},
+          visibility_origin = ${visibility.visibilityOrigin},
+          upstream_resource_id = coalesce(upstream_resource_id, null),
+          fork_tombstoned_at = null,
+          updated_at = ${now}
+      where id = ${pageId}
+    `.execute(this.db);
+    await sql`
+      insert into rollback_records (
+        id,
+        knowledge_base_id,
+        source_version_id,
+        target_version_id,
+        change_set_id,
+        rollback_type,
+        reason,
+        metadata,
+        owner_knowledge_base_id,
+        visibility_origin,
+        upstream_resource_id,
+        fork_tombstoned_at,
+        created_at
+      )
+      values (
+        ${rollbackId},
+        ${current.knowledge_base_id},
+        ${baseVersionId},
+        ${knowledgeVersionId},
+        ${changeSetId},
+        'page',
+        ${input.reason ?? null},
+        ${JSON.stringify({
+          page_id: pageId,
+          source_page_version_id: current.current_version_id,
+          target_page_version_id: targetPageVersionId,
+          created_page_version_id: pageVersionId,
+        })}::jsonb,
+        ${visibility.ownerKnowledgeBaseId},
+        ${visibility.visibilityOrigin},
+        null,
+        null,
+        ${now}
+      )
+    `.execute(this.db);
+    await this.updateKnowledgeBaseVersion(current.knowledge_base_id, knowledgeVersionId, now);
+    await this.recordGraphInsightRefresh(current.knowledge_base_id, changeSetId, now);
+
+    return {
+      rollback_id: rollbackId,
+      change_set_id: changeSetId,
+      knowledge_version_id: knowledgeVersionId,
+      page_version_id: pageVersionId,
+      source_page_version_id: current.current_version_id,
+      target_page_version_id: targetPageVersionId,
+    };
+  }
+
+  async syncForkFromUpstream(
+    input: SyncForkFromUpstreamInput,
+  ): Promise<SyncForkFromUpstreamResult> {
+    const changeSetId = createResourceId("changeSet");
+    const knowledgeVersionId = createResourceId("knowledgeVersion");
+    const knowledgeVersionNumber = await this.nextKnowledgeVersionNumber(input.forkId);
+    const now = new Date().toISOString();
+    const visibility = await this.createWriteVisibilityMetadata(input.forkId);
+    const diff = {
+      source_upstream_version_id: input.sourceUpstreamVersionId,
+      target_upstream_version_id: input.targetUpstreamVersionId,
+      conflicts: [...input.conflicts],
+    };
+
+    await sql`
+      insert into change_sets (
+        id,
+        knowledge_base_id,
+        base_version_id,
+        target_version_id,
+        status,
+        trigger_type,
+        title,
+        description,
+        diff,
+        metadata,
+        owner_knowledge_base_id,
+        visibility_origin,
+        upstream_resource_id,
+        fork_tombstoned_at,
+        created_at,
+        applied_at
+      )
+      values (
+        ${changeSetId},
+        ${input.forkId},
+        ${input.baseForkVersionId},
+        ${knowledgeVersionId},
+        'applied',
+        'upstream_sync',
+        'Sync fork from upstream',
+        'Applied upstream Knowledge Base changes into the fork view.',
+        ${JSON.stringify(diff)}::jsonb,
+        ${JSON.stringify({
+          upstream_knowledge_base_id: input.upstreamKnowledgeBaseId,
+          source_upstream_version_id: input.sourceUpstreamVersionId,
+          target_upstream_version_id: input.targetUpstreamVersionId,
+        })}::jsonb,
+        ${visibility.ownerKnowledgeBaseId},
+        ${visibility.visibilityOrigin},
+        null,
+        null,
+        ${now},
+        ${now}
+      )
+    `.execute(this.db);
+
+    await this.insertKnowledgeVersion({
+      id: knowledgeVersionId,
+      knowledgeBaseId: input.forkId,
+      versionNumber: knowledgeVersionNumber,
+      summary: "Synced fork from upstream.",
+      changeSetId,
+      createdBy: "api",
+      now,
+    });
+
+    for (const [index, conflict] of input.conflicts.entries()) {
+      const objectId =
+        typeof conflict.fork_page_id === "string" ? conflict.fork_page_id : `${input.forkId}:sync`;
+
+      await sql`
+        insert into change_set_items (
+          id,
+          change_set_id,
+          object_type,
+          object_id,
+          operation,
+          diff,
+          owner_knowledge_base_id,
+          visibility_origin,
+          upstream_resource_id,
+          fork_tombstoned_at
+        )
+        values (
+          ${`${changeSetId}:conflict:${index}`},
+          ${changeSetId},
+          'wiki_page',
+          ${objectId},
+          'conflict_detected',
+          ${JSON.stringify(conflict)}::jsonb,
+          ${visibility.ownerKnowledgeBaseId},
+          ${visibility.visibilityOrigin},
+          null,
+          null
+        )
+        on conflict (id) do nothing
+      `.execute(this.db);
+    }
+
+    await this.recordGraphInsightRefresh(input.forkId, changeSetId, now);
+
+    return {
+      changeSetId,
+      knowledgeVersionId,
+    };
+  }
+
+  async loadRetrievalRepository(knowledgeBaseId: string): Promise<RetrievalRepository> {
+    const repository = createInMemoryRetrievalRepository();
+    const scope = await this.getKnowledgeBaseScope(knowledgeBaseId);
+    const pages = await this.listPages(knowledgeBaseId);
+    const edges = await this.listEdges(knowledgeBaseId);
+    const embeddings = await this.listEmbeddings(knowledgeBaseId);
+    const sourceDocumentsById = await this.loadSourceDocumentRetrievalMetadata(
+      collectPageSourceDocumentIds(pages),
+    );
+
+    repository.upsertKnowledgeBaseScope(toRetrievalKnowledgeBaseScope(knowledgeBaseId, scope));
+    if (scope.knowledgeBaseType === "fork" && scope.upstreamKnowledgeBaseId !== null) {
+      repository.upsertKnowledgeBaseScope({
+        knowledge_base_id: scope.upstreamKnowledgeBaseId,
+        knowledge_base_type: "canonical",
+        upstream_knowledge_base_id: null,
+        upstream_synced_version_id: scope.upstreamSyncedVersionId,
+      });
+    }
+
+    for (const page of pages) {
+      const visibility = normalizeStoredVisibilityFields(page, scope);
+      repository.upsertPage({
+        knowledge_base_id: visibility.knowledge_base_id,
+        page_id: page.id,
+        page_version_id: page.current_version_id ?? page.id,
+        title: page.title,
+        type: page.type,
+        markdown: page.markdown,
+        frontmatter: page.frontmatter,
+        is_system_page: false,
+        system_page_key: null,
+        source_refs: enrichSourceRefsWithDocumentMetadata(
+          normalizeStoredPageSourceRefs(page, scope),
+          sourceDocumentsById,
+        ),
+        metadata: page.metadata,
+        visibility_origin: visibility.visibility_origin,
+        owner_knowledge_base_id: visibility.owner_knowledge_base_id,
+        upstream_resource_id: visibility.upstream_resource_id,
+        fork_tombstoned_at: visibility.fork_tombstoned_at,
+      });
+    }
+    for (const edge of edges) {
+      const visibility = normalizeStoredVisibilityFields(edge, scope);
+
+      repository.upsertEdge({
+        ...edge,
+        knowledge_base_id: visibility.knowledge_base_id,
+        visibility_origin: visibility.visibility_origin,
+        owner_knowledge_base_id: visibility.owner_knowledge_base_id,
+        upstream_resource_id: visibility.upstream_resource_id,
+        fork_tombstoned_at: visibility.fork_tombstoned_at,
+      });
+    }
+    for (const embedding of embeddings) {
+      const visibility = normalizeStoredVisibilityFields(embedding, scope);
+
+      repository.saveEmbedding({
+        ...embedding,
+        knowledge_base_id: visibility.knowledge_base_id,
+        visibility_origin: visibility.visibility_origin,
+        owner_knowledge_base_id: visibility.owner_knowledge_base_id,
+        upstream_resource_id: visibility.upstream_resource_id,
+        fork_tombstoned_at: visibility.fork_tombstoned_at,
+      });
+    }
+
+    return repository;
+  }
+
+  private async loadSourceDocumentRetrievalMetadata(
+    documentIds: readonly string[],
+  ): Promise<Map<string, RetrievalSourceDocumentMetadata>> {
+    const uniqueIds = [...new Set(documentIds)].filter((documentId) => documentId.length > 0);
+
+    if (uniqueIds.length === 0) {
+      return new Map();
+    }
+
+    const result = await sql<{
+      id: string;
+      metadata: unknown;
+      name: string;
+    }>`
+      select
+        id,
+        name,
+        metadata
+      from source_documents
+      where id = any(${uniqueIds})
+    `.execute(this.db);
+
+    return new Map(
+      result.rows.map((row) => [
+        row.id,
+        {
+          id: row.id,
+          metadata: normalizeJsonObject(row.metadata),
+          name: row.name,
+        },
+      ]),
+    );
+  }
+
+  async rebuildRetrievalIndex(
+    knowledgeBaseId: string,
+    provider: RetrievalEmbeddingProvider,
+  ): Promise<RetrievalIndexStats> {
+    const repository = await this.loadRetrievalRepository(knowledgeBaseId);
+    const embeddings = await new EmbeddingIndexService(repository, provider).indexKnowledgeBase(
+      knowledgeBaseId,
+    );
+
+    await this.replaceEmbeddings(knowledgeBaseId, embeddings);
+
+    return {
+      indexedEdgeCount: repository.listEdges(knowledgeBaseId).length,
+      indexedEmbeddingCount: embeddings.length,
+      indexedPageCount: repository.listPages(knowledgeBaseId).length,
+    };
+  }
+
+  async saveRetrievalTrace(trace: RetrievalTraceRecord): Promise<void> {
+    await this.assertKnowledgeBaseLive(trace.knowledge_base_id);
+    const scope = await requireKnowledgeBaseTenantProject(this.db, trace.knowledge_base_id);
+
+    await sql`
+      insert into retrieval_traces (
+        id,
+        tenant_id,
+        project_id,
+        knowledge_base_id,
+        query,
+        request,
+        results,
+        graph_expansions,
+        context_pack,
+        warnings,
+        metadata,
+        created_at
+      )
+      values (
+        ${trace.id},
+        ${scope.tenantId},
+        ${scope.projectId},
+        ${trace.knowledge_base_id},
+        ${trace.query},
+        ${JSON.stringify(trace.request)}::jsonb,
+        ${JSON.stringify(trace.results)}::jsonb,
+        ${JSON.stringify(trace.graph_expansions)}::jsonb,
+        ${JSON.stringify(trace.context_pack ?? {})}::jsonb,
+        ${JSON.stringify(trace.warnings)}::jsonb,
+        ${JSON.stringify({ stages: trace.stages })}::jsonb,
+        ${trace.created_at}
+      )
+      on conflict (id) do update set
+        tenant_id = excluded.tenant_id,
+        project_id = excluded.project_id,
+        request = excluded.request,
+        results = excluded.results,
+        graph_expansions = excluded.graph_expansions,
+        context_pack = excluded.context_pack,
+        warnings = excluded.warnings,
+        metadata = excluded.metadata
+    `.execute(this.db);
+  }
+
+  private async listEdges(knowledgeBaseId: string) {
+    const scope = await this.getKnowledgeBaseScope(knowledgeBaseId);
+    const visiblePageIds = (await this.listPages(knowledgeBaseId)).map((page) => page.id);
+
+    if (scope.knowledgeBaseType === "fork" && scope.upstreamKnowledgeBaseId !== null) {
+      const result = await sql<{
+        knowledge_base_id: string;
+        edge_id: string;
+        from_page_id: string;
+        to_page_id: string;
+        relation_type:
+          | "wikilink"
+          | "shared_source"
+          | "common_neighbor"
+          | "type_affinity"
+          | "generated_relationship"
+          | "evidence_relationship"
+          | "manual";
+        weight: number;
+        explanation: string;
+        source_document_ids: string[];
+        visibility_origin: RetrievalVisibilityOrigin;
+        owner_knowledge_base_id: string | null;
+        upstream_resource_id: string | null;
+        fork_tombstoned_at: string | null;
+      }>`
+        with visible_pages as (
+          select unnest(${formatTextArray(visiblePageIds)}) as id
+        ),
+        fork_edge_tombstones as (
+          select upstream_resource_id
+          from wiki_edges
+          where owner_knowledge_base_id = ${knowledgeBaseId}
+            and fork_tombstoned_at is not null
+            and upstream_resource_id is not null
+        )
+        select *
+        from (
+          select
+            ${knowledgeBaseId}::text as knowledge_base_id,
+            wiki_edges.id as edge_id,
+            wiki_edges.from_page_id,
+            wiki_edges.to_page_id,
+            wiki_edges.relation_type,
+            wiki_edges.weight::float as weight,
+            coalesce(wiki_edges.explanation, '') as explanation,
+            wiki_edges.source_document_ids,
+            'upstream_inherited'::text as visibility_origin,
+            ${knowledgeBaseId}::text as owner_knowledge_base_id,
+            wiki_edges.id as upstream_resource_id,
+            null::timestamptz as fork_tombstoned_at
+          from wiki_edges
+          where wiki_edges.knowledge_base_id = ${scope.upstreamKnowledgeBaseId}
+            and wiki_edges.owner_knowledge_base_id is null
+            and wiki_edges.fork_tombstoned_at is null
+            and exists (select 1 from visible_pages where visible_pages.id = wiki_edges.from_page_id)
+            and exists (select 1 from visible_pages where visible_pages.id = wiki_edges.to_page_id)
+            and not exists (
+              select 1
+              from fork_edge_tombstones
+              where fork_edge_tombstones.upstream_resource_id = wiki_edges.id
+            )
+          union all
+          select
+            ${knowledgeBaseId}::text as knowledge_base_id,
+            wiki_edges.id as edge_id,
+            wiki_edges.from_page_id,
+            wiki_edges.to_page_id,
+            wiki_edges.relation_type,
+            wiki_edges.weight::float as weight,
+            coalesce(wiki_edges.explanation, '') as explanation,
+            wiki_edges.source_document_ids,
+            'fork_owned'::text as visibility_origin,
+            ${knowledgeBaseId}::text as owner_knowledge_base_id,
+            wiki_edges.upstream_resource_id,
+            wiki_edges.fork_tombstoned_at
+          from wiki_edges
+          where (wiki_edges.knowledge_base_id = ${knowledgeBaseId}
+              or wiki_edges.owner_knowledge_base_id = ${knowledgeBaseId})
+            and wiki_edges.fork_tombstoned_at is null
+            and exists (select 1 from visible_pages where visible_pages.id = wiki_edges.from_page_id)
+            and exists (select 1 from visible_pages where visible_pages.id = wiki_edges.to_page_id)
+        ) visible_edges
+      `.execute(this.db);
+
+      return result.rows.map((row) => ({
+        ...row,
+        visibility_origin: readVisibilityOrigin(row.visibility_origin),
+      }));
+    }
+
+    const result = await sql<{
+      knowledge_base_id: string;
+      edge_id: string;
+      from_page_id: string;
+      to_page_id: string;
+      relation_type:
+        | "wikilink"
+        | "shared_source"
+        | "common_neighbor"
+        | "type_affinity"
+        | "generated_relationship"
+        | "evidence_relationship"
+        | "manual";
+      weight: number;
+      explanation: string;
+      source_document_ids: string[];
+      visibility_origin: RetrievalVisibilityOrigin;
+      owner_knowledge_base_id: string | null;
+      upstream_resource_id: string | null;
+      fork_tombstoned_at: string | null;
+    }>`
+      select
+        knowledge_base_id,
+        id as edge_id,
+        from_page_id,
+        to_page_id,
+        relation_type,
+        weight::float as weight,
+        coalesce(explanation, '') as explanation,
+        source_document_ids,
+        'canonical'::text as visibility_origin,
+        null::text as owner_knowledge_base_id,
+        null::text as upstream_resource_id,
+        null::timestamptz as fork_tombstoned_at
+      from wiki_edges
+      where knowledge_base_id = ${knowledgeBaseId}
+        and owner_knowledge_base_id is null
+        and fork_tombstoned_at is null
+        and from_page_id = any(${formatTextArray(visiblePageIds)})
+        and to_page_id = any(${formatTextArray(visiblePageIds)})
+    `.execute(this.db);
+
+    return result.rows.map((row) => ({
+      ...row,
+      visibility_origin: readVisibilityOrigin(row.visibility_origin),
+    }));
+  }
+
+  private async listEmbeddings(knowledgeBaseId: string): Promise<RetrievalEmbeddingRecord[]> {
+    const scope = await this.getKnowledgeBaseScope(knowledgeBaseId);
+    const visiblePageIds = (await this.listPages(knowledgeBaseId)).map((page) => page.id);
+
+    if (scope.knowledgeBaseType === "fork" && scope.upstreamKnowledgeBaseId !== null) {
+      const result = await sql<{
+        id: string;
+        knowledge_base_id: string;
+        page_id: string | null;
+        page_version_id: string | null;
+        object_type: string;
+        object_id: string;
+        model: string;
+        dimensions: number;
+        vector: string | null;
+        metadata: Record<string, unknown>;
+        visibility_origin: RetrievalVisibilityOrigin;
+        owner_knowledge_base_id: string | null;
+        upstream_resource_id: string | null;
+        fork_tombstoned_at: string | null;
+      }>`
+        with visible_pages as (
+          select unnest(${formatTextArray(visiblePageIds)}) as id
+        ),
+        fork_embedding_tombstones as (
+          select upstream_resource_id
+          from page_embeddings
+          where owner_knowledge_base_id = ${knowledgeBaseId}
+            and fork_tombstoned_at is not null
+            and upstream_resource_id is not null
+        )
+        select *
+        from (
+          select
+            page_embeddings.id,
+            ${knowledgeBaseId}::text as knowledge_base_id,
+            page_embeddings.page_id,
+            page_embeddings.page_version_id,
+            page_embeddings.object_type,
+            page_embeddings.object_id,
+            page_embeddings.model,
+            page_embeddings.dimensions,
+            page_embeddings.embedding::text as vector,
+            page_embeddings.metadata,
+            'upstream_inherited'::text as visibility_origin,
+            ${knowledgeBaseId}::text as owner_knowledge_base_id,
+            page_embeddings.id as upstream_resource_id,
+            null::timestamptz as fork_tombstoned_at
+          from page_embeddings
+          where page_embeddings.knowledge_base_id = ${scope.upstreamKnowledgeBaseId}
+            and page_embeddings.owner_knowledge_base_id is null
+            and page_embeddings.fork_tombstoned_at is null
+            and page_embeddings.page_id in (select id from visible_pages)
+            and not exists (
+              select 1
+              from fork_embedding_tombstones
+              where fork_embedding_tombstones.upstream_resource_id = page_embeddings.id
+            )
+          union all
+          select
+            page_embeddings.id,
+            ${knowledgeBaseId}::text as knowledge_base_id,
+            page_embeddings.page_id,
+            page_embeddings.page_version_id,
+            page_embeddings.object_type,
+            page_embeddings.object_id,
+            page_embeddings.model,
+            page_embeddings.dimensions,
+            page_embeddings.embedding::text as vector,
+            page_embeddings.metadata,
+            'fork_owned'::text as visibility_origin,
+            ${knowledgeBaseId}::text as owner_knowledge_base_id,
+            page_embeddings.upstream_resource_id,
+            page_embeddings.fork_tombstoned_at
+          from page_embeddings
+          where (page_embeddings.knowledge_base_id = ${knowledgeBaseId}
+              or page_embeddings.owner_knowledge_base_id = ${knowledgeBaseId})
+            and page_embeddings.fork_tombstoned_at is null
+            and page_embeddings.page_id in (select id from visible_pages)
+        ) visible_embeddings
+        order by id asc
+      `.execute(this.db);
+
+      return result.rows.flatMap((row) => toRetrievalEmbeddingRecord(row));
+    }
+
+    const result = await sql<{
+      id: string;
+      knowledge_base_id: string;
+      page_id: string | null;
+      page_version_id: string | null;
+      object_type: string;
+      object_id: string;
+      model: string;
+      dimensions: number;
+      vector: string | null;
+      metadata: Record<string, unknown>;
+      visibility_origin: RetrievalVisibilityOrigin;
+      owner_knowledge_base_id: string | null;
+      upstream_resource_id: string | null;
+      fork_tombstoned_at: string | null;
+    }>`
+      select
+        id,
+        knowledge_base_id,
+        page_id,
+        page_version_id,
+        object_type,
+        object_id,
+        model,
+        dimensions,
+        embedding::text as vector,
+        metadata,
+        'canonical'::text as visibility_origin,
+        null::text as owner_knowledge_base_id,
+        null::text as upstream_resource_id,
+        null::timestamptz as fork_tombstoned_at
+      from page_embeddings
+      where knowledge_base_id = ${knowledgeBaseId}
+        and owner_knowledge_base_id is null
+        and fork_tombstoned_at is null
+        and page_id = any(${formatTextArray(visiblePageIds)})
+      order by created_at asc, id asc
+    `.execute(this.db);
+
+    return result.rows.flatMap((row) => toRetrievalEmbeddingRecord(row));
+  }
+
+  private async replaceEmbeddings(
+    knowledgeBaseId: string,
+    embeddings: readonly RetrievalEmbeddingRecord[],
+  ): Promise<void> {
+    await sql`
+      delete from page_embeddings
+      where knowledge_base_id = ${knowledgeBaseId}
+    `.execute(this.db);
+
+    for (const embedding of embeddings) {
+      const metadata = {
+        ...embedding.metadata,
+        text: embedding.text,
+      };
+
+      await sql`
+        insert into page_embeddings (
+          id,
+          knowledge_base_id,
+          page_id,
+          page_version_id,
+          object_type,
+          object_id,
+          model,
+          dimensions,
+          embedding,
+          metadata,
+          owner_knowledge_base_id,
+          visibility_origin,
+          upstream_resource_id,
+          fork_tombstoned_at
+        )
+        values (
+          ${embedding.id},
+          ${embedding.knowledge_base_id},
+          ${embedding.page_id},
+          ${embedding.page_version_id},
+          ${embedding.object_type},
+          ${embedding.object_id},
+          ${embedding.model},
+          ${embedding.dimensions},
+          ${formatPgVector(embedding.vector)}::vector,
+          ${JSON.stringify(metadata)}::jsonb,
+          ${embedding.owner_knowledge_base_id ?? null},
+          ${embedding.visibility_origin ?? "canonical"},
+          ${embedding.upstream_resource_id ?? null},
+          ${embedding.fork_tombstoned_at ?? null}
+        )
+      `.execute(this.db);
+    }
+  }
+
+  private async requireChangeSet(changeSetId: string): Promise<ChangeSetRow> {
+    const changeSetResult = await sql<ChangeSetRow>`
+      select
+        id,
+        knowledge_base_id,
+        base_version_id,
+        target_version_id,
+        status,
+        trigger_type,
+        title,
+        description,
+        diff,
+        metadata,
+        created_at,
+        applied_at,
+        discarded_at
+      from change_sets
+      where id = ${changeSetId}
+    `.execute(this.db);
+    const changeSet = changeSetResult.rows[0];
+
+    if (changeSet === undefined) {
+      throw new ApiError("invalid_request", {
+        messageKey: "api.validation.change_set_not_found",
+      });
+    }
+
+    return {
+      ...changeSet,
+      diff: normalizeJsonObject(changeSet.diff),
+      metadata: normalizeJsonObject(changeSet.metadata),
+    };
+  }
+
+  private async getKnowledgeBaseScope(knowledgeBaseId: string): Promise<KnowledgeBaseScopeContext> {
+    const result = await sql<{
+      cleanup_operation_id: string | null;
+      cleanup_status: string | null;
+      deleted_at: Date | string | null;
+      knowledge_base_type: string;
+      status: string;
+      upstream_knowledge_base_id: string | null;
+      upstream_synced_version_id: string | null;
+    }>`
+      select
+        knowledge_bases.status,
+        knowledge_bases.deleted_at,
+        knowledge_bases.knowledge_base_type,
+        knowledge_bases.upstream_knowledge_base_id,
+        knowledge_bases.upstream_synced_version_id,
+        latest_cleanup.id as cleanup_operation_id,
+        latest_cleanup.status as cleanup_status
+      from knowledge_bases
+      left join lateral (
+        select id, status
+        from deletion_cleanup_operations
+        where target_type = 'knowledge_base'
+          and target_id = ${knowledgeBaseId}
+        order by created_at desc
+        limit 1
+      ) latest_cleanup on true
+      where knowledge_bases.id = ${knowledgeBaseId}
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    if (row === undefined) {
+      throw new ApiError("knowledge_base_not_found");
+    }
+    if (row.status === "deleted" || row.deleted_at !== null) {
+      throw new ApiError("resource_deleted", {
+        messageKey: "api.validation.knowledge_base_deleted",
+        details: {
+          target_type: "knowledge_base",
+          target_id: knowledgeBaseId,
+          cleanup_operation_id: row.cleanup_operation_id,
+          cleanup_status: row.cleanup_status,
+          guidance: "reload_resource_list",
+        },
+      });
+    }
+
+    return {
+      knowledgeBaseType: row.knowledge_base_type === "fork" ? "fork" : "canonical",
+      upstreamKnowledgeBaseId: row.upstream_knowledge_base_id,
+      upstreamSyncedVersionId: row.upstream_synced_version_id,
+    };
+  }
+
+  private async createWriteVisibilityMetadata(knowledgeBaseId: string): Promise<{
+    ownerKnowledgeBaseId: string | null;
+    visibilityOrigin: RetrievalVisibilityOrigin;
+  }> {
+    const scope = await this.getKnowledgeBaseScope(knowledgeBaseId);
+
+    if (scope.knowledgeBaseType === "fork") {
+      return {
+        ownerKnowledgeBaseId: knowledgeBaseId,
+        visibilityOrigin: "fork_owned",
+      };
+    }
+
+    return {
+      ownerKnowledgeBaseId: null,
+      visibilityOrigin: "canonical",
+    };
+  }
+
+  private async createChangeSetWriteVisibilityMetadata(changeSetId: string): Promise<{
+    ownerKnowledgeBaseId: string | null;
+    visibilityOrigin: RetrievalVisibilityOrigin;
+  }> {
+    const result = await sql<{ knowledge_base_id: string }>`
+      select knowledge_base_id
+      from change_sets
+      where id = ${changeSetId}
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    if (row === undefined) {
+      return {
+        ownerKnowledgeBaseId: null,
+        visibilityOrigin: "canonical",
+      };
+    }
+
+    return this.createWriteVisibilityMetadata(row.knowledge_base_id);
+  }
+
+  private async assertKnowledgeBaseLive(knowledgeBaseId: string): Promise<void> {
+    await this.getKnowledgeBaseScope(knowledgeBaseId);
+  }
+
+  private async applyWikiDraftChangeSet(changeSet: ChangeSetRow, now: string): Promise<void> {
+    const draft = readWikiDraftChangeContent(changeSet.diff);
+
+    if (draft === null) {
+      return;
+    }
+
+    const sourceDocumentId = await this.findChangeSetSourceDocumentId(
+      changeSet.knowledge_base_id,
+      changeSet.id,
+    );
+    const sourceDocumentIds = sourceDocumentId === null ? [] : [sourceDocumentId];
+    const slug = createDraftPageSlug(sourceDocumentId ?? changeSet.id);
+    const pageId = await this.resolveDraftPageId(changeSet.knowledge_base_id, slug);
+    const pageVersionId = createResourceId("pageVersion");
+    const knowledgeVersionId = createResourceId("knowledgeVersion");
+    const pageVersionNumber = await this.nextPageVersionNumber(pageId);
+    const knowledgeVersionNumber = await this.nextKnowledgeVersionNumber(
+      changeSet.knowledge_base_id,
+    );
+    const frontmatter = {
+      type: "page",
+      tags: draft.tags,
+      source: "wiki_draft",
+    };
+    const visibility = await this.createWriteVisibilityMetadata(changeSet.knowledge_base_id);
+
+    await sql`
+      insert into wiki_pages (
+        id,
+        knowledge_base_id,
+        slug,
+        title,
+        page_type,
+        status,
+        current_version_id,
+        markdown,
+        frontmatter,
+        source_document_ids,
+        metadata,
+        owner_knowledge_base_id,
+        visibility_origin,
+        upstream_resource_id,
+        fork_tombstoned_at,
+        created_at,
+        updated_at
+      )
+      values (
+        ${pageId},
+        ${changeSet.knowledge_base_id},
+        ${slug},
+        ${draft.title},
+        'page',
+        'ready',
+        ${pageVersionId},
+        ${draft.markdown},
+        ${JSON.stringify(frontmatter)}::jsonb,
+        ${toPostgresTextArray(sourceDocumentIds)},
+        ${JSON.stringify({
+          change_set_id: changeSet.id,
+          source: "wiki_draft",
+          ...draft.metadata,
+        })}::jsonb,
+        ${visibility.ownerKnowledgeBaseId},
+        ${visibility.visibilityOrigin},
+        null,
+        null,
+        ${now},
+        ${now}
+      )
+      on conflict (knowledge_base_id, slug) do update set
+        title = excluded.title,
+        status = excluded.status,
+        current_version_id = excluded.current_version_id,
+        markdown = excluded.markdown,
+        frontmatter = excluded.frontmatter,
+        source_document_ids = excluded.source_document_ids,
+        metadata = excluded.metadata,
+        owner_knowledge_base_id = excluded.owner_knowledge_base_id,
+        visibility_origin = excluded.visibility_origin,
+        upstream_resource_id = excluded.upstream_resource_id,
+        fork_tombstoned_at = excluded.fork_tombstoned_at,
+        updated_at = excluded.updated_at
+    `.execute(this.db);
+
+    await this.insertPageVersion({
+      id: pageVersionId,
+      pageId,
+      knowledgeBaseId: changeSet.knowledge_base_id,
+      knowledgeVersionId,
+      versionNumber: pageVersionNumber,
+      title: draft.title,
+      markdown: draft.markdown,
+      frontmatter,
+      sourceSnapshot: [
+        ...draft.sources,
+        ...(sourceDocumentId === null
+          ? []
+          : [
+              {
+                document_id: sourceDocumentId,
+              },
+            ]),
+      ],
+      createdBy: "wiki_draft",
+      now,
+    });
+    await this.insertKnowledgeVersion({
+      id: knowledgeVersionId,
+      knowledgeBaseId: changeSet.knowledge_base_id,
+      versionNumber: knowledgeVersionNumber,
+      summary: `Applied ${draft.title}.`,
+      changeSetId: changeSet.id,
+      createdBy: "wiki_draft",
+      now,
+    });
+    await sql`
+      update change_sets
+      set status = 'applied',
+          target_version_id = ${knowledgeVersionId},
+          applied_at = coalesce(applied_at, ${now})
+      where id = ${changeSet.id}
+    `.execute(this.db);
+    await this.insertChangeSetItem(changeSet.id, "wiki_page", pageId, "create", {
+      after: {
+        page_id: pageId,
+        page_version_id: pageVersionId,
+        title: draft.title,
+      },
+    });
+    await this.updateKnowledgeBaseVersion(changeSet.knowledge_base_id, knowledgeVersionId, now);
+  }
+
+  private async findChangeSetSourceDocumentId(
+    knowledgeBaseId: string,
+    changeSetId: string,
+  ): Promise<string | null> {
+    const result = await sql<{ id: string }>`
+      select id
+      from source_documents
+      where knowledge_base_id = ${knowledgeBaseId}
+        and metadata ->> 'change_set_id' = ${changeSetId}
+      order by created_at asc
+      limit 1
+    `.execute(this.db);
+
+    return result.rows[0]?.id ?? null;
+  }
+
+  private async resolveDraftPageId(knowledgeBaseId: string, slug: string): Promise<string> {
+    const result = await sql<{ id: string }>`
+      select id
+      from wiki_pages
+      where knowledge_base_id = ${knowledgeBaseId}
+        and slug = ${slug}
+    `.execute(this.db);
+
+    return result.rows[0]?.id ?? createResourceId("wikiPage");
+  }
+
+  private async listChangeSetItems(changeSetId: string): Promise<Record<string, unknown>[]> {
+    const result = await sql<Record<string, unknown>>`
+      select
+        id,
+        change_set_id,
+        object_type,
+        object_id,
+        operation,
+        before_data,
+        after_data,
+        diff,
+        created_at
+      from change_set_items
+      where change_set_id = ${changeSetId}
+      order by created_at asc
+    `.execute(this.db);
+
+    return result.rows;
+  }
+
+  private async currentKnowledgeVersionId(knowledgeBaseId: string): Promise<string | null> {
+    const result = await sql<{ currentVersionId: string | null }>`
+      select current_version_id as "currentVersionId"
+      from knowledge_bases
+      where id = ${knowledgeBaseId}
+    `.execute(this.db);
+
+    return result.rows[0]?.currentVersionId ?? null;
+  }
+
+  private async nextPageVersionNumber(pageId: string): Promise<number> {
+    const result = await sql<{ nextVersion: number }>`
+      select coalesce(max(version_number), 0) + 1 as "nextVersion"
+      from wiki_page_versions
+      where page_id = ${pageId}
+    `.execute(this.db);
+
+    return Number(result.rows[0]?.nextVersion ?? 1);
+  }
+
+  private async nextKnowledgeVersionNumber(knowledgeBaseId: string): Promise<number> {
+    const result = await sql<{ nextVersion: number }>`
+      select coalesce(max(version_number), 0) + 1 as "nextVersion"
+      from knowledge_versions
+      where knowledge_base_id = ${knowledgeBaseId}
+    `.execute(this.db);
+
+    return Number(result.rows[0]?.nextVersion ?? 1);
+  }
+
+  private async createAppliedChangeSet(input: {
+    id: string;
+    knowledgeBaseId: string;
+    baseVersionId: string | null;
+    targetVersionId: string;
+    title: string;
+    description: string;
+    diff: Record<string, unknown>;
+    now: string;
+  }): Promise<void> {
+    const visibility = await this.createWriteVisibilityMetadata(input.knowledgeBaseId);
+
+    await sql`
+      insert into change_sets (
+        id,
+        knowledge_base_id,
+        base_version_id,
+        target_version_id,
+        status,
+        trigger_type,
+        title,
+        description,
+        diff,
+        metadata,
+        owner_knowledge_base_id,
+        visibility_origin,
+        upstream_resource_id,
+        fork_tombstoned_at,
+        created_at,
+        applied_at
+      )
+      values (
+        ${input.id},
+        ${input.knowledgeBaseId},
+        ${input.baseVersionId},
+        ${input.targetVersionId},
+        'applied',
+        'manual_edit',
+        ${input.title},
+        ${input.description},
+        ${JSON.stringify(input.diff)}::jsonb,
+        '{}'::jsonb,
+        ${visibility.ownerKnowledgeBaseId},
+        ${visibility.visibilityOrigin},
+        null,
+        null,
+        ${input.now},
+        ${input.now}
+      )
+    `.execute(this.db);
+  }
+
+  private async recordGraphInsightRefresh(
+    knowledgeBaseId: string,
+    changeSetId: string,
+    now: string,
+  ): Promise<void> {
+    const jobId = createResourceId("ingestJob");
+
+    await sql`
+      insert into jobs (
+        id,
+        tenant_id,
+        project_id,
+        knowledge_base_id,
+        source_document_id,
+        job_type,
+        status,
+        stage,
+        progress,
+        progress_message,
+        result,
+        metadata,
+        queued_at,
+        started_at,
+        finished_at,
+        updated_at
+      )
+      values (
+        ${jobId},
+        (select tenant_id from knowledge_bases where id = ${knowledgeBaseId}),
+        (select project_id from knowledge_bases where id = ${knowledgeBaseId}),
+        ${knowledgeBaseId},
+        null,
+        'graph.insights.refresh',
+        'completed',
+        'indexing',
+        100,
+        'Graph insights ready.',
+        ${JSON.stringify({ status: "ready", change_set_id: changeSetId })}::jsonb,
+        ${JSON.stringify({
+          change_set_id: changeSetId,
+          refresh_kind: "graph_insights",
+        })}::jsonb,
+        ${now},
+        ${now},
+        ${now},
+        ${now}
+      )
+    `.execute(this.db);
+
+    await this.insertGraphInsightRefreshEvent(
+      jobId,
+      "job.queued",
+      "Queued graph insight recomputation.",
+      {
+        change_set_id: changeSetId,
+        stage: "indexing",
+        status: "queued",
+      },
+      now,
+    );
+    await this.insertGraphInsightRefreshEvent(
+      jobId,
+      "job.running",
+      "Updating graph insights.",
+      {
+        change_set_id: changeSetId,
+        stage: "indexing",
+        status: "updating",
+      },
+      now,
+    );
+    await this.insertGraphInsightRefreshEvent(
+      jobId,
+      "job.completed",
+      "Graph insights ready.",
+      {
+        change_set_id: changeSetId,
+        stage: "indexing",
+        status: "ready",
+      },
+      now,
+    );
+  }
+
+  private async insertGraphInsightRefreshEvent(
+    jobId: string,
+    eventType: string,
+    message: string,
+    metadata: Record<string, unknown>,
+    now: string,
+  ): Promise<void> {
+    await sql`
+      insert into job_events (
+        id,
+        tenant_id,
+        project_id,
+        job_id,
+        event_type,
+        message,
+        metadata,
+        created_at
+      )
+      values (
+        ${`${jobId}:${eventType}:${now}`},
+        (select tenant_id from jobs where id = ${jobId}),
+        (select project_id from jobs where id = ${jobId}),
+        ${jobId},
+        ${eventType},
+        ${message},
+        ${JSON.stringify(metadata)}::jsonb,
+        ${now}
+      )
+      on conflict (id) do nothing
+    `.execute(this.db);
+  }
+
+  private async insertPageVersion(input: {
+    id: string;
+    pageId: string;
+    knowledgeBaseId: string;
+    knowledgeVersionId: string;
+    versionNumber: number;
+    title: string;
+    markdown: string;
+    frontmatter: Record<string, unknown>;
+    sourceSnapshot?: readonly Record<string, unknown>[];
+    createdBy: string;
+    now: string;
+  }): Promise<void> {
+    const visibility = await this.createWriteVisibilityMetadata(input.knowledgeBaseId);
+
+    await sql`
+      insert into wiki_page_versions (
+        id,
+        page_id,
+        knowledge_version_id,
+        version_number,
+        title,
+        markdown,
+        frontmatter,
+        source_snapshot,
+        created_by,
+        owner_knowledge_base_id,
+        visibility_origin,
+        upstream_resource_id,
+        fork_tombstoned_at,
+        created_at
+      )
+      values (
+        ${input.id},
+        ${input.pageId},
+        ${input.knowledgeVersionId},
+        ${input.versionNumber},
+        ${input.title},
+        ${input.markdown},
+        ${JSON.stringify(input.frontmatter)}::jsonb,
+        ${JSON.stringify(input.sourceSnapshot ?? [])}::jsonb,
+        ${input.createdBy},
+        ${visibility.ownerKnowledgeBaseId},
+        ${visibility.visibilityOrigin},
+        null,
+        null,
+        ${input.now}
+      )
+    `.execute(this.db);
+  }
+
+  private async insertKnowledgeVersion(input: {
+    id: string;
+    knowledgeBaseId: string;
+    versionNumber: number;
+    summary: string;
+    changeSetId: string;
+    createdBy: string;
+    now: string;
+  }): Promise<void> {
+    const visibility = await this.createWriteVisibilityMetadata(input.knowledgeBaseId);
+
+    await sql`
+      insert into knowledge_versions (
+        id,
+        knowledge_base_id,
+        version_number,
+        status,
+        summary,
+        change_set_id,
+        created_by,
+        owner_knowledge_base_id,
+        visibility_origin,
+        upstream_resource_id,
+        fork_tombstoned_at,
+        created_at
+      )
+      values (
+        ${input.id},
+        ${input.knowledgeBaseId},
+        ${input.versionNumber},
+        'active',
+        ${input.summary},
+        ${input.changeSetId},
+        ${input.createdBy},
+        ${visibility.ownerKnowledgeBaseId},
+        ${visibility.visibilityOrigin},
+        null,
+        null,
+        ${input.now}
+      )
+    `.execute(this.db);
+  }
+
+  private async insertChangeSetItem(
+    changeSetId: string,
+    objectType: string,
+    objectId: string,
+    operation: string,
+    diff: Record<string, unknown>,
+  ): Promise<void> {
+    const visibility = await this.createChangeSetWriteVisibilityMetadata(changeSetId);
+
+    await sql`
+      insert into change_set_items (
+        id,
+        change_set_id,
+        object_type,
+        object_id,
+        operation,
+        diff,
+        owner_knowledge_base_id,
+        visibility_origin,
+        upstream_resource_id,
+        fork_tombstoned_at
+      )
+      values (
+        ${`${changeSetId}:${objectId}`},
+        ${changeSetId},
+        ${objectType},
+        ${objectId},
+        ${operation},
+        ${JSON.stringify(diff)}::jsonb,
+        ${visibility.ownerKnowledgeBaseId},
+        ${visibility.visibilityOrigin},
+        null,
+        null
+      )
+      on conflict (id) do nothing
+    `.execute(this.db);
+  }
+
+  private async updateKnowledgeBaseVersion(
+    knowledgeBaseId: string,
+    versionId: string,
+    now: string,
+  ): Promise<void> {
+    await sql`
+      update knowledge_bases
+      set current_version_id = ${versionId}, updated_at = ${now}
+      where id = ${knowledgeBaseId}
+    `.execute(this.db);
+  }
+
+  private async requireKnowledgeVersion(versionId: string): Promise<Record<string, unknown>> {
+    const result = await sql<Record<string, unknown>>`
+      select *
+      from knowledge_versions
+      where id = ${versionId}
+    `.execute(this.db);
+    const version = result.rows[0];
+
+    if (version === undefined) {
+      throw new ApiError("version_not_found");
+    }
+
+    return version;
+  }
+
+  private async requirePageVersion(versionId: string): Promise<Record<string, unknown>> {
+    const result = await sql<Record<string, unknown>>`
+      select *
+      from wiki_page_versions
+      where id = ${versionId}
+    `.execute(this.db);
+    const version = result.rows[0];
+
+    if (version === undefined) {
+      throw new ApiError("version_not_found");
+    }
+
+    return version;
+  }
+}
+
+function normalizePageRow(row: WikiPageApiRecord): WikiPageApiRecord {
+  return {
+    ...row,
+    frontmatter: normalizeJsonObject(row.frontmatter),
+    metadata: normalizeJsonObject(row.metadata),
+    source_document_ids: row.source_document_ids ?? [],
+    source_refs: normalizeRecordArray(row.source_refs),
+    visibility_origin: readVisibilityOrigin(row.visibility_origin),
+    owner_knowledge_base_id: row.owner_knowledge_base_id ?? null,
+    upstream_resource_id: row.upstream_resource_id ?? null,
+    fork_tombstoned_at: row.fork_tombstoned_at ?? null,
+  };
+}
+
+interface RetrievalEmbeddingRow {
+  id: string;
+  knowledge_base_id: string;
+  page_id: string | null;
+  page_version_id: string | null;
+  object_type: string;
+  object_id: string;
+  model: string;
+  dimensions: number;
+  vector: string | null;
+  metadata: Record<string, unknown>;
+  visibility_origin: RetrievalVisibilityOrigin;
+  owner_knowledge_base_id: string | null;
+  upstream_resource_id: string | null;
+  fork_tombstoned_at: string | null;
+}
+
+function toRetrievalEmbeddingRecord(row: RetrievalEmbeddingRow): RetrievalEmbeddingRecord[] {
+  const objectType = readEmbeddingObjectType(row.object_type);
+  const vector = parsePgVector(row.vector);
+  const text = readMetadataText(row.metadata);
+
+  if (
+    objectType === null ||
+    row.page_id === null ||
+    row.page_version_id === null ||
+    vector.length === 0 ||
+    text === null
+  ) {
+    return [];
+  }
+
+  return [
+    {
+      id: row.id,
+      knowledge_base_id: row.knowledge_base_id,
+      page_id: row.page_id,
+      page_version_id: row.page_version_id,
+      object_type: objectType,
+      object_id: row.object_id,
+      text,
+      model: row.model,
+      dimensions: Number(row.dimensions),
+      vector,
+      metadata: removeMetadataText(row.metadata),
+      visibility_origin: readVisibilityOrigin(row.visibility_origin),
+      owner_knowledge_base_id: row.owner_knowledge_base_id,
+      upstream_resource_id: row.upstream_resource_id,
+      fork_tombstoned_at: row.fork_tombstoned_at,
+    },
+  ];
+}
+
+function readVisibilityOrigin(value: unknown): RetrievalVisibilityOrigin {
+  if (value === "canonical" || value === "upstream_inherited" || value === "fork_owned") {
+    return value;
+  }
+
+  return "canonical";
+}
+
+function formatTextArray(values: readonly string[]) {
+  return values.length === 0 ? sql`array[]::text[]` : sql`array[${sql.join(values)}]::text[]`;
+}
+
+function normalizeJsonObject(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function normalizeRecordArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter(
+        (item): item is Record<string, unknown> =>
+          typeof item === "object" && item !== null && !Array.isArray(item),
+      )
+    : [];
+}
+
+function normalizePageSourceRefs(page: WikiPageApiRecord): RetrievalSourceRef[] {
+  const sourceRefs = normalizeRecordArray(page.source_refs).flatMap(toRetrievalSourceRef);
+
+  return sourceRefs.length > 0
+    ? sourceRefs
+    : page.source_document_ids.map((documentId) => ({
+        document_id: documentId,
+      }));
+}
+
+function collectPageSourceDocumentIds(pages: readonly WikiPageApiRecord[]): string[] {
+  return [
+    ...new Set(
+      pages.flatMap((page) => [
+        ...page.source_document_ids,
+        ...normalizeRecordArray(page.source_refs)
+          .map((sourceRef) => readString(sourceRef.document_id))
+          .filter((documentId): documentId is string => documentId !== null),
+      ]),
+    ),
+  ];
+}
+
+export function enrichSourceRefsWithDocumentMetadata(
+  sourceRefs: readonly RetrievalSourceRef[],
+  sourceDocumentsById: ReadonlyMap<string, RetrievalSourceDocumentMetadata>,
+): RetrievalSourceRef[] {
+  return sourceRefs.map((sourceRef) => {
+    const sourceDocument = sourceDocumentsById.get(sourceRef.document_id);
+
+    if (sourceDocument === undefined) {
+      return sourceRef;
+    }
+
+    const name =
+      sourceRef.name ?? readString(sourceDocument.metadata.display_name) ?? sourceDocument.name;
+    const virtualPath =
+      sourceRef.virtual_path ??
+      readString(sourceDocument.metadata.source_path) ??
+      readString(sourceDocument.metadata.source_url) ??
+      readString(sourceDocument.metadata.path) ??
+      readString(sourceDocument.metadata.file_path);
+    const summary =
+      sourceRef.summary ??
+      readString(sourceDocument.metadata.source_summary) ??
+      readString(sourceDocument.metadata.summary);
+
+    return {
+      ...sourceRef,
+      ...(name === undefined ? {} : { name }),
+      ...(virtualPath === null || virtualPath === undefined ? {} : { virtual_path: virtualPath }),
+      ...(summary === null || summary === undefined ? {} : { summary }),
+    };
+  });
+}
+
+function toRetrievalKnowledgeBaseScope(
+  knowledgeBaseId: string,
+  scope: KnowledgeBaseScopeContext,
+): RetrievalKnowledgeBaseScopeRecord {
+  return {
+    knowledge_base_id: knowledgeBaseId,
+    knowledge_base_type: scope.knowledgeBaseType,
+    upstream_knowledge_base_id: scope.upstreamKnowledgeBaseId,
+    upstream_synced_version_id: scope.upstreamSyncedVersionId,
+  };
+}
+
+function normalizeStoredPageSourceRefs(
+  page: WikiPageApiRecord,
+  scope: KnowledgeBaseScopeContext,
+): RetrievalSourceRef[] {
+  const sourceRefs = normalizePageSourceRefs(page);
+
+  if (!isUpstreamInheritedRecord(page, scope)) {
+    return sourceRefs;
+  }
+
+  return sourceRefs.map((sourceRef) => {
+    const nextSourceRef = { ...sourceRef };
+
+    delete nextSourceRef.visibility_origin;
+
+    return nextSourceRef;
+  });
+}
+
+function normalizeStoredVisibilityFields(
+  record: {
+    knowledge_base_id: string;
+    visibility_origin?: RetrievalVisibilityOrigin;
+    owner_knowledge_base_id?: string | null;
+    upstream_resource_id?: string | null;
+    fork_tombstoned_at?: string | null;
+  },
+  scope: KnowledgeBaseScopeContext,
+): {
+  knowledge_base_id: string;
+  visibility_origin: RetrievalVisibilityOrigin;
+  owner_knowledge_base_id: string | null;
+  upstream_resource_id: string | null;
+  fork_tombstoned_at: string | null;
+} {
+  if (isUpstreamInheritedRecord(record, scope) && scope.upstreamKnowledgeBaseId !== null) {
+    return {
+      knowledge_base_id: scope.upstreamKnowledgeBaseId,
+      visibility_origin: "canonical",
+      owner_knowledge_base_id: null,
+      upstream_resource_id: null,
+      fork_tombstoned_at: null,
+    };
+  }
+
+  return {
+    knowledge_base_id: record.knowledge_base_id,
+    visibility_origin: record.visibility_origin ?? "canonical",
+    owner_knowledge_base_id: record.owner_knowledge_base_id ?? null,
+    upstream_resource_id: record.upstream_resource_id ?? null,
+    fork_tombstoned_at: record.fork_tombstoned_at ?? null,
+  };
+}
+
+function isUpstreamInheritedRecord(
+  record: { visibility_origin?: RetrievalVisibilityOrigin },
+  scope: KnowledgeBaseScopeContext,
+): boolean {
+  return (
+    scope.knowledgeBaseType === "fork" &&
+    scope.upstreamKnowledgeBaseId !== null &&
+    record.visibility_origin === "upstream_inherited"
+  );
+}
+
+function toRetrievalSourceRef(value: Record<string, unknown>): RetrievalSourceRef[] {
+  const documentId = readString(value.document_id);
+
+  if (documentId === null) {
+    return [];
+  }
+
+  const sourceRef: RetrievalSourceRef = {
+    document_id: documentId,
+  };
+  const parsedContentId = readString(value.parsed_content_id);
+  const sourceAnchorId = readString(value.source_anchor_id);
+  const locator = readString(value.locator);
+  const locatorStatus = readLocatorStatus(value.locator_status);
+  const warningCodes = readStringArray(value.warning_codes);
+  const mediaAssetId = readString(value.media_asset_id);
+  const evidenceKind = readEvidenceKind(value.evidence_kind);
+  const visibilityOrigin = readVisibilityOrigin(value.visibility_origin);
+
+  if (parsedContentId !== null) {
+    sourceRef.parsed_content_id = parsedContentId;
+  }
+  if (sourceAnchorId !== null) {
+    sourceRef.source_anchor_id = sourceAnchorId;
+  }
+  if (locator !== null) {
+    sourceRef.locator = locator;
+  }
+  sourceRef.locator_status = locatorStatus ?? (locator === null ? "not_provided" : "not_found");
+  sourceRef.warning_codes = normalizeSourceRefWarningCodes(warningCodes, locatorStatus, locator);
+  if (mediaAssetId !== null) {
+    sourceRef.media_asset_id = mediaAssetId;
+  }
+  if (evidenceKind !== null) {
+    sourceRef.evidence_kind = evidenceKind;
+  }
+  sourceRef.visibility_origin = visibilityOrigin;
+
+  return [sourceRef];
+}
+
+function normalizeSourceRefWarningCodes(
+  warningCodes: readonly string[],
+  locatorStatus: RetrievalSourceRef["locator_status"] | null,
+  locator: string | null,
+): string[] {
+  const next = new Set(warningCodes);
+
+  if (locatorStatus === null) {
+    next.add("source_ref_locator_status_missing");
+  }
+  if (locatorStatus === null && locator === null) {
+    next.add("source_ref_locator_not_specific");
+  }
+
+  return [...next];
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function readEvidenceKind(value: unknown): "text" | "image_caption" | "ocr" | null {
+  return value === "text" || value === "image_caption" || value === "ocr" ? value : null;
+}
+
+function readLocatorStatus(
+  value: unknown,
+): "resolved" | "not_provided" | "not_found" | "ambiguous" | "unsupported" | null {
+  return value === "resolved" ||
+    value === "not_provided" ||
+    value === "not_found" ||
+    value === "ambiguous" ||
+    value === "unsupported"
+    ? value
+    : null;
+}
+
+function readWikiDraftChangeContent(diff: Record<string, unknown>): WikiDraftChangeContent | null {
+  const after = normalizeJsonObject(diff.after);
+  const title = readNonEmptyString(after.title);
+  const markdown = readNonEmptyString(after.markdown);
+
+  if (title === null || markdown === null) {
+    return null;
+  }
+
+  return {
+    title,
+    markdown,
+    tags: readStringArray(after.tags),
+    sources: readObjectArray(after.sources),
+    metadata: normalizeJsonObject(after.metadata),
+  };
+}
+
+function readNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function readStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter((item) => item.length > 0);
+}
+
+function readObjectArray(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.map(normalizeJsonObject).filter((item) => Object.keys(item).length > 0);
+}
+
+function createDraftPageSlug(sourceId: string): string {
+  return `draft-${sourceId.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "")}`;
+}
+
+function toPostgresTextArray(values: readonly string[]) {
+  return values.length === 0 ? sql`array[]::text[]` : sql`array[${sql.join(values)}]::text[]`;
+}
+
+function readEmbeddingObjectType(value: string): RetrievalEmbeddingObjectType | null {
+  if (value === "page" || value === "page_section" || value === "system_page") {
+    return value;
+  }
+
+  return null;
+}
+
+function parsePgVector(value: string | null): number[] {
+  if (value === null) {
+    return [];
+  }
+
+  const body = value.trim().replace(/^\[/u, "").replace(/\]$/u, "");
+
+  if (body.length === 0) {
+    return [];
+  }
+
+  return body
+    .split(",")
+    .map((item) => Number(item.trim()))
+    .filter((item) => Number.isFinite(item));
+}
+
+function formatPgVector(vector: readonly number[]): string {
+  return `[${vector.map((value) => Number(value)).join(",")}]`;
+}
+
+function readMetadataText(metadata: Record<string, unknown>): string | null {
+  const value = metadata.text;
+
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function removeMetadataText(metadata: Record<string, unknown>): Record<string, unknown> {
+  const rest = { ...metadata };
+
+  delete rest.text;
+  return rest;
+}
+
+function createDefaultGraphInsightStatus(): GraphInsightStatus {
+  return {
+    failure_reason: null,
+    source_job_id: null,
+    started_at: null,
+    state: "ready",
+    updated_at: null,
+  };
+}
+
+function toGraphInsightStatusState(status: string): GraphInsightStatus["state"] {
+  if (status === "queued") {
+    return "queued";
+  }
+  if (status === "running") {
+    return "updating";
+  }
+  if (status === "failed" || status === "canceled") {
+    return "failed";
+  }
+
+  return "ready";
+}
+
+function readFailureReason(
+  error: Record<string, unknown> | null,
+  progressMessage: string | null,
+): string | null {
+  if (error !== null && typeof error.message === "string" && error.message.length > 0) {
+    return error.message;
+  }
+
+  return progressMessage;
+}
+
+function readRequired(value: string | undefined, field: string): string {
+  const normalized = value?.trim();
+
+  if (normalized === undefined || normalized.length === 0) {
+    throw new ApiError("invalid_request", {
+      messageKey: "api.validation.required_field",
+      messageParams: {
+        field,
+      },
+      details: { fields: [field] },
+    });
+  }
+
+  return normalized;
+}
+
+function cryptoSafeId(): string {
+  return createResourceId("changeSet").replace(/^cs_/u, "");
+}

@@ -1,0 +1,10 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+overrides:
+  zod: 4.4.3
+allowBuilds:
+  "@nestjs/core": true
+  esbuild: true
+  msgpackr-extract: true
+  msw: true

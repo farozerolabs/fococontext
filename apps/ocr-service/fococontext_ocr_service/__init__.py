@@ -1,0 +1,1 @@
+"""FocoContext OCR sidecar."""

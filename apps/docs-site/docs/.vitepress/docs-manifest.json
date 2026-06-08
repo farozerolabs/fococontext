@@ -1,0 +1,250 @@
+{
+  "locales": [
+    {
+      "id": "en-US",
+      "label": "English",
+      "lang": "en-US"
+    },
+    {
+      "id": "zh-CN",
+      "label": "简体中文",
+      "lang": "zh-CN"
+    }
+  ],
+  "groups": [
+    {
+      "id": "help",
+      "title": {
+        "en-US": "Help",
+        "zh-CN": "帮助文档"
+      },
+      "items": [
+        {
+          "id": "help-introduction",
+          "slug": "introduction",
+          "title": {
+            "en-US": "Introduction",
+            "zh-CN": "产品介绍"
+          }
+        },
+        {
+          "id": "help-concepts",
+          "slug": "concepts",
+          "title": {
+            "en-US": "Key Concepts",
+            "zh-CN": "核心概念"
+          }
+        },
+        {
+          "id": "help-quick-start",
+          "slug": "quick-start",
+          "title": {
+            "en-US": "Docker Compose Quick Start",
+            "zh-CN": "Docker Compose 快速开始"
+          }
+        },
+        {
+          "id": "help-env-reference",
+          "slug": "env-reference",
+          "title": {
+            "en-US": "Env Reference",
+            "zh-CN": "Env 字段说明"
+          }
+        },
+        {
+          "id": "help-configuration",
+          "slug": "configuration",
+          "title": {
+            "en-US": "Configuration",
+            "zh-CN": "配置说明"
+          }
+        },
+        {
+          "id": "help-knowledge-bases",
+          "slug": "knowledge-bases",
+          "title": {
+            "en-US": "Knowledge Base Workflow",
+            "zh-CN": "知识库流程"
+          }
+        },
+        {
+          "id": "help-sources",
+          "slug": "sources",
+          "title": {
+            "en-US": "Sources and Ingest",
+            "zh-CN": "资料与入库"
+          }
+        },
+        {
+          "id": "help-source-watch",
+          "slug": "source-watch",
+          "title": {
+            "en-US": "Source Watch",
+            "zh-CN": "Source Watch"
+          }
+        },
+        {
+          "id": "help-jobs",
+          "slug": "jobs",
+          "title": {
+            "en-US": "Jobs and Troubleshooting",
+            "zh-CN": "任务与排障"
+          }
+        },
+        {
+          "id": "help-wiki-graph-versions",
+          "slug": "wiki-graph-versions",
+          "title": {
+            "en-US": "Wiki, Graph, and Versions",
+            "zh-CN": "Wiki、图谱与版本"
+          }
+        },
+        {
+          "id": "help-retrieval-lab",
+          "slug": "retrieval-lab",
+          "title": {
+            "en-US": "Retrieval Lab",
+            "zh-CN": "检索调试"
+          }
+        },
+        {
+          "id": "help-forks-submissions",
+          "slug": "forks-submissions",
+          "title": {
+            "en-US": "Forks and Submissions",
+            "zh-CN": "分叉与提交"
+          }
+        },
+        {
+          "id": "help-webhooks-operations",
+          "slug": "webhooks-operations",
+          "title": {
+            "en-US": "Webhooks and Operations",
+            "zh-CN": "Webhook 与运维"
+          }
+        },
+        {
+          "id": "help-troubleshooting-glossary",
+          "slug": "troubleshooting-glossary",
+          "title": {
+            "en-US": "Troubleshooting and Glossary",
+            "zh-CN": "排障与术语表"
+          }
+        }
+      ]
+    },
+    {
+      "id": "openapi",
+      "title": {
+        "en-US": "OpenAPI",
+        "zh-CN": "OpenAPI 说明"
+      },
+      "items": [
+        {
+          "id": "openapi-overview",
+          "slug": "overview",
+          "title": {
+            "en-US": "API Overview",
+            "zh-CN": "API 概览"
+          }
+        },
+        {
+          "id": "openapi-auth-localization",
+          "slug": "auth-localization",
+          "title": {
+            "en-US": "Authentication and Localization",
+            "zh-CN": "认证与本地化"
+          }
+        },
+        {
+          "id": "openapi-knowledge-bases",
+          "slug": "knowledge-bases",
+          "title": {
+            "en-US": "Knowledge Bases API",
+            "zh-CN": "知识库 API"
+          }
+        },
+        {
+          "id": "openapi-sources-uploads",
+          "slug": "sources-uploads",
+          "title": {
+            "en-US": "Sources and Uploads API",
+            "zh-CN": "资料与上传 API"
+          }
+        },
+        {
+          "id": "openapi-jobs",
+          "slug": "jobs",
+          "title": {
+            "en-US": "Jobs API",
+            "zh-CN": "任务 API"
+          }
+        },
+        {
+          "id": "openapi-wiki-graph",
+          "slug": "wiki-graph",
+          "title": {
+            "en-US": "Wiki and Graph API",
+            "zh-CN": "Wiki 与图谱 API"
+          }
+        },
+        {
+          "id": "openapi-retrieve",
+          "slug": "retrieve",
+          "title": {
+            "en-US": "Retrieve API",
+            "zh-CN": "Retrieve API"
+          }
+        },
+        {
+          "id": "openapi-versions",
+          "slug": "versions",
+          "title": {
+            "en-US": "Versions and Rollback API",
+            "zh-CN": "版本与回滚 API"
+          }
+        },
+        {
+          "id": "openapi-source-watch",
+          "slug": "source-watch",
+          "title": {
+            "en-US": "Source Watch API",
+            "zh-CN": "Source Watch API"
+          }
+        },
+        {
+          "id": "openapi-forks-submissions",
+          "slug": "forks-submissions",
+          "title": {
+            "en-US": "Forks and Submissions API",
+            "zh-CN": "分叉与提交 API"
+          }
+        },
+        {
+          "id": "openapi-webhooks",
+          "slug": "webhooks",
+          "title": {
+            "en-US": "Webhooks API",
+            "zh-CN": "Webhook API"
+          }
+        },
+        {
+          "id": "openapi-errors-limits",
+          "slug": "errors-limits",
+          "title": {
+            "en-US": "Errors and Limits",
+            "zh-CN": "错误与限制"
+          }
+        },
+        {
+          "id": "openapi-integration-flow",
+          "slug": "integration-flow",
+          "title": {
+            "en-US": "Integration Flow",
+            "zh-CN": "接入流程"
+          }
+        }
+      ]
+    }
+  ]
+}

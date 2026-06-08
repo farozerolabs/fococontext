@@ -1,0 +1,35 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "useDefineForClassFields": false,
+    "ignoreDeprecations": "6.0",
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@fococontext/contracts": ["packages/contracts/src/index.ts"],
+      "@fococontext/core": ["packages/core/src/index.ts"],
+      "@fococontext/db": ["packages/db/src/index.ts"],
+      "@fococontext/graph": ["packages/graph/src/index.ts"],
+      "@fococontext/llm": ["packages/llm/src/index.ts"],
+      "@fococontext/parsers": ["packages/parsers/src/index.ts"],
+      "@fococontext/retrieval": ["packages/retrieval/src/index.ts"],
+      "@fococontext/sdk-js": ["packages/sdk-js/src/index.ts"],
+      "@fococontext/storage": ["packages/storage/src/index.ts"]
+    }
+  }
+}
