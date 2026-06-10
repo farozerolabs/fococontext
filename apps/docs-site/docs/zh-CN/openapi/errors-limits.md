@@ -26,16 +26,27 @@
 
 ## 字段说明
 
-| 字段                                            | 说明                                                                              |
-| ----------------------------------------------- | --------------------------------------------------------------------------------- |
-| `error.code`                                    | 客户端逻辑使用的稳定枚举。                                                        |
-| `error.message`                                 | 本地化的人类可读消息。                                                            |
-| `message_key`                                   | 客户端想自行翻译时使用的翻译 key。                                                |
-| `details`                                       | 结构化字段，例如非法字段、目标资源、清理任务、重试时间或限制名。                  |
-| 清理任务                                        | 隐藏 Knowledge Base、资料、对象、索引和行清理的异步删除状态。                     |
-| `settled_state`                                 | 分阶段清理验证，包含对象存储、数据库、pending、failed 和 residual artifact 计数。 |
-| `dependencies.metrics.objectStorageOperations`  | 最近窗口内按 class、operation、caller、status 汇总的 S3-compatible 操作计数。     |
-| `dependencies.pressure.objectStorageOperations` | 操作压力状态、Class A/B 阈值、hot callers 和 tuning guidance keys。               |
+| 字段                                            | 说明                                                                                         |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `error.code`                                    | 客户端逻辑使用的稳定枚举。                                                                   |
+| `error.message`                                 | 本地化的人类可读消息。                                                                       |
+| `message_key`                                   | 客户端想自行翻译时使用的翻译 key。                                                           |
+| `details`                                       | 结构化字段，例如非法字段、目标资源、清理任务、重试时间或限制名。                             |
+| 清理任务                                        | 隐藏 Knowledge Base、资料、对象、索引和行清理的异步删除状态。                                |
+| 清理任务列表                                    | 返回 operation 摘要和 `item_counts`；清理 item 页面从详情或 retry 响应中读取。               |
+| `items_page` / `items_page_size`                | 控制 cleanup detail 和 retry 响应中返回的 cleanup item 分页区段。                            |
+| `settled_state`                                 | 分阶段清理验证，包含对象存储、数据库、pending、failed 和 residual artifact 计数。            |
+| `dependencies.metrics.api`                      | 最近窗口内 API 端点分组计数、状态计数、延迟桶、返回数量、page size 和 warnings。             |
+| `dependencies.metrics.cache`                    | 按 resource kind 汇总的 runtime cache hit、miss、expired miss、set、delete 和 invalidation。 |
+| `dependencies.migration`                        | Docker Compose 发布中启动迁移归属和已知目标迁移摘要。                                        |
+| `dependencies.metrics.objectStorageOperations`  | 最近窗口内按 class、operation、caller、status 汇总的 S3-compatible 操作计数。                |
+| `dependencies.pressure.objectStorageOperations` | 操作压力状态、Class A/B 阈值、hot callers 和 tuning guidance keys。                          |
+
+## 运行诊断
+
+`GET /health` 和 settings/status payload 会暴露适合大知识库运行的安全诊断信息。API metrics 会把端点归入 jobs、sources、wiki、graph、retrieve、cleanup 和 runtime status 等分组，并报告计数、延迟桶、返回 item 数、page size、total、`has_more`、图谱就绪状态和 warning code 计数。
+
+Cache metrics 按 resource kind 汇总 runtime cache 行为，可用于发现反复 miss 或 invalidation 密集的流程。Migration status 会说明 Docker Compose 部署中的 schema 变更由独立启动迁移服务负责，API 和 Worker 容器会在 schema 准备完成后运行。
 
 ## OpenAPI
 
@@ -53,7 +64,7 @@ paths:
   "/cleanup-operations":
     get:
       summary: "List deletion cleanup operations"
-      description: "Returns asynchronous cleanup operations for visible deletion, object cleanup, database cleanup, and retry status."
+      description: "Returns asynchronous cleanup operation summaries for visible deletion, object cleanup, database cleanup, and retry status. Operation items are loaded through the detail endpoint with item pagination."
       operationId: "listCleanupOperations"
       responses:
         200:
@@ -78,8 +89,26 @@ paths:
   "/cleanup-operations/{cleanup_operation_id}":
     get:
       summary: "Get deletion cleanup operation"
-      description: "Returns cleanup phase, item counts, settled-state verification, retry eligibility, and safe error summaries without provider secrets."
+      description: "Returns cleanup phase, item counts, a bounded cleanup item page, settled-state verification, retry eligibility, and safe error summaries without provider secrets."
       operationId: "getCleanupOperation"
+      parameters:
+        - name: "items_page"
+          in: "query"
+          required: false
+          description: "Cleanup item page number. Values start at 1."
+          schema:
+            type: "integer"
+            default: 1
+            minimum: 1
+        - name: "items_page_size"
+          in: "query"
+          required: false
+          description: "Number of cleanup items to return in the bounded item section."
+          schema:
+            type: "integer"
+            default: 100
+            minimum: 1
+            maximum: 500
       responses:
         200:
           description: "Deletion cleanup operation."
@@ -101,8 +130,26 @@ paths:
   "/cleanup-operations/{cleanup_operation_id}/retry":
     post:
       summary: "Retry deletion cleanup operation"
-      description: "Queues retry work for retryable failed or pending cleanup items."
+      description: "Queues retry work for retryable failed or pending cleanup items and returns the operation with a bounded cleanup item page."
       operationId: "retryCleanupOperation"
+      parameters:
+        - name: "items_page"
+          in: "query"
+          required: false
+          description: "Cleanup item page number in the returned operation. Values start at 1."
+          schema:
+            type: "integer"
+            default: 1
+            minimum: 1
+        - name: "items_page_size"
+          in: "query"
+          required: false
+          description: "Number of cleanup items to return in the bounded item section."
+          schema:
+            type: "integer"
+            default: 100
+            minimum: 1
+            maximum: 500
       responses:
         200:
           description: "Deletion cleanup retry accepted."
@@ -277,11 +324,39 @@ components:
           type: "boolean"
         item_counts:
           "$ref": "#/components/schemas/CleanupItemCounts"
+        items:
+          type: "array"
+          description: "Bounded cleanup item page returned by operation detail and retry responses. Cleanup operation list responses return summaries and item counts without this section."
+          items:
+            "$ref": "#/components/schemas/CleanupItemSummary"
+        items_pagination:
+          "$ref": "#/components/schemas/CleanupItemPagination"
         created_at:
           "$ref": "#/components/schemas/Timestamp"
         updated_at:
           "$ref": "#/components/schemas/Timestamp"
       additionalProperties: true
+    CleanupItemPagination:
+      type: "object"
+      required:
+        - "page"
+        - "page_size"
+        - "total"
+        - "has_more"
+      properties:
+        page:
+          type: "integer"
+          minimum: 1
+        page_size:
+          type: "integer"
+          minimum: 1
+          maximum: 500
+        total:
+          type: "integer"
+          minimum: 0
+        has_more:
+          type: "boolean"
+      additionalProperties: false
     CleanupRetryResponse:
       type: "object"
       required:

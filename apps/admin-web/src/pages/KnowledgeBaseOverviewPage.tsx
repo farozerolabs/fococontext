@@ -15,6 +15,9 @@ import {
   CardTitle,
 } from "@/components/ui/card.js"
 
+const overviewCountListOptions = { page: 1, pageSize: 1 }
+const overviewSystemPagesListOptions = { page: 1, pageSize: 8 }
+
 export function KnowledgeBaseOverviewPage() {
   const { knowledgeBaseId } = useParams()
   const { t } = useTranslation()
@@ -22,7 +25,13 @@ export function KnowledgeBaseOverviewPage() {
 
   const overviewQuery = useQuery({
     enabled: knowledgeBaseId !== undefined,
-    queryKey: ["knowledge-bases", knowledgeBaseId, "overview"],
+    queryKey: [
+      "knowledge-bases",
+      knowledgeBaseId,
+      "overview",
+      overviewCountListOptions,
+      overviewSystemPagesListOptions,
+    ],
     queryFn: async () => {
       if (knowledgeBaseId === undefined) {
         return null
@@ -31,10 +40,19 @@ export function KnowledgeBaseOverviewPage() {
       const [knowledgeBase, sources, pages, versions, systemPages] =
         await Promise.all([
           apiClient.getKnowledgeBase(knowledgeBaseId),
-          apiClient.listSourceDocuments(knowledgeBaseId),
-          apiClient.listWikiPages(knowledgeBaseId),
-          apiClient.listKnowledgeVersions(knowledgeBaseId),
-          apiClient.listSystemPages(knowledgeBaseId),
+          apiClient.listSourceDocuments(
+            knowledgeBaseId,
+            overviewCountListOptions
+          ),
+          apiClient.listWikiPages(knowledgeBaseId, overviewCountListOptions),
+          apiClient.listKnowledgeVersions(
+            knowledgeBaseId,
+            overviewCountListOptions
+          ),
+          apiClient.listSystemPages(
+            knowledgeBaseId,
+            overviewSystemPagesListOptions
+          ),
         ])
 
       return {

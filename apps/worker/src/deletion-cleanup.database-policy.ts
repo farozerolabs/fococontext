@@ -11,6 +11,10 @@ export function getDatabaseCleanupPriority(tableName: string | null): number {
   return databaseCleanupTablePriority.get(tableName) ?? 1_000;
 }
 
+export function listDatabaseCleanupPriorityEntries(): readonly (readonly [string, number])[] {
+  return [...databaseCleanupTablePriority.entries()];
+}
+
 export function isCleanupEnabledDatabaseTable(tableName: string): boolean {
   return deletableDatabaseTables.has(tableName);
 }

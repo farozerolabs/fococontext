@@ -203,35 +203,39 @@ Rerank 使用全有或全无配置规则。所有 `RERANK_*` 都留空时禁用 
 
 ## 上传、运行压力和解析器
 
-| 字段                                         | 说明                        | 建议值                               |
-| -------------------------------------------- | --------------------------- | ------------------------------------ |
-| `UPLOAD_MAX_FILE_SIZE_MB`                    | 上传文件大小上限 MB         | 默认 `50`；生产按 API 网关和 S3 调整 |
-| `UPLOAD_MAX_CONCURRENT_FILES`                | 浏览器并发上传数            | 默认 `3`                             |
-| `UPLOAD_DIRECT_ENABLED`                      | `true` / `false`            | 有直传能力后开启                     |
-| `UPLOAD_DIRECT_THRESHOLD_MB`                 | 超过多少 MB 走直传          | 默认 `50`                            |
-| `UPLOAD_SESSION_EXPIRES_SECONDS`             | 上传会话过期秒数            | 默认 `900`                           |
-| `UPLOAD_MULTIPART_FALLBACK_MODE`             | `enabled` / `disabled`      | 默认 `enabled`                       |
-| `UPLOAD_MULTIPART_TIMEOUT_SECONDS`           | multipart 超时              | 默认 `300`                           |
-| `UPLOAD_PRESSURE_DEGRADED_THRESHOLD`         | 上传压力 degraded 阈值      | 默认 `3`                             |
-| `RUNTIME_QUEUE_DEPTH_DEGRADED_THRESHOLD`     | 总队列 degraded 阈值        | 默认 `20`                            |
-| `RUNTIME_QUEUE_DEPTH_SATURATED_THRESHOLD`    | 总队列 saturated 阈值       | 默认 `100`                           |
-| `COMPILE_QUEUE_DEPTH_DEGRADED_THRESHOLD`     | 编译队列 degraded 阈值      | 默认 `10`                            |
-| `COMPILE_QUEUE_DEPTH_SATURATED_THRESHOLD`    | 编译队列 saturated 阈值     | 默认 `50`                            |
-| `PROVIDER_FAILURE_DEGRADED_THRESHOLD`        | provider 失败 degraded 阈值 | 默认 `3`                             |
-| `EXPENSIVE_VALIDATION_ENABLED`               | 是否执行昂贵外部探测        | 默认 `false`                         |
-| `PARSER_MAX_FILE_SIZE_MB`                    | parser 接受文件大小上限     | 默认 `50`                            |
-| `PARSER_TIMEOUT_SECONDS`                     | parser 超时秒数             | 默认 `120`                           |
-| `PARSER_CONCURRENCY`                         | 解析并发兼容回退            | 默认 `2`                             |
-| `SOURCE_PARSE_CONCURRENCY`                   | 资料解析阶段并发            | 默认 `2`                             |
-| `PARSER_MAX_IMAGES_PER_DOCUMENT`             | 单文档视觉资产抽取上限      | 默认 `50`                            |
-| `PARSER_MAX_RENDERED_SNAPSHOTS_PER_DOCUMENT` | 单文档渲染页/表快照上限     | 默认 `10`                            |
-| `PARSER_MAX_IMAGE_PIXELS`                    | 单张抽取图片像素上限        | 默认 `16000000`                      |
-| `PARSER_MAX_IMAGE_BYTES`                     | 单张抽取图片字节上限        | 默认 `10485760`                      |
-| `PARSER_MIN_IMAGE_WIDTH`                     | 最小图片宽度                | 默认 `64`                            |
-| `PARSER_MIN_IMAGE_HEIGHT`                    | 最小图片高度                | 默认 `64`                            |
-| `PARSER_VISUAL_EXTRACTION_CONCURRENCY`       | 单文档视觉抽取并发          | 默认 `2`                             |
-| `PARSER_REMOTE_IMAGE_FETCHING_ENABLED`       | Markdown/HTML 远程图片抓取  | 默认 `false`                         |
-| `PARSER_PDF_SNAPSHOT_MIN_TEXT_CHARS`         | PDF 低文本页快照阈值        | 默认 `80`                            |
+| 字段                                         | 说明                           | 建议值                               |
+| -------------------------------------------- | ------------------------------ | ------------------------------------ |
+| `UPLOAD_MAX_FILE_SIZE_MB`                    | 上传文件大小上限 MB            | 默认 `50`；生产按 API 网关和 S3 调整 |
+| `UPLOAD_MAX_CONCURRENT_FILES`                | 浏览器并发上传数               | 默认 `3`                             |
+| `UPLOAD_DIRECT_ENABLED`                      | `true` / `false`               | 有直传能力后开启                     |
+| `UPLOAD_DIRECT_THRESHOLD_MB`                 | 超过多少 MB 走直传             | 默认 `50`                            |
+| `UPLOAD_SESSION_EXPIRES_SECONDS`             | 上传会话过期秒数               | 默认 `900`                           |
+| `UPLOAD_MULTIPART_FALLBACK_MODE`             | `enabled` / `disabled`         | 默认 `enabled`                       |
+| `UPLOAD_MULTIPART_TIMEOUT_SECONDS`           | multipart 超时                 | 默认 `300`                           |
+| `UPLOAD_PRESSURE_DEGRADED_THRESHOLD`         | 上传压力 degraded 阈值         | 默认 `3`                             |
+| `RUNTIME_QUEUE_DEPTH_DEGRADED_THRESHOLD`     | 总队列 degraded 阈值           | 默认 `20`                            |
+| `RUNTIME_QUEUE_DEPTH_SATURATED_THRESHOLD`    | 总队列 saturated 阈值          | 默认 `100`                           |
+| `COMPILE_QUEUE_DEPTH_DEGRADED_THRESHOLD`     | 编译队列 degraded 阈值         | 默认 `10`                            |
+| `COMPILE_QUEUE_DEPTH_SATURATED_THRESHOLD`    | 编译队列 saturated 阈值        | 默认 `50`                            |
+| `PROVIDER_FAILURE_DEGRADED_THRESHOLD`        | provider 失败 degraded 阈值    | 默认 `3`                             |
+| `EXPENSIVE_VALIDATION_ENABLED`               | 是否执行昂贵外部探测           | 默认 `false`                         |
+| `PARSER_MAX_FILE_SIZE_MB`                    | parser 接受文件大小上限        | 默认 `50`                            |
+| `PARSER_TIMEOUT_SECONDS`                     | parser 超时秒数                | 默认 `120`                           |
+| `PARSER_CONCURRENCY`                         | 解析并发兼容回退               | 默认 `2`                             |
+| `SOURCE_PARSE_CONCURRENCY`                   | 资料解析阶段并发               | 默认 `2`                             |
+| `PARSER_ZIP_MAX_ENTRIES`                     | archive entry 数量上限         | 默认 `10000`                         |
+| `PARSER_ZIP_MAX_EXPANDED_MB`                 | archive 解压后总大小上限 MB    | 默认 `1000`                          |
+| `PARSER_ZIP_MAX_ENTRY_MB`                    | 单个 archive entry 大小上限 MB | 默认 `50`                            |
+| `PARSER_MEDIA_UPLOAD_CONCURRENCY`            | 抽取媒体上传并发               | 默认 `2`                             |
+| `PARSER_MAX_IMAGES_PER_DOCUMENT`             | 单文档视觉资产抽取上限         | 默认 `50`                            |
+| `PARSER_MAX_RENDERED_SNAPSHOTS_PER_DOCUMENT` | 单文档渲染页/表快照上限        | 默认 `10`                            |
+| `PARSER_MAX_IMAGE_PIXELS`                    | 单张抽取图片像素上限           | 默认 `16000000`                      |
+| `PARSER_MAX_IMAGE_BYTES`                     | 单张抽取图片字节上限           | 默认 `10485760`                      |
+| `PARSER_MIN_IMAGE_WIDTH`                     | 最小图片宽度                   | 默认 `64`                            |
+| `PARSER_MIN_IMAGE_HEIGHT`                    | 最小图片高度                   | 默认 `64`                            |
+| `PARSER_VISUAL_EXTRACTION_CONCURRENCY`       | 单文档视觉抽取并发             | 默认 `2`                             |
+| `PARSER_REMOTE_IMAGE_FETCHING_ENABLED`       | Markdown/HTML 远程图片抓取     | 默认 `false`                         |
+| `PARSER_PDF_SNAPSHOT_MIN_TEXT_CHARS`         | PDF 低文本页快照阈值           | 默认 `80`                            |
 
 ## 队列、编译和 Retrieve
 

@@ -33,6 +33,14 @@
 | 成功响应包 | JSON 成功响应包含 `data` 和 `request_id`；列表额外包含 `pagination`。                                         |
 | 错误响应包 | 错误响应包含稳定 `error.code`、本地化 `error.message`、可选 `message_key`、结构化 `details` 和 `request_id`。 |
 
+## 服务端分页与大知识库行为
+
+列表端点会在服务端完成受限分页，然后再序列化响应。请求未传分页字段时，默认 `page_size` 为 `20`；通用最大值为 `100`，具体端点如果有不同边界，会在对应页面说明。支持 cursor 的列表接受 `cursor` 搭配 `limit` 或 `page_size`，还有下一页时返回 `pagination.next_cursor`。
+
+客户端应把过滤、搜索、排序和分页参数传给 API，由服务端按当前租户、项目和知识库 scope 查询。不要把全量行加载到前端或调用方内存后再过滤。管理后台通过 session-authenticated routes 使用同一套服务行为。
+
+Runtime status 会在 `dependencies.metrics.api`、`dependencies.metrics.cache` 和相关 pressure 字段中暴露安全的运行信号。这些字段适合接入监控面板和支持日志：它们展示端点分组、延迟桶、返回数量、page size、cache hit/miss 汇总、图谱就绪状态和 warning code 计数，同时不会泄露租户数据、API Key、对象 key 或原始文档内容。
+
 ## OpenAPI
 
 ```yaml
@@ -184,6 +192,11 @@ components:
           minimum: 0
         has_more:
           type: "boolean"
+        next_cursor:
+          oneOf:
+            - type: "string"
+            - type: "null"
+          description: "支持 cursor 的列表在还有下一页时返回的不透明游标。"
 ```
 
 ## 请求示例

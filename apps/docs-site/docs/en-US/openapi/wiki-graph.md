@@ -31,13 +31,23 @@ Use this page to render generated Wiki Pages, inspect page relationships, expose
 
 ## Field Guide
 
-| Field               | Meaning                                                                               |
-| ------------------- | ------------------------------------------------------------------------------------- |
-| `page_type`         | `source`, `entity`, `concept`, `synthesis`, `comparison`, `query`, or `system`.       |
-| `source_refs`       | Traceability records pointing back to text, OCR, or image caption evidence.           |
-| `relation_type`     | `wikilink`, `shared_source`, `common_neighbor`, `type_affinity`, or `manual`.         |
-| `visibility_origin` | Distinguishes canonical, inherited upstream, and fork-owned records.                  |
-| `graph_insights`    | Communities, bridges, isolated pages, sparse areas, gaps, and surprising connections. |
+| Field               | Meaning                                                                                                |
+| ------------------- | ------------------------------------------------------------------------------------------------------ |
+| `page_type`         | `source`, `entity`, `concept`, `synthesis`, `comparison`, `query`, or `system`.                        |
+| `source_refs`       | Traceability records pointing back to text, OCR, or image caption evidence.                            |
+| `relation_type`     | `wikilink`, `shared_source`, `common_neighbor`, `type_affinity`, or `manual`.                          |
+| `visibility_origin` | Distinguishes canonical, inherited upstream, and fork-owned records.                                   |
+| `graph_insights`    | Communities, bridges, isolated pages, sparse areas, gaps, and surprising connections.                  |
+| `graph_readiness`   | Materialized graph insight state returned by graph-aware APIs.                                         |
+| `warnings`          | Non-fatal graph warning codes such as `graph.readiness.updating` or `graph.limit.edge_budget_reached`. |
+
+## Graph Readiness
+
+Graph APIs and Retrieve responses can include `graph_readiness` so clients can distinguish direct Wiki retrieval from materialized graph insight readiness. The state is one of `queued`, `updating`, `ready`, `failed`, `partial`, or `stale`.
+
+Use `ready` for graph insight dashboards and graph-heavy Agent expansion. For `queued` or `updating`, show progress and retry later. For `partial`, `stale`, or `failed`, keep the direct Wiki result usable and mark graph insight sections as limited. Non-ready states are also surfaced through request warnings as `graph.readiness.<state>`.
+
+Large Knowledge Bases should page Wiki pages and system pages through the list APIs instead of requesting every node for UI filtering. Use graph endpoints for the current view, Retrieve Expand for layered exploration, and runtime metrics for pressure signals.
 
 ## OpenAPI
 

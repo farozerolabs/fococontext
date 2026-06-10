@@ -33,6 +33,14 @@ Use the authenticated contract to discover all available paths, schemas, respons
 | Response envelope | Successful JSON responses include `data` and `request_id`; lists also include `pagination`.                                    |
 | Error envelope    | Errors include stable `error.code`, localized `error.message`, optional `message_key`, structured `details`, and `request_id`. |
 
+## Server-Side Pagination and Large-KB Behavior
+
+List endpoints apply bounded server-side pagination before the response is serialized. If a request omits pagination fields, the default `page_size` is `20`; the general maximum is `100` unless an endpoint documents a narrower or wider bound. Cursor-enabled lists accept `cursor` plus `limit` or `page_size`, and return `pagination.next_cursor` when another page remains.
+
+Clients should send filters, search terms, sorting, and pagination parameters to the API instead of loading all rows and filtering in memory. The Admin Console follows the same public service behavior through its session-authenticated routes.
+
+Runtime status exposes safe operational signals under `dependencies.metrics.api`, `dependencies.metrics.cache`, and related pressure fields. These fields are designed for dashboards and support logs: they report endpoint groups, latency buckets, returned counts, page sizes, cache hit/miss summaries, graph readiness states, and warning-code counts without leaking tenant data, API keys, object keys, or raw document content.
+
 ## OpenAPI
 
 ```yaml
@@ -184,6 +192,11 @@ components:
           minimum: 0
         has_more:
           type: "boolean"
+        next_cursor:
+          oneOf:
+            - type: "string"
+            - type: "null"
+          description: "Opaque cursor for the next page on cursor-enabled lists."
 ```
 
 ## Request Example

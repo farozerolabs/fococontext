@@ -1,7 +1,12 @@
 import { Injectable } from "@nestjs/common";
-import { maskSecret, type ReleaseMetadata, type RuntimeConfig } from "@fococontext/core";
+import {
+  maskSecret,
+  snapshotRuntimeCacheMetrics,
+  type ReleaseMetadata,
+  type RuntimeConfig,
+} from "@fococontext/core";
 import { openApiDocument } from "@fococontext/contracts";
-import type { DefaultIdentitySeed } from "@fococontext/db";
+import { getOrderedSqlMigrations, type DefaultIdentitySeed } from "@fococontext/db";
 import {
   defaultObjectStorageOperationRecorder,
   type ObjectStorageOperationClass,
@@ -19,6 +24,7 @@ import type {
 } from "../documents/document.types.js";
 import type { UploadAdmissionService } from "../documents/upload-admission.service.js";
 import { snapshotRetrievalQualityMetrics } from "../retrieve/retrieve-quality-metrics.js";
+import { snapshotRuntimeApiMetrics } from "../runtime/runtime-api-metrics.js";
 
 @Injectable()
 export class SystemStatusService {
@@ -125,6 +131,7 @@ export class SystemStatusService {
       upload: this.getUploadRuntimeStatus(),
       pressure: this.getPressureStatus(),
       metrics: this.getRuntimeMetricsStatus(),
+      migration: this.getMigrationRuntimeStatus(),
       cleanupQueue: this.getCleanupQueueStatus(),
       ocr: await this.getOcrRuntimeStatus(),
       sourceWatch: this.getSourceWatchRuntimeStatus(),
@@ -240,6 +247,8 @@ export class SystemStatusService {
     );
 
     return {
+      api: snapshotRuntimeApiMetrics(),
+      cache: snapshotRuntimeCacheMetrics(),
       sourceJobs,
       objectStorageOperations,
       retrievalQuality: snapshotRetrievalQualityMetrics(),
@@ -254,6 +263,22 @@ export class SystemStatusService {
         retryCount: sourceJobs.retryCount,
         stageDurations: sourceJobs.stageDurations,
       },
+    };
+  }
+
+  private getMigrationRuntimeStatus() {
+    const migrations = readAvailableMigrations();
+    const targetSchemaVersion = migrations.at(-1)?.name ?? null;
+
+    return {
+      status: this.config.database.url === undefined ? "database_not_configured" : "managed",
+      mode: "dedicated_migration_service",
+      startupService: "migrate",
+      currentSchemaVersion: null,
+      targetSchemaVersion,
+      knownMigrationCount: migrations.length,
+      pendingCount: null,
+      lastOutcome: "managed_by_startup_service",
     };
   }
 
@@ -954,6 +979,16 @@ function summarizeDurations<TKey extends string>(
   }
 
   return summary;
+}
+
+function readAvailableMigrations(): Array<{ name: string }> {
+  try {
+    return getOrderedSqlMigrations().map((migration) => ({
+      name: migration.name,
+    }));
+  } catch {
+    return [];
+  }
 }
 
 function classifyPressureState(

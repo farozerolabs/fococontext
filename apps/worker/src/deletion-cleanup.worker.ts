@@ -24,6 +24,7 @@ import {
   isCleanupEnabledDatabaseTable,
   isScopedCleanupTable,
   isTenantProjectScopedDatabaseTable,
+  listDatabaseCleanupPriorityEntries,
 } from "./deletion-cleanup.database-policy.js";
 import type { WorkerWebhookEventEmitter } from "./webhook-dispatch.worker.js";
 
@@ -58,6 +59,18 @@ export interface DeletionCleanupStore {
   listItemsByOperationId(
     operationId: string,
   ): DeletionCleanupItemRecord[] | Promise<DeletionCleanupItemRecord[]>;
+  listRetryableItemsByOperationId?(
+    operationId: string,
+    input: ListRetryableDeletionCleanupItemsInput,
+  ): DeletionCleanupItemRecord[] | Promise<DeletionCleanupItemRecord[]>;
+  countItemsByOperationId?(
+    operationId: string,
+  ): DeletionCleanupOperationItemCounts | Promise<DeletionCleanupOperationItemCounts>;
+  hasFailedItemsByOperationId?(
+    operationId: string,
+    input?: { itemType?: DeletionCleanupItemType },
+  ): boolean | Promise<boolean>;
+  hasRetryableItemsByOperationId?(operationId: string): boolean | Promise<boolean>;
   upsertItem(
     record: DeletionCleanupItemRecord,
   ): DeletionCleanupItemRecord | Promise<DeletionCleanupItemRecord>;
@@ -66,6 +79,22 @@ export interface DeletionCleanupStore {
   ):
     | { deletedItems: number; deletedOperations: number }
     | Promise<{ deletedItems: number; deletedOperations: number }>;
+}
+
+export interface ListRetryableDeletionCleanupItemsInput {
+  itemType: "object" | "database_row";
+  limit: number;
+  retryFailedBefore: string;
+}
+
+export interface DeletionCleanupOperationItemCounts {
+  totalItemCount: number;
+  pendingItemCount: number;
+  deletedItemCount: number;
+  skippedItemCount: number;
+  failedItemCount: number;
+  objectKeyCount: number;
+  databaseRowCount: number;
 }
 
 export interface DeletionCleanupDatabaseCleaner {
@@ -106,10 +135,21 @@ export interface DeletionCleanupProcessorOptions {
   repository: DeletionCleanupStore;
   objectStorage: ObjectStorageAdapter;
   databaseCleanup?: DeletionCleanupDatabaseCleaner;
+  manifestPlanner?: DeletionCleanupManifestPlanner;
   targetGuard?: DeletionCleanupTargetGuard;
   webhookEvents?: WorkerWebhookEventEmitter;
   objectBatchSize?: number;
   now?: () => string;
+}
+
+export interface DeletionCleanupManifestPlanInput {
+  operation: DeletionCleanupOperationRecord;
+  repository: DeletionCleanupStore;
+  now: () => string;
+}
+
+export interface DeletionCleanupManifestPlanner {
+  planOperation(input: DeletionCleanupManifestPlanInput): Promise<DeletionCleanupOperationRecord>;
 }
 
 export class BullMqDeletionCleanupQueue implements DeletionCleanupQueue {
@@ -228,30 +268,38 @@ export class DeletionCleanupProcessor {
       });
     }
 
-    const started = await this.updateOperation(fenced, {
+    const planned = await this.ensureManifestPlanned(fenced);
+
+    if (planned.status === "failed" || planned.status === "canceled") {
+      return planned;
+    }
+
+    const started = await this.updateOperation(planned, {
       status: "running",
       phase: "object_cleanup",
       updatedAt: this.now(),
     });
-    const items = await this.options.repository.listItemsByOperationId(operationId);
-    const objectItems = items.filter(isRetryableObjectItem);
+    let objectItems = await this.listRetryableItems(operationId, "object", started.updatedAt);
 
-    if (objectItems.length > 0) {
+    while (objectItems.length > 0) {
       await this.deleteObjectItems(objectItems);
+      if (await this.hasFailedItems(operationId, "object")) {
+        return this.finishOperation(started.id);
+      }
+      objectItems = await this.listRetryableItems(operationId, "object", started.updatedAt);
     }
 
-    const afterObjects = await this.options.repository.listItemsByOperationId(operationId);
-    const objectFailed = afterObjects.some(
-      (item) => item.itemType === "object" && item.status === "failed",
-    );
+    const objectFailed = await this.hasFailedItems(operationId, "object");
 
     if (objectFailed) {
       return this.finishOperation(started.id);
     }
 
-    const databaseItems = afterObjects
-      .filter(isRetryableDatabaseItem)
-      .sort(compareDatabaseCleanupItems);
+    let databaseItems = await this.listRetryableItems(
+      operationId,
+      "database_row",
+      started.updatedAt,
+    );
 
     if (databaseItems.length > 0) {
       const databasePhase = await this.updateOperation(started, {
@@ -259,7 +307,18 @@ export class DeletionCleanupProcessor {
         phase: "database_cleanup",
         updatedAt: this.now(),
       });
-      await this.deleteDatabaseItems(databaseItems);
+
+      while (databaseItems.length > 0) {
+        await this.deleteDatabaseItems(databaseItems);
+        if (await this.hasFailedItems(operationId, "database_row")) {
+          return this.finishOperation(databasePhase.id);
+        }
+        databaseItems = await this.listRetryableItems(
+          operationId,
+          "database_row",
+          databasePhase.updatedAt,
+        );
+      }
 
       return this.finishOperation(databasePhase.id);
     }
@@ -414,15 +473,10 @@ export class DeletionCleanupProcessor {
       throw new Error("Cleanup operation not found.");
     }
 
-    const items = await this.options.repository.listItemsByOperationId(operationId);
-    const counts = countItems(items);
+    const counts = await this.countItems(operationId);
     const now = this.now();
     const hasIncomplete = counts.failedItemCount > 0 || counts.pendingItemCount > 0;
-    const retryable = items.some(
-      (item) =>
-        (item.status === "pending" || item.status === "failed") &&
-        item.attemptCount < item.maxAttempts,
-    );
+    const retryable = await this.hasRetryableItems(operationId);
 
     const updated = await this.updateOperation(operation, {
       ...counts,
@@ -459,6 +513,58 @@ export class DeletionCleanupProcessor {
     return updated;
   }
 
+  private async ensureManifestPlanned(
+    operation: DeletionCleanupOperationRecord,
+  ): Promise<DeletionCleanupOperationRecord> {
+    if (!shouldPlanManifest(operation)) {
+      return operation;
+    }
+
+    const planning = await this.updateOperation(operation, {
+      status: "running",
+      phase: "manifest",
+      manifest: {
+        ...operation.manifest,
+        planning_status: "running",
+      },
+      startedAt: operation.startedAt ?? this.now(),
+      updatedAt: this.now(),
+    });
+
+    if (this.options.manifestPlanner === undefined) {
+      return this.updateOperation(planning, {
+        status: "failed",
+        phase: "manifest",
+        retryable: true,
+        lastError: {
+          message: "Deletion cleanup manifest planner is not configured.",
+        },
+        failedAt: this.now(),
+        updatedAt: this.now(),
+      });
+    }
+
+    try {
+      return await this.options.manifestPlanner.planOperation({
+        operation: planning,
+        repository: this.options.repository,
+        now: this.now,
+      });
+    } catch (error) {
+      return this.updateOperation(planning, {
+        status: "failed",
+        phase: "manifest",
+        retryable: true,
+        lastError: {
+          message:
+            error instanceof Error ? error.message : "Deletion cleanup manifest planning failed.",
+        },
+        failedAt: this.now(),
+        updatedAt: this.now(),
+      });
+    }
+  }
+
   private async updateOperation(
     operation: DeletionCleanupOperationRecord,
     patch: Partial<DeletionCleanupOperationRecord>,
@@ -467,6 +573,85 @@ export class DeletionCleanupProcessor {
       ...operation,
       ...patch,
     });
+  }
+
+  private getItemPageLimit(): number {
+    return Math.max(1, this.options.objectBatchSize ?? 100);
+  }
+
+  private async listRetryableItems(
+    operationId: string,
+    itemType: "object" | "database_row",
+    retryFailedBefore: string,
+  ): Promise<DeletionCleanupItemRecord[]> {
+    const limit = this.getItemPageLimit();
+    const listRetryable = this.options.repository.listRetryableItemsByOperationId;
+
+    if (listRetryable !== undefined) {
+      return listRetryable.call(this.options.repository, operationId, {
+        itemType,
+        limit,
+        retryFailedBefore,
+      });
+    }
+
+    const items = await this.options.repository.listItemsByOperationId(operationId);
+    const retryableItems = items.filter((item) =>
+      itemType === "object"
+        ? isRetryableObjectItem(item, retryFailedBefore)
+        : isRetryableDatabaseItem(item, retryFailedBefore),
+    );
+    const sortedItems =
+      itemType === "database_row"
+        ? retryableItems.sort(compareDatabaseCleanupItems)
+        : retryableItems;
+
+    return sortedItems.slice(0, limit);
+  }
+
+  private async hasFailedItems(
+    operationId: string,
+    itemType: DeletionCleanupItemType,
+  ): Promise<boolean> {
+    const hasFailed = this.options.repository.hasFailedItemsByOperationId;
+
+    if (hasFailed !== undefined) {
+      return hasFailed.call(this.options.repository, operationId, {
+        itemType,
+      });
+    }
+
+    const items = await this.options.repository.listItemsByOperationId(operationId);
+
+    return items.some((item) => item.itemType === itemType && item.status === "failed");
+  }
+
+  private async hasRetryableItems(operationId: string): Promise<boolean> {
+    const hasRetryable = this.options.repository.hasRetryableItemsByOperationId;
+
+    if (hasRetryable !== undefined) {
+      return hasRetryable.call(this.options.repository, operationId);
+    }
+
+    const items = await this.options.repository.listItemsByOperationId(operationId);
+
+    return items.some(
+      (item) =>
+        (item.status === "pending" || item.status === "failed") &&
+        item.attemptCount < item.maxAttempts,
+    );
+  }
+
+  private async countItems(operationId: string): Promise<DeletionCleanupOperationItemCounts> {
+    const countItemsByOperationId = this.options.repository.countItemsByOperationId;
+
+    if (countItemsByOperationId !== undefined) {
+      return countItemsByOperationId.call(this.options.repository, operationId);
+    }
+
+    const items = await this.options.repository.listItemsByOperationId(operationId);
+
+    return countItems(items);
   }
 }
 
@@ -650,6 +835,138 @@ export class PostgresDeletionCleanupRepository implements DeletionCleanupStore {
     return result.rows.map(toItemRecord);
   }
 
+  async listRetryableItemsByOperationId(
+    operationId: string,
+    input: ListRetryableDeletionCleanupItemsInput,
+  ): Promise<DeletionCleanupItemRecord[]> {
+    if (input.itemType === "object") {
+      const result = await sql<DeletionCleanupItemRow>`
+        select
+          id,
+          operation_id,
+          item_type,
+          resource_type,
+          resource_id,
+          object_key,
+          table_name,
+          knowledge_base_id,
+          source_document_id,
+          status,
+          phase,
+          attempt_count,
+          max_attempts,
+          last_error,
+          skip_reason,
+          retry_after,
+          retained_until,
+          created_at,
+          updated_at,
+          completed_at
+        from deletion_cleanup_items
+        where operation_id = ${operationId}
+          and item_type = 'object'
+          and object_key is not null
+          and attempt_count < max_attempts
+          and (
+            status = 'pending'
+            or (status = 'failed' and updated_at <= ${input.retryFailedBefore})
+          )
+        order by created_at asc, id asc
+        limit ${input.limit}
+      `.execute(this.db);
+
+      return result.rows.map(toItemRecord);
+    }
+
+    const result = await sql<DeletionCleanupItemRow>`
+      select
+        id,
+        operation_id,
+        item_type,
+        resource_type,
+        resource_id,
+        object_key,
+        table_name,
+        knowledge_base_id,
+        source_document_id,
+        status,
+        phase,
+        attempt_count,
+        max_attempts,
+        last_error,
+        skip_reason,
+        retry_after,
+        retained_until,
+        created_at,
+        updated_at,
+        completed_at
+      from deletion_cleanup_items
+      where operation_id = ${operationId}
+        and item_type = 'database_row'
+        and table_name is not null
+        and resource_id is not null
+        and attempt_count < max_attempts
+        and (
+          status = 'pending'
+          or (status = 'failed' and updated_at <= ${input.retryFailedBefore})
+        )
+      order by ${databaseCleanupPriorityOrderSql()} asc, resource_id asc, id asc
+      limit ${input.limit}
+    `.execute(this.db);
+
+    return result.rows.map(toItemRecord);
+  }
+
+  async countItemsByOperationId(operationId: string): Promise<DeletionCleanupOperationItemCounts> {
+    const result = await sql<DeletionCleanupItemCountRow>`
+      select
+        count(*)::text as total_item_count,
+        count(*) filter (where status in ('pending', 'running'))::text as pending_item_count,
+        count(*) filter (where status = 'deleted')::text as deleted_item_count,
+        count(*) filter (where status = 'skipped')::text as skipped_item_count,
+        count(*) filter (where status = 'failed')::text as failed_item_count,
+        count(*) filter (where object_key is not null)::text as object_key_count,
+        count(*) filter (where table_name is not null)::text as database_row_count
+      from deletion_cleanup_items
+      where operation_id = ${operationId}
+    `.execute(this.db);
+
+    return toItemCounts(result.rows[0]);
+  }
+
+  async hasFailedItemsByOperationId(
+    operationId: string,
+    input: { itemType?: DeletionCleanupItemType } = {},
+  ): Promise<boolean> {
+    const result = await sql<{ exists: boolean }>`
+      select exists (
+        select 1
+        from deletion_cleanup_items
+        where operation_id = ${operationId}
+          and status = 'failed'
+          ${input.itemType === undefined ? sql`` : sql`and item_type = ${input.itemType}`}
+        limit 1
+      ) as exists
+    `.execute(this.db);
+
+    return result.rows[0]?.exists ?? false;
+  }
+
+  async hasRetryableItemsByOperationId(operationId: string): Promise<boolean> {
+    const result = await sql<{ exists: boolean }>`
+      select exists (
+        select 1
+        from deletion_cleanup_items
+        where operation_id = ${operationId}
+          and status in ('pending', 'failed')
+          and attempt_count < max_attempts
+        limit 1
+      ) as exists
+    `.execute(this.db);
+
+    return result.rows[0]?.exists ?? false;
+  }
+
   async upsertItem(record: DeletionCleanupItemRecord): Promise<DeletionCleanupItemRecord> {
     const scope = await requireCleanupItemTenantProject(this.db, record);
 
@@ -743,6 +1060,242 @@ export class PostgresDeletionCleanupRepository implements DeletionCleanupStore {
       deletedItems: Number(deletedItems.rows[0]?.count ?? 0),
       deletedOperations: deletedOperations.rows.length,
     };
+  }
+}
+
+export class PostgresDeletionCleanupManifestPlanner implements DeletionCleanupManifestPlanner {
+  constructor(private readonly db: Kysely<DatabaseSchema>) {}
+
+  async planOperation(
+    input: DeletionCleanupManifestPlanInput,
+  ): Promise<DeletionCleanupOperationRecord> {
+    if (input.operation.targetType !== "knowledge_base") {
+      return input.operation;
+    }
+
+    await this.insertKnowledgeBaseManifestItems(input.operation, input.now());
+    const counts = await readOperationItemCounts(input.repository, input.operation.id);
+    const now = input.now();
+
+    return input.repository.updateOperation({
+      ...input.operation,
+      ...counts,
+      status: "running",
+      phase: "manifest",
+      manifest: {
+        ...input.operation.manifest,
+        target_type: input.operation.targetType,
+        target_id: input.operation.targetId,
+        knowledge_base_id: input.operation.knowledgeBaseId,
+        object_key_count: counts.objectKeyCount,
+        database_row_count: counts.databaseRowCount,
+        skipped_reference_count: 0,
+        total_item_count: counts.totalItemCount,
+        item_page_size: counts.totalItemCount,
+        item_page_count: counts.totalItemCount === 0 ? 0 : 1,
+        planning_status: "completed",
+        planning_mode: "worker_bounded_db",
+      },
+      retryable: true,
+      lastError: null,
+      updatedAt: now,
+    });
+  }
+
+  private async insertKnowledgeBaseManifestItems(
+    operation: DeletionCleanupOperationRecord,
+    now: string,
+  ): Promise<void> {
+    const scope = await requirePersistedCleanupOperationTenantProject(this.db, operation.id);
+    const forkScopedRowsSql = createForkScopedManifestRowsSql();
+
+    await sql`
+      with target_kb as (
+        select id, knowledge_base_type
+        from knowledge_bases
+        where id = ${operation.targetId}
+          and tenant_id = ${scope.tenantId}
+          and project_id = ${scope.projectId}
+        limit 1
+      ),
+      object_rows as (
+        select distinct on (object_key)
+          'object'::text as item_type,
+          resource_type,
+          resource_id,
+          object_key,
+          null::text as table_name,
+          10 as sort_group,
+          object_key as sort_key
+        from (
+          select
+            'source_documents'::text as resource_type,
+            source_documents.id as resource_id,
+            source_documents.object_key as object_key
+          from source_documents
+          inner join target_kb on target_kb.id = source_documents.knowledge_base_id
+          where source_documents.object_key is not null
+          union all
+          select
+            'parsed_contents'::text as resource_type,
+            parsed_contents.id as resource_id,
+            parsed_contents.normalized_markdown_object_key as object_key
+          from parsed_contents
+          inner join source_documents on source_documents.id = parsed_contents.source_document_id
+          inner join target_kb on target_kb.id = source_documents.knowledge_base_id
+          where parsed_contents.normalized_markdown_object_key is not null
+          union all
+          select
+            'parsed_contents'::text as resource_type,
+            parsed_contents.id as resource_id,
+            parsed_contents.plain_text_object_key as object_key
+          from parsed_contents
+          inner join source_documents on source_documents.id = parsed_contents.source_document_id
+          inner join target_kb on target_kb.id = source_documents.knowledge_base_id
+          where parsed_contents.plain_text_object_key is not null
+          union all
+          select
+            'parsed_contents'::text as resource_type,
+            parsed_contents.id as resource_id,
+            parsed_contents.captioned_markdown_object_key as object_key
+          from parsed_contents
+          inner join source_documents on source_documents.id = parsed_contents.source_document_id
+          inner join target_kb on target_kb.id = source_documents.knowledge_base_id
+          where parsed_contents.captioned_markdown_object_key is not null
+          union all
+          select
+            'media_assets'::text as resource_type,
+            media_assets.id as resource_id,
+            media_assets.object_key as object_key
+          from media_assets
+          inner join source_documents on source_documents.id = media_assets.source_document_id
+          inner join target_kb on target_kb.id = source_documents.knowledge_base_id
+          where media_assets.object_key is not null
+        ) raw_object_rows
+        order by object_key, resource_type, resource_id
+      ),
+      database_rows as (
+        select distinct on (table_name, resource_type, resource_id)
+          'database_row'::text as item_type,
+          resource_type,
+          resource_id,
+          null::text as object_key,
+          table_name,
+          1000 + ${databaseCleanupPriorityOrderSql()} as sort_group,
+          resource_id as sort_key
+        from (
+          select
+            'knowledge_bases'::text as resource_type,
+            target_kb.id as resource_id,
+            'knowledge_bases'::text as table_name
+          from target_kb
+          union all
+          select
+            'source_documents'::text as resource_type,
+            source_documents.id as resource_id,
+            'source_documents'::text as table_name
+          from source_documents
+          inner join target_kb on target_kb.id = source_documents.knowledge_base_id
+          union all
+          select
+            'parsed_contents'::text as resource_type,
+            parsed_contents.id as resource_id,
+            'parsed_contents'::text as table_name
+          from parsed_contents
+          inner join source_documents on source_documents.id = parsed_contents.source_document_id
+          inner join target_kb on target_kb.id = source_documents.knowledge_base_id
+          union all
+          select
+            'media_assets'::text as resource_type,
+            media_assets.id as resource_id,
+            'media_assets'::text as table_name
+          from media_assets
+          inner join source_documents on source_documents.id = media_assets.source_document_id
+          inner join target_kb on target_kb.id = source_documents.knowledge_base_id
+          union all
+          select
+            'jobs'::text as resource_type,
+            jobs.id as resource_id,
+            'jobs'::text as table_name
+          from jobs
+          inner join target_kb on target_kb.id = jobs.knowledge_base_id
+          union all
+          select
+            'job_events'::text as resource_type,
+            jobs.id || ':' || job_events.created_at::text || ':' || job_events.event_type as resource_id,
+            'job_events'::text as table_name
+          from job_events
+          inner join jobs on jobs.id = job_events.job_id
+          inner join target_kb on target_kb.id = jobs.knowledge_base_id
+          union all
+          ${forkScopedRowsSql}
+        ) raw_database_rows
+        order by table_name, resource_type, resource_id
+      ),
+      numbered_items as (
+        select
+          row_number() over (order by sort_group asc, sort_key asc, resource_type asc, resource_id asc) as item_index,
+          item_type,
+          resource_type,
+          resource_id,
+          object_key,
+          table_name
+        from (
+          select * from object_rows
+          union all
+          select * from database_rows
+        ) manifest_rows
+      )
+      insert into deletion_cleanup_items (
+        id,
+        tenant_id,
+        project_id,
+        operation_id,
+        item_type,
+        resource_type,
+        resource_id,
+        object_key,
+        table_name,
+        knowledge_base_id,
+        source_document_id,
+        status,
+        phase,
+        attempt_count,
+        max_attempts,
+        last_error,
+        skip_reason,
+        retry_after,
+        retained_until,
+        created_at,
+        updated_at,
+        completed_at
+      )
+      select
+        ${operation.id} || '_item_' || lpad(item_index::text, 6, '0'),
+        ${scope.tenantId},
+        ${scope.projectId},
+        ${operation.id},
+        item_type,
+        resource_type,
+        resource_id,
+        object_key,
+        table_name,
+        ${operation.knowledgeBaseId},
+        null,
+        'pending',
+        'queued',
+        0,
+        ${operation.maxAttempts},
+        null,
+        null,
+        null,
+        ${operation.itemRetentionExpiresAt},
+        ${now},
+        ${now},
+        null
+      from numbered_items
+      on conflict (id) do nothing
+    `.execute(this.db);
   }
 }
 
@@ -965,21 +1518,50 @@ export class PostgresDeletionCleanupTargetGuard implements DeletionCleanupTarget
   }
 }
 
-function isRetryableObjectItem(item: DeletionCleanupItemRecord): boolean {
+function shouldPlanManifest(operation: DeletionCleanupOperationRecord): boolean {
+  return (
+    operation.targetType === "knowledge_base" &&
+    operation.totalItemCount === 0 &&
+    operation.manifest.planning_status !== "completed"
+  );
+}
+
+async function readOperationItemCounts(
+  repository: DeletionCleanupStore,
+  operationId: string,
+): Promise<DeletionCleanupOperationItemCounts> {
+  if (repository.countItemsByOperationId !== undefined) {
+    return repository.countItemsByOperationId(operationId);
+  }
+
+  const items = await repository.listItemsByOperationId(operationId);
+
+  return countItems(items);
+}
+
+function isRetryableObjectItem(
+  item: DeletionCleanupItemRecord,
+  retryFailedBefore = "9999-12-31T23:59:59.999Z",
+): boolean {
   return (
     item.itemType === "object" &&
     item.objectKey !== null &&
-    (item.status === "pending" || item.status === "failed") &&
+    (item.status === "pending" ||
+      (item.status === "failed" && item.updatedAt <= retryFailedBefore)) &&
     item.attemptCount < item.maxAttempts
   );
 }
 
-function isRetryableDatabaseItem(item: DeletionCleanupItemRecord): boolean {
+function isRetryableDatabaseItem(
+  item: DeletionCleanupItemRecord,
+  retryFailedBefore = "9999-12-31T23:59:59.999Z",
+): boolean {
   return (
     item.itemType === "database_row" &&
     item.tableName !== null &&
     item.resourceId !== null &&
-    (item.status === "pending" || item.status === "failed") &&
+    (item.status === "pending" ||
+      (item.status === "failed" && item.updatedAt <= retryFailedBefore)) &&
     item.attemptCount < item.maxAttempts
   );
 }
@@ -1067,6 +1649,16 @@ interface DeletionCleanupItemRow {
   completed_at: Date | string | null;
 }
 
+interface DeletionCleanupItemCountRow {
+  total_item_count: string;
+  pending_item_count: string;
+  deleted_item_count: string;
+  skipped_item_count: string;
+  failed_item_count: string;
+  object_key_count: string;
+  database_row_count: string;
+}
+
 function toOperationRecord(row: DeletionCleanupOperationRow): DeletionCleanupOperationRecord {
   return {
     id: row.id,
@@ -1126,6 +1718,70 @@ function toItemRecord(row: DeletionCleanupItemRow): DeletionCleanupItemRecord {
     completedAt: normalizeNullableTimestamp(row.completed_at),
   };
 }
+
+function toItemCounts(
+  row: DeletionCleanupItemCountRow | undefined,
+): DeletionCleanupOperationItemCounts {
+  return {
+    totalItemCount: Number(row?.total_item_count ?? 0),
+    pendingItemCount: Number(row?.pending_item_count ?? 0),
+    deletedItemCount: Number(row?.deleted_item_count ?? 0),
+    skippedItemCount: Number(row?.skipped_item_count ?? 0),
+    failedItemCount: Number(row?.failed_item_count ?? 0),
+    objectKeyCount: Number(row?.object_key_count ?? 0),
+    databaseRowCount: Number(row?.database_row_count ?? 0),
+  };
+}
+
+function databaseCleanupPriorityOrderSql() {
+  const caseClauses = listDatabaseCleanupPriorityEntries()
+    .map(([tableName, priority]) => `when table_name = '${tableName}' then ${priority}`)
+    .join(" ");
+
+  return sql.raw(`case ${caseClauses} else 1000 end`);
+}
+
+function createForkScopedManifestRowsSql() {
+  const values = forkOwnedOverlayTables.map((tableName) => `('${tableName}'::text)`).join(", ");
+
+  return sql.raw(`
+    select
+      scoped.table_name || '.owner_knowledge_base_id' as resource_type,
+      target_kb.id as resource_id,
+      scoped.table_name as table_name
+    from target_kb
+    cross join (values ${values}) as scoped(table_name)
+    where target_kb.knowledge_base_type = 'fork'
+  `);
+}
+
+const forkOwnedOverlayTables = [
+  "source_documents",
+  "parsed_contents",
+  "media_assets",
+  "ocr_page_statuses",
+  "ocr_blocks",
+  "ocr_artifacts",
+  "media_caption_cache",
+  "wiki_pages",
+  "wiki_page_versions",
+  "system_pages",
+  "wiki_edges",
+  "wiki_edge_sources",
+  "wiki_analysis_results",
+  "wiki_draft_candidates",
+  "compile_stage_executions",
+  "knowledge_versions",
+  "change_sets",
+  "change_set_items",
+  "rollback_records",
+  "page_merge_records",
+  "knowledge_checks",
+  "duplicate_decisions",
+  "delete_impact_previews",
+  "page_embeddings",
+  "retrieval_traces",
+] as const;
 
 function normalizeJsonObject(value: unknown): Record<string, unknown> {
   if (typeof value === "object" && value !== null && !Array.isArray(value)) {

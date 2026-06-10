@@ -443,6 +443,7 @@ export interface Pagination {
   page_size: number;
   total: number;
   has_more: boolean;
+  next_cursor?: string | null;
 }
 
 export interface SuccessEnvelope<TData> {
@@ -562,16 +563,21 @@ export function createListEnvelope<TItem>(
   data: readonly TItem[],
   input: ListEnvelopeInput,
 ): ListEnvelope<TItem> {
-  const { page, page_size, total, has_more, requestId } = input;
+  const { page, page_size, total, has_more, next_cursor, requestId } = input;
+  const pagination: Pagination = {
+    page,
+    page_size,
+    total,
+    has_more,
+  };
+
+  if (next_cursor !== undefined) {
+    pagination.next_cursor = next_cursor;
+  }
 
   return {
     data,
-    pagination: {
-      page,
-      page_size,
-      total,
-      has_more,
-    },
+    pagination,
     request_id: requestId,
   };
 }
@@ -776,6 +782,13 @@ const paginationParameters = [
   { $ref: "#/components/parameters/PageSize" },
 ] as const;
 
+const cursorPaginationParameters = [
+  { $ref: "#/components/parameters/Page" },
+  { $ref: "#/components/parameters/PageSize" },
+  { $ref: "#/components/parameters/Cursor" },
+  { $ref: "#/components/parameters/Limit" },
+] as const;
+
 export const openApiComponents = {
   securitySchemes: {
     bearerAuth: {
@@ -826,6 +839,51 @@ export const openApiComponents = {
       schema: {
         default: 20,
         maximum: 100,
+        minimum: 1,
+        type: "integer",
+      },
+    },
+    Cursor: {
+      name: "cursor",
+      in: "query",
+      required: false,
+      description: "Opaque cursor returned in `pagination.next_cursor` by cursor-enabled lists.",
+      schema: {
+        type: "string",
+      },
+    },
+    Limit: {
+      name: "limit",
+      in: "query",
+      required: false,
+      description:
+        "Cursor page size alias for cursor-enabled lists. When both `limit` and `page_size` are provided, `limit` is used.",
+      schema: {
+        default: 20,
+        maximum: 100,
+        minimum: 1,
+        type: "integer",
+      },
+    },
+    CleanupItemsPage: {
+      name: "items_page",
+      in: "query",
+      required: false,
+      description: "Page number for cleanup operation items. Values start at 1.",
+      schema: {
+        default: 1,
+        minimum: 1,
+        type: "integer",
+      },
+    },
+    CleanupItemsPageSize: {
+      name: "items_page_size",
+      in: "query",
+      required: false,
+      description: "Number of cleanup operation items to return per page.",
+      schema: {
+        default: 100,
+        maximum: 500,
         minimum: 1,
         type: "integer",
       },
@@ -3369,6 +3427,9 @@ export const openApiComponents = {
         knowledge_base_id: {
           $ref: "#/components/schemas/KnowledgeBaseId",
         },
+        graph_readiness: {
+          $ref: "#/components/schemas/GraphInsightStatus",
+        },
         nodes: {
           type: "array",
           items: {
@@ -3774,6 +3835,9 @@ export const openApiComponents = {
             },
           },
           additionalProperties: false,
+        },
+        graph_readiness: {
+          $ref: "#/components/schemas/GraphInsightStatus",
         },
         results: {
           type: "array",
@@ -4593,6 +4657,17 @@ export const openApiComponents = {
         item_counts: {
           $ref: "#/components/schemas/CleanupItemCounts",
         },
+        items: {
+          type: "array",
+          description:
+            "Bounded cleanup item page returned by operation detail and retry responses. Cleanup operation list responses return summaries and item counts without this section.",
+          items: {
+            $ref: "#/components/schemas/CleanupItemSummary",
+          },
+        },
+        items_pagination: {
+          $ref: "#/components/schemas/CleanupItemPagination",
+        },
         settled_state: {
           $ref: "#/components/schemas/CleanupSettledState",
         },
@@ -4604,6 +4679,33 @@ export const openApiComponents = {
         },
       },
       additionalProperties: true,
+    },
+    CleanupItemPagination: {
+      type: "object",
+      required: ["page", "page_size", "total", "has_more"],
+      properties: {
+        page: {
+          type: "integer",
+          minimum: 1,
+        },
+        page_size: {
+          type: "integer",
+          minimum: 1,
+          maximum: 500,
+        },
+        total: {
+          type: "integer",
+          minimum: 0,
+        },
+        has_more: {
+          type: "boolean",
+        },
+        next_cursor: {
+          oneOf: [{ type: "string" }, { type: "null" }],
+          description: "Opaque cursor for the next page when cursor pagination is available.",
+        },
+      },
+      additionalProperties: false,
     },
     CleanupItemSummary: {
       type: "object",
@@ -4625,6 +4727,70 @@ export const openApiComponents = {
         },
         phase: {
           $ref: "#/components/schemas/CleanupPhase",
+        },
+      },
+      additionalProperties: true,
+    },
+    ChangeSet: {
+      type: "object",
+      required: [
+        "id",
+        "knowledge_base_id",
+        "status",
+        "trigger_type",
+        "title",
+        "description",
+        "metadata",
+        "created_at",
+      ],
+      properties: {
+        id: {
+          $ref: "#/components/schemas/ChangeSetId",
+        },
+        knowledge_base_id: {
+          $ref: "#/components/schemas/KnowledgeBaseId",
+        },
+        base_version_id: {
+          oneOf: [{ $ref: "#/components/schemas/KnowledgeVersionId" }, { type: "null" }],
+        },
+        target_version_id: {
+          oneOf: [{ $ref: "#/components/schemas/KnowledgeVersionId" }, { type: "null" }],
+        },
+        status: {
+          type: "string",
+        },
+        trigger_type: {
+          type: "string",
+        },
+        title: {
+          type: "string",
+        },
+        description: {
+          type: ["string", "null"],
+        },
+        diff: {
+          type: "object",
+          additionalProperties: true,
+        },
+        items: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: true,
+          },
+        },
+        metadata: {
+          type: "object",
+          additionalProperties: true,
+        },
+        created_at: {
+          $ref: "#/components/schemas/Timestamp",
+        },
+        applied_at: {
+          oneOf: [{ $ref: "#/components/schemas/Timestamp" }, { type: "null" }],
+        },
+        discarded_at: {
+          oneOf: [{ $ref: "#/components/schemas/Timestamp" }, { type: "null" }],
         },
       },
       additionalProperties: true,
@@ -4700,6 +4866,11 @@ export const openApiComponents = {
         },
         has_more: {
           type: "boolean",
+        },
+        next_cursor: {
+          oneOf: [{ type: "string" }, { type: "null" }],
+          description:
+            "Opaque cursor for the next page on cursor-enabled lists. Omitted or null when no next page is available.",
         },
       },
     },
@@ -4924,7 +5095,7 @@ export const openApiPaths = {
     get: {
       summary: "List system pages",
       operationId: "listSystemPages",
-      parameters: paginationParameters,
+      parameters: cursorPaginationParameters,
       responses: {
         "200": listJsonResponse("System pages.", "#/components/schemas/SystemPage"),
       },
@@ -5346,7 +5517,7 @@ export const openApiPaths = {
     get: {
       summary: "List deletion cleanup operations",
       description:
-        "Returns asynchronous cleanup operations for visible deletion, object cleanup, database cleanup, and retry status.",
+        "Returns asynchronous cleanup operation summaries for visible deletion, object cleanup, database cleanup, and retry status. Operation items are loaded through the detail endpoint with item pagination.",
       operationId: "listCleanupOperations",
       parameters: paginationParameters,
       responses: {
@@ -5362,8 +5533,12 @@ export const openApiPaths = {
     get: {
       summary: "Get deletion cleanup operation",
       description:
-        "Returns cleanup phase, item counts, retry eligibility, and safe error summaries without provider secrets.",
+        "Returns cleanup phase, item counts, a bounded cleanup item page, retry eligibility, and safe error summaries without provider secrets.",
       operationId: "getCleanupOperation",
+      parameters: [
+        { $ref: "#/components/parameters/CleanupItemsPage" },
+        { $ref: "#/components/parameters/CleanupItemsPageSize" },
+      ],
       responses: {
         "200": jsonResponse("Deletion cleanup operation.", "#/components/schemas/CleanupOperation"),
         ...standardErrorResponses,
@@ -5373,8 +5548,13 @@ export const openApiPaths = {
   "/cleanup-operations/{cleanup_operation_id}/retry": {
     post: {
       summary: "Retry deletion cleanup operation",
-      description: "Queues retry work for retryable failed or pending cleanup items.",
+      description:
+        "Queues retry work for retryable failed or pending cleanup items and returns the operation with a bounded cleanup item page.",
       operationId: "retryCleanupOperation",
+      parameters: [
+        { $ref: "#/components/parameters/CleanupItemsPage" },
+        { $ref: "#/components/parameters/CleanupItemsPageSize" },
+      ],
       responses: {
         "200": jsonResponse(
           "Deletion cleanup retry accepted.",
@@ -5661,7 +5841,7 @@ export const openApiPaths = {
     get: {
       summary: "List wiki pages",
       operationId: "listWikiPages",
-      parameters: paginationParameters,
+      parameters: cursorPaginationParameters,
       responses: {
         "200": listJsonResponse("Wiki pages.", "#/components/schemas/WikiPage"),
       },
@@ -5697,7 +5877,7 @@ export const openApiPaths = {
     get: {
       summary: "List wiki page versions",
       operationId: "listWikiPageVersions",
-      parameters: paginationParameters,
+      parameters: cursorPaginationParameters,
       responses: {
         "200": listJsonResponse("Wiki page versions.", "#/components/schemas/WikiPageVersion"),
       },
@@ -5707,7 +5887,7 @@ export const openApiPaths = {
     get: {
       summary: "List knowledge base page versions",
       operationId: "listKnowledgeBasePageVersions",
-      parameters: paginationParameters,
+      parameters: cursorPaginationParameters,
       responses: {
         "200": listJsonResponse(
           "Knowledge Base-scoped wiki page versions.",
@@ -5830,7 +6010,7 @@ export const openApiPaths = {
     get: {
       summary: "List knowledge base versions",
       operationId: "listKnowledgeBaseVersions",
-      parameters: paginationParameters,
+      parameters: cursorPaginationParameters,
       responses: {
         "200": listJsonResponse(
           "Knowledge Base versions.",
@@ -5839,12 +6019,25 @@ export const openApiPaths = {
       },
     },
   },
+  "/knowledge-bases/{knowledge_base_id}/change-sets": {
+    get: {
+      summary: "List knowledge base change sets",
+      description:
+        "Returns Knowledge Base-scoped Change Set summaries with stable ordering and standard pagination. Use the Change Set detail endpoint for full diff and item payloads.",
+      operationId: "listKnowledgeBaseChangeSets",
+      parameters: cursorPaginationParameters,
+      responses: {
+        "200": listJsonResponse("Knowledge Base Change Sets.", "#/components/schemas/ChangeSet"),
+        ...standardErrorResponses,
+      },
+    },
+  },
   "/change-sets/{change_set_id}": {
     get: {
       summary: "Get a change set",
       operationId: "getChangeSet",
       responses: {
-        "200": standardJsonResponse,
+        "200": jsonResponse("Change Set detail.", "#/components/schemas/ChangeSet"),
       },
     },
   },

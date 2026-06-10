@@ -3,16 +3,16 @@ import { ApiError, createResourceId } from "@fococontext/contracts";
 import type { RuntimeConfig } from "@fococontext/core";
 
 import { apiDatabaseMirrorToken, type ApiDatabaseMirror } from "../database/api-database-mirror.js";
+import {
+  operationalReadStoreToken,
+  type OperationalReadStore,
+} from "../database/operational-read-store.js";
 import { defaultApiResourceScope, type ApiResourceScope } from "../auth/api-key.guard.js";
 import { isApiResourceInScope, requireScopedKnowledgeBase } from "../auth/resource-scope.js";
 import {
   createQueuedDeletionCleanupOperation,
   toDeletionCleanupOperationSummaryResponse,
 } from "../deletion-cleanup/deletion-cleanup.response.js";
-import {
-  applyManifestToOperation,
-  DeletionCleanupManifestCollector,
-} from "../deletion-cleanup/deletion-cleanup.manifest.js";
 import { DeletionCleanupRepository } from "../deletion-cleanup/deletion-cleanup.repository.js";
 import { DocumentRepository } from "../documents/document.repository.js";
 import { runtimeConfigToken } from "../runtime-config.provider.js";
@@ -95,8 +95,8 @@ export class KnowledgeBaseService {
     private readonly repository: KnowledgeBaseRepository,
     private readonly documentRepository: DocumentRepository,
     private readonly deletionCleanupRepository: DeletionCleanupRepository,
-    private readonly deletionCleanupManifestCollector: DeletionCleanupManifestCollector,
     @Inject(apiDatabaseMirrorToken) private readonly databaseMirror: ApiDatabaseMirror,
+    @Inject(operationalReadStoreToken) private readonly operationalReadStore: OperationalReadStore,
     @Inject(wikiStoreToken) private readonly wikiStore: WikiStore,
     @Inject(retrievalEmbeddingProviderToken)
     private readonly embeddingProvider: ApiRetrievalEmbeddingProvider,
@@ -181,10 +181,26 @@ export class KnowledgeBaseService {
     return toKnowledgeBaseResponse(created);
   }
 
-  list(
+  async list(
     input: ListKnowledgeBaseInput,
     scope: ApiResourceScope = defaultApiResourceScope,
-  ): ListKnowledgeBaseResult {
+  ): Promise<ListKnowledgeBaseResult> {
+    try {
+      const dbResult = await this.operationalReadStore.listKnowledgeBases(scope, input);
+
+      if (dbResult !== null) {
+        return {
+          items: dbResult.items,
+          page: input.page,
+          pageSize: input.pageSize,
+          total: dbResult.total,
+          hasMore: dbResult.hasMore,
+        };
+      }
+    } catch (error) {
+      throw toOperationalListError(error);
+    }
+
     const keyword = input.keyword?.trim().toLowerCase();
     const filtered = this.repository
       .list()
@@ -216,12 +232,31 @@ export class KnowledgeBaseService {
     return toKnowledgeBaseResponse(this.requireForkRecord(id, scope));
   }
 
-  listForks(
+  async listForks(
     upstreamKnowledgeBaseId: string,
     input: ListKnowledgeBaseInput,
     scope: ApiResourceScope = defaultApiResourceScope,
-  ): ListKnowledgeBaseForksResult {
+  ): Promise<ListKnowledgeBaseForksResult> {
     const upstream = this.requireForkableUpstream(upstreamKnowledgeBaseId, scope);
+
+    try {
+      const dbResult = await this.operationalReadStore.listKnowledgeBaseForks(scope, {
+        ...input,
+        upstreamKnowledgeBaseId: upstream.id,
+      });
+
+      if (dbResult !== null) {
+        return {
+          items: dbResult.items,
+          page: input.page,
+          pageSize: input.pageSize,
+          total: dbResult.total,
+          hasMore: dbResult.hasMore,
+        };
+      }
+    } catch (error) {
+      throw toOperationalListError(error);
+    }
 
     const keyword = input.keyword?.trim().toLowerCase();
     const filtered = this.repository
@@ -549,24 +584,11 @@ export class KnowledgeBaseService {
         ),
       }),
     );
-    const manifest = this.deletionCleanupManifestCollector.collectKnowledgeBaseManifest({
-      knowledgeBaseId: id,
-      knowledgeBaseType: record.knowledgeBaseType,
-      operationId: createdCleanupOperation.id,
-      now,
-      maxAttempts: createdCleanupOperation.maxAttempts,
-      retainedUntil: createdCleanupOperation.itemRetentionExpiresAt,
-    });
-    const cleanupOperation = this.deletionCleanupRepository.updateOperation(
-      applyManifestToOperation(createdCleanupOperation, manifest),
-    );
-
-    this.deletionCleanupRepository.replaceItemsForOperation(cleanupOperation.id, manifest.items);
 
     await this.databaseMirror.updateKnowledgeBase(updated);
-    await this.databaseMirror.saveDeletionCleanupOperation(cleanupOperation);
-    await this.databaseMirror.saveDeletionCleanupItems(manifest.items);
-    const queuedCleanupOperation = await this.enqueueDeletionCleanupOperation(cleanupOperation);
+    await this.databaseMirror.saveDeletionCleanupOperation(createdCleanupOperation);
+    const queuedCleanupOperation =
+      await this.enqueueDeletionCleanupOperation(createdCleanupOperation);
 
     return {
       id,
@@ -1050,4 +1072,8 @@ function compareUpdatedAtDesc(
   const updatedAtOrder = rightUpdatedAt.localeCompare(leftUpdatedAt);
 
   return updatedAtOrder === 0 ? rightId.localeCompare(leftId) : updatedAtOrder;
+}
+
+function toOperationalListError(error: unknown): ApiError {
+  return error instanceof ApiError ? error : new ApiError("internal_error");
 }

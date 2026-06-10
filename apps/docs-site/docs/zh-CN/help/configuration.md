@@ -124,6 +124,22 @@ S3_SECRET_ACCESS_KEY=...
 6. 知识库设置里的提示词模板可以预览、保存和校验。
 7. OpenAPI base URL 和 CORS 与部署方式一致。
 
+## 步骤 8：查看运行时压力
+
+设置页和 `/health` 会展示适合部署排查的压力信号：
+
+| 信号                                            | 用途                                      |
+| ----------------------------------------------- | ----------------------------------------- |
+| `dependencies.migration`                        | 确认迁移启动模式和目标 schema             |
+| `dependencies.pressure.queue`                   | 查看排队任务、运行任务和重试压力          |
+| `dependencies.pressure.compile`                 | 查看编译队列和阶段耗时压力                |
+| `dependencies.pressure.objectStorageOperations` | 查看 S3-compatible 请求压力               |
+| `dependencies.metrics.api`                      | 查看接口延迟、列表返回数量和 warning      |
+| `dependencies.metrics.cache`                    | 查看运行时缓存 hit/miss 情况              |
+| `dependencies.metrics.retrievalQuality`         | 查看 Retrieve 延迟、warning 和 stage 使用 |
+
+调优时先处理受影响的区域，例如 Worker 并发、parser 限制、模型 provider 并发、S3 multipart 大小、Source Watch 频率或检索预算。
+
 ## 生产注意事项
 
 - `.env` 可以放在服务器本地，不应提交到仓库。

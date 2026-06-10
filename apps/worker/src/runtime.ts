@@ -3,11 +3,7 @@ import { rmSync, writeFileSync } from "node:fs";
 import { Queue } from "bullmq";
 import { loadRuntimeConfig } from "@fococontext/core";
 import type { RuntimeConfig } from "@fococontext/core";
-import {
-  createPostgresCompileArtifactRepository,
-  createPostgresDatabase,
-  migrateToLatest,
-} from "@fococontext/db";
+import { createPostgresCompileArtifactRepository, createPostgresDatabase } from "@fococontext/db";
 import {
   createOpenAICompatibleChatProvider,
   createOpenAICompatibleVisionCaptionProvider,
@@ -25,11 +21,18 @@ import {
   PostgresDeletionCleanupDatabaseCleaner,
   DeletionCleanupProcessor,
   deletionCleanupQueueName,
+  PostgresDeletionCleanupManifestPlanner,
   PostgresDeletionCleanupRepository,
   PostgresDeletionCleanupTargetGuard,
 } from "./deletion-cleanup.worker.js";
 import { PostgresModelCallRecorder } from "./model-call.postgres-recorder.js";
 import { PostgresSourceParseWriter } from "./source-parse.postgres-writer.js";
+import {
+  BullMqKnowledgeCheckWorker,
+  KnowledgeCheckProcessor,
+  knowledgeCheckQueueName,
+  PostgresKnowledgeCheckStore,
+} from "./knowledge-check.worker.js";
 import {
   BullMqMediaCaptionQueue,
   BullMqMediaCaptionWorker,
@@ -76,8 +79,6 @@ const WORKER_READY_FILE = "/tmp/fococontext-worker-ready";
 async function main(): Promise<void> {
   const config = loadRuntimeConfig(process.env);
 
-  await migrateToLatest(config.database.url);
-
   const db = createPostgresDatabase(config.database.url);
   const webhookEventEmitter = config.webhook.delivery.enabled
     ? new PostgresWebhookEventEmitter(db, config)
@@ -110,10 +111,17 @@ async function main(): Promise<void> {
     new DeletionCleanupProcessor({
       repository: new PostgresDeletionCleanupRepository(db),
       databaseCleanup: new PostgresDeletionCleanupDatabaseCleaner(db),
+      manifestPlanner: new PostgresDeletionCleanupManifestPlanner(db),
       targetGuard: new PostgresDeletionCleanupTargetGuard(db),
       ...(webhookEventEmitter === undefined ? {} : { webhookEvents: webhookEventEmitter }),
       objectStorage,
       objectBatchSize: config.limits.deletionCleanup.objectBatchSize,
+    }),
+  );
+  const knowledgeCheckWorker = new BullMqKnowledgeCheckWorker(
+    config,
+    new KnowledgeCheckProcessor(new PostgresKnowledgeCheckStore(db), {
+      ...(webhookEventEmitter === undefined ? {} : { webhookEvents: webhookEventEmitter }),
     }),
   );
   const mediaCaptionQueue =
@@ -161,6 +169,7 @@ async function main(): Promise<void> {
       jobProgress,
       objectStorage,
       parserLimits: createParserLimitConfig(config.limits.parser),
+      mediaAssetUploadConcurrency: config.limits.parser.mediaUploadConcurrency,
       previewMaxChars: config.limits.objectStorageOperations.previewMaxChars,
       writer: new PostgresSourceParseWriter(db),
     }),
@@ -259,6 +268,7 @@ async function main(): Promise<void> {
     ...(mediaCaptionWorker === undefined ? [] : [mediaCaptionWorker]),
     ...(sourceOcrWorker === undefined ? [] : [sourceOcrWorker]),
     deletionCleanupWorker,
+    knowledgeCheckWorker,
     wikiAnalyzeWorker,
     wikiGenerateWorker,
     wikiMergeWorker,
@@ -284,7 +294,7 @@ async function main(): Promise<void> {
 
   writeFileSync(WORKER_READY_FILE, "ready\n", "utf8");
   console.log(
-    `FocoContext worker runtime started with ${deletionCleanupQueueName}, ${webhookDispatchQueueName}.`,
+    `FocoContext worker runtime started with ${deletionCleanupQueueName}, ${knowledgeCheckQueueName}, ${webhookDispatchQueueName}.`,
   );
 }
 
@@ -315,9 +325,9 @@ function createParserLimitConfig(config: RuntimeConfig["limits"]["parser"]): Par
     maxFileSizeBytes,
     timeoutMs: config.timeoutSeconds * 1000,
     zip: {
-      maxEntries: 10_000,
-      maxExpandedBytes: maxFileSizeBytes * 20,
-      maxEntryBytes: maxFileSizeBytes,
+      maxEntries: config.maxZipEntries,
+      maxExpandedBytes: config.maxZipExpandedMb * 1024 * 1024,
+      maxEntryBytes: config.maxZipEntryMb * 1024 * 1024,
     },
     images: {
       maxImagesPerDocument: config.maxImagesPerDocument,

@@ -59,7 +59,14 @@ export interface SourceWatchS3ClientFactoryInput {
   secretAccessKey: string;
 }
 
+export interface SourceWatchExistingDocumentProvider {
+  listExistingDocuments(
+    rule: SourceWatchRuleRecord,
+  ): Promise<readonly SourceDocumentRecord[] | null>;
+}
+
 export interface SourceWatchScannerOptions {
+  existingDocumentProvider?: SourceWatchExistingDocumentProvider;
   operationRecorder?: ObjectStorageOperationRecorder;
   s3ClientFactory?: (input: SourceWatchS3ClientFactoryInput) => SourceWatchS3Client;
 }
@@ -76,16 +83,16 @@ export function createDefaultSourceWatchScanner(
       }
 
       if (rule.sourceKind === "mounted_directory") {
-        return scanMountedDirectory(rule, documentRepository);
+        return scanMountedDirectory(rule, documentRepository, options);
       }
       if (rule.sourceKind === "url_list") {
-        return scanUrlList(rule, documentRepository, config);
+        return scanUrlList(rule, documentRepository, config, options);
       }
       if (rule.sourceKind === "s3_prefix") {
         return scanS3Prefix(rule, documentRepository, config, options);
       }
       if (rule.sourceKind === "git_repo") {
-        return scanGitRepository(rule, documentRepository, config);
+        return scanGitRepository(rule, documentRepository, config, options);
       }
 
       return createDisabledDiscovery("source_watch_adapter_disabled");
@@ -104,6 +111,7 @@ export function createDisabledSourceWatchScanner(): SourceWatchScanner {
 async function scanMountedDirectory(
   rule: SourceWatchRuleRecord,
   documentRepository: DocumentRepository,
+  options: SourceWatchScannerOptions,
 ): Promise<SourceWatchScanDiscovery> {
   const root = resolve(rule.location);
   const rootStatus = await stat(root).catch(() => null);
@@ -128,7 +136,12 @@ async function scanMountedDirectory(
 
   const skipped: SourceWatchSkippedSource[] = [];
   const scannedSources = await collectMountedDirectorySources(rule, root, skipped);
-  const comparison = compareDiscoveredSources(rule, documentRepository, scannedSources);
+  const existingSources = await listExistingSourceWatchDocuments(
+    rule,
+    documentRepository,
+    options.existingDocumentProvider,
+  );
+  const comparison = compareDiscoveredSources(rule, existingSources, scannedSources);
 
   return {
     status: "completed",
@@ -146,6 +159,7 @@ async function scanUrlList(
   rule: SourceWatchRuleRecord,
   documentRepository: DocumentRepository,
   config: RuntimeConfig,
+  options: SourceWatchScannerOptions,
 ): Promise<SourceWatchScanDiscovery> {
   const adapter = config.sourceWatch.adapters.urlList;
 
@@ -155,7 +169,12 @@ async function scanUrlList(
 
   const skipped: SourceWatchSkippedSource[] = [];
   const sources = collectUrlListSources(rule, adapter, skipped);
-  const comparison = compareDiscoveredSources(rule, documentRepository, sources);
+  const existingSources = await listExistingSourceWatchDocuments(
+    rule,
+    documentRepository,
+    options.existingDocumentProvider,
+  );
+  const comparison = compareDiscoveredSources(rule, existingSources, sources);
 
   return {
     status: "completed",
@@ -294,9 +313,12 @@ async function scanS3Prefix(
     });
   const operationRecorder = options.operationRecorder ?? defaultObjectStorageOperationRecorder;
   const discovered: SourceWatchDiscoveredSource[] = [];
-  const existingByPath = groupDocumentsBySourcePath(
-    listExistingSourceWatchDocuments(rule, documentRepository),
+  const existingSources = await listExistingSourceWatchDocuments(
+    rule,
+    documentRepository,
+    options.existingDocumentProvider,
   );
+  const existingByPath = groupDocumentsBySourcePath(existingSources);
   let continuationToken: string | undefined;
 
   do {
@@ -431,7 +453,7 @@ async function scanS3Prefix(
     continuationToken = page.IsTruncated === true ? page.NextContinuationToken : undefined;
   } while (continuationToken !== undefined && discovered.length < adapter.maxItems);
 
-  const comparison = compareDiscoveredSources(rule, documentRepository, discovered);
+  const comparison = compareDiscoveredSources(rule, existingSources, discovered);
 
   return {
     status: "completed",
@@ -449,6 +471,7 @@ async function scanGitRepository(
   rule: SourceWatchRuleRecord,
   documentRepository: DocumentRepository,
   config: RuntimeConfig,
+  options: SourceWatchScannerOptions,
 ): Promise<SourceWatchScanDiscovery> {
   const adapter = config.sourceWatch.adapters.gitRepo;
 
@@ -487,7 +510,12 @@ async function scanGitRepository(
 
     const skipped: SourceWatchSkippedSource[] = [];
     const sources = await collectGitRepositorySources(rule, checkoutPath, adapter, skipped);
-    const comparison = compareDiscoveredSources(rule, documentRepository, sources);
+    const existingSources = await listExistingSourceWatchDocuments(
+      rule,
+      documentRepository,
+      options.existingDocumentProvider,
+    );
+    const comparison = compareDiscoveredSources(rule, existingSources, sources);
 
     return {
       status: "completed",
@@ -648,14 +676,13 @@ async function walkGitDirectory(
 
 function compareDiscoveredSources(
   rule: SourceWatchRuleRecord,
-  documentRepository: DocumentRepository,
+  existingSources: readonly SourceDocumentRecord[],
   scannedSources: readonly SourceWatchDiscoveredSource[],
 ): {
   changedSources: SourceWatchDiscoveredSource[];
   deleteCandidates: SourceWatchScanDiscovery["deleteCandidates"];
   newSources: SourceWatchDiscoveredSource[];
 } {
-  const existingSources = listExistingSourceWatchDocuments(rule, documentRepository);
   const existingByPath = groupDocumentsBySourcePath(existingSources);
   const scannedPaths = new Set(scannedSources.map((source) => source.source_path ?? source.name));
   const newSources: SourceWatchDiscoveredSource[] = [];
@@ -822,10 +849,17 @@ async function walkMountedDirectory(
   }
 }
 
-function listExistingSourceWatchDocuments(
+async function listExistingSourceWatchDocuments(
   rule: SourceWatchRuleRecord,
   documentRepository: DocumentRepository,
-): SourceDocumentRecord[] {
+  existingDocumentProvider: SourceWatchExistingDocumentProvider | undefined,
+): Promise<readonly SourceDocumentRecord[]> {
+  const providedSources = await existingDocumentProvider?.listExistingDocuments(rule);
+
+  if (providedSources !== undefined && providedSources !== null) {
+    return providedSources;
+  }
+
   return documentRepository
     .listDocuments(rule.knowledgeBaseId)
     .filter((document) => document.status !== "deleted")
@@ -834,7 +868,7 @@ function listExistingSourceWatchDocuments(
 }
 
 function groupDocumentsBySourcePath(
-  documents: SourceDocumentRecord[],
+  documents: readonly SourceDocumentRecord[],
 ): Map<string, SourceDocumentRecord[]> {
   const grouped = new Map<string, SourceDocumentRecord[]>();
 

@@ -86,12 +86,43 @@ export const zhCNMessages = {
     exportGraph: "导出图谱",
     graphView: "图谱视图",
     insights: "图谱洞察",
+    loadFailedDescription:
+      "图谱数据加载失败。请检查 API 连接和知识库访问权限后重试。",
     noGraph: "暂无图谱",
     noInsights: "暂无洞察",
     noSourceRefs: "暂无来源引用",
     nodes: "节点",
     insightMembership: "洞察归属",
     reasonCodes: "原因代码",
+    readiness: {
+      failed: {
+        description:
+          "图谱刷新失败。已有图谱数据可能仍可查看，但洞察的新鲜度无法保证。",
+        title: "图谱刷新失败",
+      },
+      loadFailedDescription: "图谱洞察状态加载失败。请重试刷新就绪状态。",
+      loadFailedTitle: "图谱就绪状态不可用",
+      partial: {
+        description: "图谱洞察已部分可用，部分信号可能仍在重算或缺失。",
+        title: "图谱洞察部分可用",
+      },
+      queued: {
+        description: "图谱刷新已排队。Worker 追上进度前，现有图谱仍可使用。",
+        title: "图谱刷新已排队",
+      },
+      sourceJob: "来源任务 {{value}}",
+      stale: {
+        description:
+          "图谱数据落后于最近的知识库变化。请刷新或等待 Worker 完成处理。",
+        title: "图谱数据已过期",
+      },
+      state: "状态 {{state}}",
+      updatedAt: "更新时间 {{value}}",
+      updating: {
+        description: "图谱刷新正在运行。Worker 更新图谱信号时，结果可能变化。",
+        title: "图谱刷新中",
+      },
+    },
     relation: "关系",
     resetFocus: "重置焦点",
     resetView: "重置视图",
@@ -443,12 +474,19 @@ export const zhCNMessages = {
     },
     knowledgeBaseJob: "知识库",
     listTotal: "{{total}} 个任务",
+    emptyDescription:
+      "入库、重试、OCR、编译、清理和图谱刷新开始后，任务会显示在这里。",
     metadata: "元数据",
     ingestProgressSummary:
-      "{{completed}}/{{total}} 个任务已完成 · 总进度 {{progress}}%",
+      "{{completed}}/{{total}} 个任务已完成 · 阶段平均进度 {{progress}}%",
+    loadFailedDescription: "任务加载失败。请重试以重新请求当前页。",
     retrieveNotReady: "检索正在等待活跃入库任务",
     retrieveReady: "检索已就绪",
+    runtimeStatusUnavailable: "运行状态不可用",
+    runtimeStatusUnavailableDescription:
+      "任务数据仍可使用，但系统状态加载完成前无法展示队列压力和降级告警。",
     retryFailed: "重试失败项",
+    stageAverageProgress: "阶段平均进度",
     viewDetails: "详情",
     section: {
       artifacts: "产物",
@@ -1041,6 +1079,12 @@ export const zhCNMessages = {
     lastSignIn: "最近登录",
     maskedKey: "脱敏 Key",
     maskedSecret: "脱敏 secret",
+    migrationLastOutcome: "最近迁移结果",
+    migrationManagedByStartup:
+      "数据库迁移由启动迁移服务管理，API 和 Worker 容器开始服务前会先完成迁移。",
+    migrationMode: "迁移模式",
+    migrationPendingCount: "待执行迁移",
+    migrationStatus: "数据库迁移状态",
     noValue: "不可用",
     objectStorageOperationMetrics: "S3-compatible 操作指标",
     objectStorageOperationPressure: "S3-compatible 操作压力",
@@ -1087,6 +1131,8 @@ export const zhCNMessages = {
     webhookSecret: "Webhook 密钥状态",
     workerRelease: "Worker 发布元数据",
     workerStatus: "Worker",
+    loadFailedDescription:
+      "系统设置加载失败。请重试刷新运行时、存储、迁移和压力状态。",
   },
   outputLanguage: {
     auto: "自动",
@@ -1166,10 +1212,12 @@ export const zhCNMessages = {
     rolledBack: "已回滚",
     running: "运行中",
     resolved: "已解决",
+    seeded: "已初始化",
     skipped: "已跳过",
     stale: "已过期",
     uploaded: "已上传",
     outdated: "已过期",
+    updating: "更新中",
     unavailable: "不可用",
     limited: "受限",
     unknown: "未知",

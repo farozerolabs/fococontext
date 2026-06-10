@@ -47,6 +47,7 @@ import { ResourceIdDisplay } from "@/components/resource-id/ResourceIdDisplay.js
 import { EmptyState } from "@/components/state/EmptyState.js"
 import { ErrorAlert } from "@/components/state/ErrorAlert.js"
 import { LoadingState } from "@/components/state/LoadingState.js"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert.js"
 import { Badge } from "@/components/ui/badge.js"
 import { Button } from "@/components/ui/button.js"
 import { cn } from "@/lib/utils.js"
@@ -196,7 +197,9 @@ export function KnowledgeBaseGraphPage() {
   const insights = collectInsights(insightsQuery.data)
   const emptyReasons = insightsQuery.data?.empty_reasons ?? {}
   const insightStatus =
-    insightsQuery.data?.status ?? createDefaultGraphInsightStatus()
+    insightsQuery.data?.status ??
+    graph?.graph_readiness ??
+    createDefaultGraphInsightStatus()
   const visibleGraph = useMemo(
     () => filterGraph(graph, focusNodeId),
     [focusNodeId, graph]
@@ -239,7 +242,20 @@ export function KnowledgeBaseGraphPage() {
       ) : null}
       {graphQuery.isError ? (
         <div className="p-6">
-          <ErrorAlert title={t("state.loadFailed")} />
+          <ErrorAlert
+            action={
+              <Button
+                onClick={() => void graphQuery.refetch()}
+                size="sm"
+                type="button"
+                variant="outline"
+              >
+                {t("action.retry")}
+              </Button>
+            }
+            description={t("graph.loadFailedDescription")}
+            title={t("state.loadFailed")}
+          />
         </div>
       ) : null}
       {graph !== null && graph !== undefined && graph.nodes.length === 0 ? (
@@ -284,6 +300,11 @@ export function KnowledgeBaseGraphPage() {
           visibleGraph={visibleGraph}
           insightStatus={insightStatus}
           insights={insights}
+          isInsightsError={insightsQuery.isError}
+          onRefresh={() => {
+            void graphQuery.refetch()
+            void insightsQuery.refetch()
+          }}
           onClearSelection={handleClearSelection}
           onDrillDown={(nodeId) =>
             setFocusStack((current) =>
@@ -314,6 +335,8 @@ function GraphWorkbenchDetail({
   graph,
   insightStatus,
   insights,
+  isInsightsError,
+  onRefresh,
   onClearSelection,
   onDrillDown,
   onDrillUp,
@@ -329,6 +352,8 @@ function GraphWorkbenchDetail({
   graph: GraphResponse
   insightStatus: GraphInsightStatus
   insights: GraphInsightItem[]
+  isInsightsError: boolean
+  onRefresh: () => void
   onClearSelection: () => void
   onDrillDown: (nodeId: string) => void
   onDrillUp: () => void
@@ -415,17 +440,24 @@ function GraphWorkbenchDetail({
       }
       contentClassName="overflow-hidden p-0"
       primary={
-        <GraphWorkbenchPrimary
-          focusNodeId={focusNodeId}
-          graph={graph}
-          insights={insights}
-          onClearSelection={onClearSelection}
-          onSelect={onSelect}
-          selectedEdgeIds={selectionHighlight.selectedEdgeIds}
-          selectedNodeIds={selectionHighlight.selectedNodeIds}
-          selection={selection}
-          visibleGraph={visibleGraph}
-        />
+        <div className="flex h-full min-h-0 flex-col">
+          <GraphReadinessBanner
+            isInsightsError={isInsightsError}
+            onRefresh={onRefresh}
+            status={insightStatus}
+          />
+          <GraphWorkbenchPrimary
+            focusNodeId={focusNodeId}
+            graph={graph}
+            insights={insights}
+            onClearSelection={onClearSelection}
+            onSelect={onSelect}
+            selectedEdgeIds={selectionHighlight.selectedEdgeIds}
+            selectedNodeIds={selectionHighlight.selectedNodeIds}
+            selection={selection}
+            visibleGraph={visibleGraph}
+          />
+        </div>
       }
       subtitle={
         focusNodeId === null ? (
@@ -436,6 +468,85 @@ function GraphWorkbenchDetail({
       }
       title={t("graph.graphView")}
     />
+  )
+}
+
+function GraphReadinessBanner({
+  isInsightsError,
+  onRefresh,
+  status,
+}: {
+  isInsightsError: boolean
+  onRefresh: () => void
+  status: GraphInsightStatus
+}) {
+  const { t } = useTranslation()
+  const shouldShow =
+    isInsightsError ||
+    status.state === "queued" ||
+    status.state === "updating" ||
+    status.state === "partial" ||
+    status.state === "stale" ||
+    status.state === "failed"
+
+  if (!shouldShow) {
+    return null
+  }
+
+  const title = isInsightsError
+    ? t("graph.readiness.loadFailedTitle")
+    : t(`graph.readiness.${status.state}.title`)
+  const description = isInsightsError
+    ? t("graph.readiness.loadFailedDescription")
+    : t(`graph.readiness.${status.state}.description`)
+
+  return (
+    <Alert
+      className="m-3 mb-0"
+      variant={
+        status.state === "failed" || isInsightsError ? "destructive" : "default"
+      }
+    >
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <AlertTitle>{title}</AlertTitle>
+          <AlertDescription>
+            <div className="flex flex-col gap-2">
+              <p>{description}</p>
+              <div className="flex flex-wrap gap-2 text-xs">
+                <Badge variant="secondary">
+                  {t("graph.readiness.state", {
+                    state: t(`status.${toStatusLabelKey(status.state)}`),
+                  })}
+                </Badge>
+                {status.updated_at === null ? null : (
+                  <Badge variant="outline">
+                    {t("graph.readiness.updatedAt", {
+                      value: status.updated_at,
+                    })}
+                  </Badge>
+                )}
+                {status.source_job_id === null ? null : (
+                  <Badge variant="outline">
+                    {t("graph.readiness.sourceJob", {
+                      value: status.source_job_id,
+                    })}
+                  </Badge>
+                )}
+              </div>
+              {status.failure_reason === null ? null : (
+                <code className="w-fit rounded border bg-background px-1.5 py-0.5 text-xs">
+                  {status.failure_reason}
+                </code>
+              )}
+            </div>
+          </AlertDescription>
+        </div>
+        <Button onClick={onRefresh} size="sm" type="button" variant="outline">
+          {t("action.retry")}
+        </Button>
+      </div>
+    </Alert>
   )
 }
 

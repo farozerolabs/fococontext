@@ -21,6 +21,13 @@ import {
   resolveChatModel,
   resolveDatasetPromptTemplateFromSnapshot,
 } from "@fococontext/llm";
+import {
+  GraphQueryService,
+  createInMemoryRetrievalRepository,
+  type GraphInsightsResponse,
+  type RetrievalRelationType,
+  type RetrievalVisibilityOrigin,
+} from "@fococontext/retrieval";
 import type { ObjectStorageAdapter } from "@fococontext/storage";
 
 import type {
@@ -208,6 +215,14 @@ export interface GraphSignalPageRecord extends RelationshipPageRecord {
   sourceDocumentIds: readonly string[];
 }
 
+export interface GraphSignalDerivationLimits {
+  maxCommonNeighborIdsPerPair?: number;
+  maxCommonNeighborPairs?: number;
+  maxPairsPerGroupWindow?: number;
+  maxSharedSourcePairs?: number;
+  maxTypeAffinityPairs?: number;
+}
+
 export interface ResolvedRelationshipEdgeWrite {
   edgeId: string;
   explanation: string;
@@ -219,6 +234,14 @@ export interface ResolvedRelationshipEdgeWrite {
   toPageId: string;
   weight: number;
 }
+
+const defaultGraphSignalDerivationLimits = {
+  maxCommonNeighborIdsPerPair: 16,
+  maxCommonNeighborPairs: 20_000,
+  maxPairsPerGroupWindow: 16,
+  maxSharedSourcePairs: 30_000,
+  maxTypeAffinityPairs: 20_000,
+} satisfies Required<GraphSignalDerivationLimits>;
 
 export function resolveRelationshipEdgesForPages(input: {
   knowledgeBaseId: string;
@@ -279,9 +302,15 @@ export function resolveRelationshipEdgesForPages(input: {
 export function deriveGraphSignalEdgesForPages(input: {
   existingEdges?: readonly ResolvedRelationshipEdgeWrite[];
   knowledgeBaseId: string;
+  limits?: GraphSignalDerivationLimits;
   pages: readonly GraphSignalPageRecord[];
 }): ResolvedRelationshipEdgeWrite[] {
   const pageLookup = createRelationshipPageLookup(input.pages);
+  const pagesById = new Map(input.pages.map((page) => [page.id, page]));
+  const sourceIdsByPageId = createSourceIdsByPageId(input.pages);
+  const pagesBySourceDocumentId = createPagesBySourceDocumentId(input.pages);
+  const pagesByType = createPagesByType(input.pages);
+  const limits = normalizeGraphSignalDerivationLimits(input.limits);
   const edgesByKey = new Map<string, ResolvedRelationshipEdgeWrite>();
 
   for (const page of input.pages) {
@@ -316,21 +345,29 @@ export function deriveGraphSignalEdgesForPages(input: {
     }
   }
 
-  for (let leftIndex = 0; leftIndex < input.pages.length; leftIndex += 1) {
-    for (let rightIndex = leftIndex + 1; rightIndex < input.pages.length; rightIndex += 1) {
-      const leftPage = input.pages[leftIndex];
-      const rightPage = input.pages[rightIndex];
+  const sharedSourcePairKeys = new Set<string>();
+  let sharedSourcePairCount = 0;
 
-      if (leftPage === undefined || rightPage === undefined) {
-        continue;
-      }
+  for (const pages of pagesBySourceDocumentId.values()) {
+    if (sharedSourcePairCount >= limits.maxSharedSourcePairs) {
+      break;
+    }
 
-      const sharedSourceIds = intersectStrings(
-        leftPage.sourceDocumentIds,
-        rightPage.sourceDocumentIds,
-      );
+    sharedSourcePairCount += visitBoundedPagePairs({
+      limit: limits.maxSharedSourcePairs - sharedSourcePairCount,
+      pages,
+      pairKeys: sharedSourcePairKeys,
+      windowSize: limits.maxPairsPerGroupWindow,
+      visit: (leftPage, rightPage) => {
+        const sharedSourceIds = intersectStringSets(
+          sourceIdsByPageId.get(leftPage.id) ?? new Set(),
+          sourceIdsByPageId.get(rightPage.id) ?? new Set(),
+        );
 
-      if (sharedSourceIds.length > 0) {
+        if (sharedSourceIds.length === 0) {
+          return;
+        }
+
         upsertBidirectionalDerivedEdges(edgesByKey, {
           explanation: `${leftPage.title} and ${rightPage.title} cite shared source documents.`,
           knowledgeBaseId: input.knowledgeBaseId,
@@ -348,9 +385,27 @@ export function deriveGraphSignalEdgesForPages(input: {
           })),
           weight: 0.82,
         });
-      }
+      },
+    });
+  }
 
-      if (leftPage.pageType === rightPage.pageType) {
+  let typeAffinityPairCount = 0;
+
+  for (const pages of pagesByType.values()) {
+    if (typeAffinityPairCount >= limits.maxTypeAffinityPairs) {
+      break;
+    }
+
+    typeAffinityPairCount += visitBoundedPagePairs({
+      limit: limits.maxTypeAffinityPairs - typeAffinityPairCount,
+      pages,
+      windowSize: limits.maxPairsPerGroupWindow,
+      visit: (leftPage, rightPage) => {
+        const sharedSourceIds = intersectStringSets(
+          sourceIdsByPageId.get(leftPage.id) ?? new Set(),
+          sourceIdsByPageId.get(rightPage.id) ?? new Set(),
+        );
+
         upsertBidirectionalDerivedEdges(edgesByKey, {
           explanation: `${leftPage.title} and ${rightPage.title} share page type ${leftPage.pageType}.`,
           knowledgeBaseId: input.knowledgeBaseId,
@@ -365,8 +420,8 @@ export function deriveGraphSignalEdgesForPages(input: {
           sourceRefs: [],
           weight: 0.35,
         });
-      }
-    }
+      },
+    });
   }
 
   const baseEdges = [...(input.existingEdges ?? []), ...edgesByKey.values()].filter(
@@ -381,39 +436,66 @@ export function deriveGraphSignalEdgesForPages(input: {
     neighborIdsByPageId.get(edge.toPageId)?.add(edge.fromPageId);
   }
 
-  for (let leftIndex = 0; leftIndex < input.pages.length; leftIndex += 1) {
-    for (let rightIndex = leftIndex + 1; rightIndex < input.pages.length; rightIndex += 1) {
-      const leftPage = input.pages[leftIndex];
-      const rightPage = input.pages[rightIndex];
+  const commonNeighborIdsByPairKey = new Map<string, Set<string>>();
+  let commonNeighborPairCount = 0;
 
-      if (leftPage === undefined || rightPage === undefined) {
-        continue;
-      }
-
-      const commonNeighborIds = intersectStrings(
-        [...(neighborIdsByPageId.get(leftPage.id) ?? [])],
-        [...(neighborIdsByPageId.get(rightPage.id) ?? [])],
-      ).filter((pageId) => pageId !== leftPage.id && pageId !== rightPage.id);
-
-      if (commonNeighborIds.length === 0) {
-        continue;
-      }
-
-      upsertBidirectionalDerivedEdges(edgesByKey, {
-        explanation: `${leftPage.title} and ${rightPage.title} share graph neighbors.`,
-        knowledgeBaseId: input.knowledgeBaseId,
-        leftPage,
-        metadata: {
-          signal: "common_neighbor",
-          common_neighbor_page_ids: commonNeighborIds,
-        },
-        relationType: "common_neighbor",
-        rightPage,
-        sourceDocumentIds: [],
-        sourceRefs: [],
-        weight: 0.5,
-      });
+  for (const [commonNeighborId, neighborIds] of neighborIdsByPageId.entries()) {
+    if (commonNeighborPairCount >= limits.maxCommonNeighborPairs) {
+      break;
     }
+
+    const neighborPages = sortGraphSignalPages(
+      [...neighborIds].flatMap((pageId) => {
+        const page = pagesById.get(pageId);
+
+        return page === undefined ? [] : [page];
+      }),
+    );
+
+    commonNeighborPairCount += visitBoundedPagePairs({
+      limit: limits.maxCommonNeighborPairs - commonNeighborPairCount,
+      pages: neighborPages,
+      windowSize: limits.maxPairsPerGroupWindow,
+      visit: (leftPage, rightPage) => {
+        if (leftPage.id === commonNeighborId || rightPage.id === commonNeighborId) {
+          return;
+        }
+
+        const pairKey = createUndirectedPagePairKey(leftPage.id, rightPage.id);
+        const commonNeighborIds = commonNeighborIdsByPairKey.get(pairKey) ?? new Set<string>();
+
+        if (commonNeighborIds.size < limits.maxCommonNeighborIdsPerPair) {
+          commonNeighborIds.add(commonNeighborId);
+        }
+
+        commonNeighborIdsByPairKey.set(pairKey, commonNeighborIds);
+      },
+    });
+  }
+
+  for (const [pairKey, commonNeighborIds] of commonNeighborIdsByPairKey.entries()) {
+    const [leftPageId, rightPageId] = pairKey.split("\u0000");
+    const leftPage = leftPageId === undefined ? undefined : pagesById.get(leftPageId);
+    const rightPage = rightPageId === undefined ? undefined : pagesById.get(rightPageId);
+
+    if (leftPage === undefined || rightPage === undefined || commonNeighborIds.size === 0) {
+      continue;
+    }
+
+    upsertBidirectionalDerivedEdges(edgesByKey, {
+      explanation: `${leftPage.title} and ${rightPage.title} share graph neighbors.`,
+      knowledgeBaseId: input.knowledgeBaseId,
+      leftPage,
+      metadata: {
+        signal: "common_neighbor",
+        common_neighbor_page_ids: [...commonNeighborIds].sort(),
+      },
+      relationType: "common_neighbor",
+      rightPage,
+      sourceDocumentIds: [],
+      sourceRefs: [],
+      weight: 0.5,
+    });
   }
 
   return [...edgesByKey.values()];
@@ -525,10 +607,160 @@ function extractWikiLinkTitles(markdown: string): string[] {
   return [...new Set(titles)];
 }
 
-function intersectStrings(leftValues: readonly string[], rightValues: readonly string[]): string[] {
-  const rightSet = new Set(rightValues);
+function intersectStringSets(
+  leftValues: ReadonlySet<string>,
+  rightValues: ReadonlySet<string>,
+): string[] {
+  const sharedValues: string[] = [];
+  const smallerSet = leftValues.size <= rightValues.size ? leftValues : rightValues;
+  const largerSet = leftValues.size <= rightValues.size ? rightValues : leftValues;
 
-  return [...new Set(leftValues.filter((value) => rightSet.has(value)))];
+  for (const value of smallerSet) {
+    if (largerSet.has(value)) {
+      sharedValues.push(value);
+    }
+  }
+
+  return sharedValues.sort();
+}
+
+function createSourceIdsByPageId(
+  pages: readonly GraphSignalPageRecord[],
+): Map<string, ReadonlySet<string>> {
+  return new Map(
+    pages.map((page) => [
+      page.id,
+      new Set(page.sourceDocumentIds.filter((sourceDocumentId) => sourceDocumentId.length > 0)),
+    ]),
+  );
+}
+
+function createPagesBySourceDocumentId(
+  pages: readonly GraphSignalPageRecord[],
+): Map<string, GraphSignalPageRecord[]> {
+  const pagesBySourceDocumentId = new Map<string, GraphSignalPageRecord[]>();
+
+  for (const page of pages) {
+    for (const sourceDocumentId of new Set(page.sourceDocumentIds)) {
+      if (sourceDocumentId.length === 0) {
+        continue;
+      }
+
+      const sourcePages = pagesBySourceDocumentId.get(sourceDocumentId) ?? [];
+      sourcePages.push(page);
+      pagesBySourceDocumentId.set(sourceDocumentId, sourcePages);
+    }
+  }
+
+  return sortGraphSignalPageGroups(pagesBySourceDocumentId);
+}
+
+function createPagesByType(
+  pages: readonly GraphSignalPageRecord[],
+): Map<string, GraphSignalPageRecord[]> {
+  const pagesByType = new Map<string, GraphSignalPageRecord[]>();
+
+  for (const page of pages) {
+    const typePages = pagesByType.get(page.pageType) ?? [];
+    typePages.push(page);
+    pagesByType.set(page.pageType, typePages);
+  }
+
+  return sortGraphSignalPageGroups(pagesByType);
+}
+
+function sortGraphSignalPageGroups(
+  groups: Map<string, GraphSignalPageRecord[]>,
+): Map<string, GraphSignalPageRecord[]> {
+  return new Map(
+    [...groups.entries()]
+      .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+      .map(([key, pages]) => [key, sortGraphSignalPages(pages)]),
+  );
+}
+
+function sortGraphSignalPages(pages: readonly GraphSignalPageRecord[]): GraphSignalPageRecord[] {
+  return [...pages].sort((leftPage, rightPage) => {
+    const titleOrder = leftPage.title.localeCompare(rightPage.title);
+
+    return titleOrder === 0 ? leftPage.id.localeCompare(rightPage.id) : titleOrder;
+  });
+}
+
+function normalizeGraphSignalDerivationLimits(
+  limits: GraphSignalDerivationLimits | undefined,
+): Required<GraphSignalDerivationLimits> {
+  return {
+    maxCommonNeighborIdsPerPair: normalizePositiveIntegerLimit(
+      limits?.maxCommonNeighborIdsPerPair,
+      defaultGraphSignalDerivationLimits.maxCommonNeighborIdsPerPair,
+    ),
+    maxCommonNeighborPairs: normalizePositiveIntegerLimit(
+      limits?.maxCommonNeighborPairs,
+      defaultGraphSignalDerivationLimits.maxCommonNeighborPairs,
+    ),
+    maxPairsPerGroupWindow: normalizePositiveIntegerLimit(
+      limits?.maxPairsPerGroupWindow,
+      defaultGraphSignalDerivationLimits.maxPairsPerGroupWindow,
+    ),
+    maxSharedSourcePairs: normalizePositiveIntegerLimit(
+      limits?.maxSharedSourcePairs,
+      defaultGraphSignalDerivationLimits.maxSharedSourcePairs,
+    ),
+    maxTypeAffinityPairs: normalizePositiveIntegerLimit(
+      limits?.maxTypeAffinityPairs,
+      defaultGraphSignalDerivationLimits.maxTypeAffinityPairs,
+    ),
+  };
+}
+
+function normalizePositiveIntegerLimit(value: number | undefined, defaultValue: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : defaultValue;
+}
+
+function visitBoundedPagePairs(input: {
+  limit: number;
+  pages: readonly GraphSignalPageRecord[];
+  pairKeys?: Set<string>;
+  visit: (leftPage: GraphSignalPageRecord, rightPage: GraphSignalPageRecord) => void;
+  windowSize: number;
+}): number {
+  let visitedPairCount = 0;
+
+  for (let leftIndex = 0; leftIndex < input.pages.length; leftIndex += 1) {
+    if (visitedPairCount >= input.limit) {
+      break;
+    }
+
+    for (let offset = 1; offset <= input.windowSize; offset += 1) {
+      if (visitedPairCount >= input.limit) {
+        break;
+      }
+
+      const leftPage = input.pages[leftIndex];
+      const rightPage = input.pages[leftIndex + offset];
+
+      if (leftPage === undefined || rightPage === undefined) {
+        break;
+      }
+
+      const pairKey = createUndirectedPagePairKey(leftPage.id, rightPage.id);
+
+      if (input.pairKeys?.has(pairKey)) {
+        continue;
+      }
+
+      input.pairKeys?.add(pairKey);
+      input.visit(leftPage, rightPage);
+      visitedPairCount += 1;
+    }
+  }
+
+  return visitedPairCount;
+}
+
+function createUndirectedPagePairKey(leftPageId: string, rightPageId: string): string {
+  return [leftPageId, rightPageId].sort().join("\u0000");
 }
 
 export interface WikiMergeProcessorServiceOptions {
@@ -1967,6 +2199,13 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     });
 
     await input.assertCanContinue?.();
+    await this.refreshDerivedGraphSignalEdges(
+      input.draft.knowledgeBaseId,
+      applied.changeSetId,
+      applied.knowledgeVersionId,
+    );
+
+    await input.assertCanContinue?.();
 
     const indexedEmbeddingCount =
       (await this.embeddingIndexer?.indexPage({
@@ -2277,20 +2516,6 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     `.execute(db);
     await this.insertRelationshipCandidates(input, changeSetId, knowledgeVersionId, now, db);
     await input.assertCanContinue?.();
-    await this.insertDerivedGraphSignalEdges(
-      input.draft.knowledgeBaseId,
-      changeSetId,
-      knowledgeVersionId,
-      now,
-      db,
-    );
-    await this.recordGraphInsightRefreshJob(
-      input.draft.knowledgeBaseId,
-      changeSetId,
-      knowledgeVersionId,
-      now,
-      db,
-    );
     await sql`
       update knowledge_bases
       set current_version_id = ${knowledgeVersionId}, updated_at = ${now}
@@ -2417,6 +2642,59 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     return pages.length;
   }
 
+  private async refreshDerivedGraphSignalEdges(
+    knowledgeBaseId: string,
+    changeSetId: string,
+    knowledgeVersionId: string,
+  ): Promise<void> {
+    const startedAt = new Date().toISOString();
+    const jobId = await this.createGraphInsightRefreshJob(
+      knowledgeBaseId,
+      changeSetId,
+      knowledgeVersionId,
+      startedAt,
+      this.db,
+    );
+
+    try {
+      let graphInsights: GraphInsightsResponse | null = null;
+
+      await this.db.transaction().execute(async (trx) => {
+        await this.insertDerivedGraphSignalEdges(
+          knowledgeBaseId,
+          changeSetId,
+          knowledgeVersionId,
+          startedAt,
+          trx,
+        );
+        graphInsights = await this.createGraphInsightsSnapshot(knowledgeBaseId, trx);
+      });
+
+      if (graphInsights === null) {
+        throw new Error("Graph insight snapshot was not created.");
+      }
+
+      await this.completeGraphInsightRefreshJob(
+        jobId,
+        knowledgeBaseId,
+        changeSetId,
+        knowledgeVersionId,
+        graphInsights,
+        new Date().toISOString(),
+        this.db,
+      );
+    } catch (error) {
+      await this.failGraphInsightRefreshJob(
+        jobId,
+        changeSetId,
+        knowledgeVersionId,
+        error,
+        new Date().toISOString(),
+        this.db,
+      );
+    }
+  }
+
   private async loadSystemPageMarkdown(
     knowledgeBaseId: string,
     systemKey: string,
@@ -2483,13 +2761,180 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     );
   }
 
-  private async recordGraphInsightRefreshJob(
+  private async createGraphInsightsSnapshot(
+    knowledgeBaseId: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ): Promise<GraphInsightsResponse> {
+    const repository = createInMemoryRetrievalRepository();
+    const scope = await this.loadGraphInsightKnowledgeBaseScope(knowledgeBaseId, db);
+
+    repository.upsertKnowledgeBaseScope(scope);
+
+    const pages = await this.listGraphInsightPages(knowledgeBaseId, db);
+    const edges = await this.listGraphInsightEdges(knowledgeBaseId, db);
+
+    for (const page of pages) {
+      repository.upsertPage(page);
+    }
+
+    for (const edge of edges) {
+      repository.upsertEdge(edge);
+    }
+
+    return new GraphQueryService(repository).insights(knowledgeBaseId);
+  }
+
+  private async loadGraphInsightKnowledgeBaseScope(
+    knowledgeBaseId: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ) {
+    const result = await sql<{
+      id: string;
+      knowledge_base_type: string;
+      upstream_knowledge_base_id: string | null;
+      upstream_synced_version_id: string | null;
+    }>`
+      select id, knowledge_base_type, upstream_knowledge_base_id, upstream_synced_version_id
+      from knowledge_bases
+      where id = ${knowledgeBaseId}
+      limit 1
+    `.execute(db);
+    const row = result.rows[0];
+
+    return {
+      knowledge_base_id: knowledgeBaseId,
+      knowledge_base_type: row?.knowledge_base_type === "fork" ? "fork" : "canonical",
+      upstream_knowledge_base_id: row?.upstream_knowledge_base_id ?? null,
+      upstream_synced_version_id: row?.upstream_synced_version_id ?? null,
+    } as const;
+  }
+
+  private async listGraphInsightPages(
+    knowledgeBaseId: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ) {
+    const result = await sql<{
+      current_version_id: string | null;
+      fork_tombstoned_at: string | null;
+      frontmatter: Record<string, unknown> | null;
+      id: string;
+      markdown: string;
+      metadata: Record<string, unknown> | null;
+      owner_knowledge_base_id: string | null;
+      page_type: string;
+      slug: string;
+      source_document_ids: string[] | null;
+      system_page_key: string | null;
+      title: string;
+      upstream_resource_id: string | null;
+      visibility_origin: string | null;
+    }>`
+      select
+        id,
+        current_version_id,
+        title,
+        page_type,
+        slug,
+        markdown,
+        frontmatter,
+        source_document_ids,
+        metadata,
+        system_page_key,
+        owner_knowledge_base_id,
+        visibility_origin,
+        upstream_resource_id,
+        fork_tombstoned_at
+      from wiki_pages
+      where knowledge_base_id = ${knowledgeBaseId}
+        and deleted_at is null
+        and fork_tombstoned_at is null
+      order by updated_at desc, id desc
+    `.execute(db);
+
+    return result.rows.map((row) => {
+      const sourceDocumentIds = row.source_document_ids ?? [];
+
+      return {
+        fork_tombstoned_at: row.fork_tombstoned_at,
+        frontmatter: row.frontmatter ?? {},
+        is_system_page: row.system_page_key !== null,
+        knowledge_base_id: knowledgeBaseId,
+        markdown: row.markdown,
+        metadata: {
+          ...(row.metadata ?? {}),
+          slug: row.slug,
+        },
+        owner_knowledge_base_id: row.owner_knowledge_base_id,
+        page_id: row.id,
+        page_version_id: row.current_version_id ?? row.id,
+        source_refs: sourceDocumentIds.map((documentId) => ({ document_id: documentId })),
+        system_page_key: row.system_page_key,
+        title: row.title,
+        type: row.page_type,
+        upstream_resource_id: row.upstream_resource_id,
+        visibility_origin: readRetrievalVisibilityOrigin(row.visibility_origin),
+      };
+    });
+  }
+
+  private async listGraphInsightEdges(
+    knowledgeBaseId: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ) {
+    const result = await sql<{
+      explanation: string | null;
+      fork_tombstoned_at: string | null;
+      from_page_id: string;
+      id: string;
+      owner_knowledge_base_id: string | null;
+      relation_type: string;
+      source_document_ids: string[] | null;
+      to_page_id: string;
+      upstream_resource_id: string | null;
+      visibility_origin: string | null;
+      weight: number | null;
+    }>`
+      select
+        id,
+        from_page_id,
+        to_page_id,
+        relation_type,
+        weight,
+        explanation,
+        source_document_ids,
+        owner_knowledge_base_id,
+        visibility_origin,
+        upstream_resource_id,
+        fork_tombstoned_at
+      from wiki_edges
+      where knowledge_base_id = ${knowledgeBaseId}
+        and fork_tombstoned_at is null
+      order by updated_at desc, id desc
+    `.execute(db);
+
+    return result.rows.map((row) => ({
+      edge_id: row.id,
+      explanation: row.explanation ?? `${row.from_page_id} relates to ${row.to_page_id}.`,
+      fork_tombstoned_at: row.fork_tombstoned_at,
+      from_page_id: row.from_page_id,
+      knowledge_base_id: knowledgeBaseId,
+      owner_knowledge_base_id: row.owner_knowledge_base_id,
+      relation_type: readRetrievalRelationType(row.relation_type),
+      source_document_ids: row.source_document_ids ?? [],
+      to_page_id: row.to_page_id,
+      upstream_resource_id: row.upstream_resource_id,
+      visibility_origin: readRetrievalVisibilityOrigin(row.visibility_origin),
+      weight: row.weight ?? 1,
+    }));
+  }
+
+  private async createGraphInsightRefreshJob(
     knowledgeBaseId: string,
     changeSetId: string,
     knowledgeVersionId: string,
     now: string,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
-  ): Promise<void> {
+  ): Promise<string> {
     const jobId = this.idFactory("ingest_job");
 
     await sql`
@@ -2518,26 +2963,188 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
         ${knowledgeBaseId},
         null,
         'graph.insights.refresh',
-        'completed',
+        'running',
         'indexing',
-        100,
-        'Graph insights ready.',
+        10,
+        'Updating graph insights.',
         ${JSON.stringify({
           change_set_id: changeSetId,
           knowledge_version_id: knowledgeVersionId,
-          status: "ready",
+          retry_eligible: true,
+          status: "updating",
         })}::jsonb,
         ${JSON.stringify({
+          affected_knowledge_base_id: knowledgeBaseId,
           change_set_id: changeSetId,
+          generated_at: now,
           knowledge_version_id: knowledgeVersionId,
           refresh_kind: "graph_insights",
-          recompute_mode: "on_read_snapshot_cache",
+          retry_eligible: true,
         })}::jsonb,
         ${now},
         ${now},
-        ${now},
+        null,
         ${now}
       )
+    `.execute(db);
+
+    await this.insertGraphInsightRefreshEvent(
+      jobId,
+      "job.running",
+      "Updating graph insights.",
+      {
+        affected_knowledge_base_id: knowledgeBaseId,
+        change_set_id: changeSetId,
+        knowledge_version_id: knowledgeVersionId,
+        retry_eligible: true,
+        stage: "indexing",
+        status: "updating",
+      },
+      now,
+      db,
+    );
+
+    return jobId;
+  }
+
+  private async completeGraphInsightRefreshJob(
+    jobId: string,
+    knowledgeBaseId: string,
+    changeSetId: string,
+    knowledgeVersionId: string,
+    graphInsights: GraphInsightsResponse,
+    now: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ): Promise<void> {
+    await sql`
+      update jobs
+      set
+        status = 'completed',
+        stage = 'indexing',
+        progress = 100,
+        progress_message = 'Graph insights ready.',
+        result = ${JSON.stringify({
+          change_set_id: changeSetId,
+          graph_insights: graphInsights,
+          knowledge_version_id: knowledgeVersionId,
+          retry_eligible: false,
+          status: "ready",
+        })}::jsonb,
+        metadata = metadata || ${JSON.stringify({
+          affected_knowledge_base_id: knowledgeBaseId,
+          change_set_id: changeSetId,
+          generated_at: now,
+          knowledge_version_id: knowledgeVersionId,
+          refresh_kind: "graph_insights",
+          retry_eligible: false,
+        })}::jsonb,
+        finished_at = ${now},
+        updated_at = ${now}
+      where id = ${jobId}
+    `.execute(db);
+
+    await this.insertGraphInsightRefreshEvent(
+      jobId,
+      "job.completed",
+      "Graph insights ready.",
+      {
+        affected_knowledge_base_id: knowledgeBaseId,
+        change_set_id: changeSetId,
+        generated_at: now,
+        knowledge_version_id: knowledgeVersionId,
+        retry_eligible: false,
+        stage: "indexing",
+        status: "ready",
+      },
+      now,
+      db,
+    );
+  }
+
+  private async failGraphInsightRefreshJob(
+    jobId: string,
+    changeSetId: string,
+    knowledgeVersionId: string,
+    error: unknown,
+    now: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ): Promise<void> {
+    const safeError = toGraphRefreshError(error);
+
+    await sql`
+      update jobs
+      set
+        status = 'failed',
+        stage = 'indexing',
+        progress = 0,
+        progress_message = ${safeError.message},
+        result = ${JSON.stringify({
+          change_set_id: changeSetId,
+          knowledge_version_id: knowledgeVersionId,
+          retry_eligible: true,
+          status: "failed",
+        })}::jsonb,
+        error = ${JSON.stringify(safeError)}::jsonb,
+        metadata = metadata || ${JSON.stringify({
+          change_set_id: changeSetId,
+          failed_at: now,
+          knowledge_version_id: knowledgeVersionId,
+          refresh_kind: "graph_insights",
+          retry_eligible: true,
+        })}::jsonb,
+        finished_at = ${now},
+        updated_at = ${now}
+      where id = ${jobId}
+    `.execute(db);
+
+    await this.insertGraphInsightRefreshEvent(
+      jobId,
+      "job.failed",
+      safeError.message,
+      {
+        change_set_id: changeSetId,
+        error_code: safeError.code,
+        failed_at: now,
+        knowledge_version_id: knowledgeVersionId,
+        retry_eligible: true,
+        stage: "indexing",
+        status: "failed",
+      },
+      now,
+      db,
+    );
+  }
+
+  private async insertGraphInsightRefreshEvent(
+    jobId: string,
+    eventType: string,
+    message: string,
+    metadata: Record<string, unknown>,
+    now: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ): Promise<void> {
+    await sql`
+      insert into job_events (
+        id,
+        tenant_id,
+        project_id,
+        job_id,
+        event_type,
+        message,
+        metadata,
+        created_at
+      )
+      values (
+        ${createStableRelationshipId("jobevt_", jobId, eventType, now)},
+        (select tenant_id from jobs where id = ${jobId}),
+        (select project_id from jobs where id = ${jobId}),
+        ${jobId},
+        ${eventType},
+        ${message},
+        ${JSON.stringify(metadata)}::jsonb,
+        ${now}
+      )
+      on conflict (id) do nothing
     `.execute(db);
   }
 
@@ -4163,6 +4770,44 @@ function toStageError(code: string, error: unknown): Record<string, unknown> {
     message: summarizeError(error),
     retryable: !(error instanceof StructuredOutputValidationError),
   };
+}
+
+function toGraphRefreshError(error: unknown): {
+  code: string;
+  message: string;
+  retryable: boolean;
+} {
+  const message = error instanceof Error ? error.message : "Unknown graph refresh failure.";
+
+  return {
+    code: "graph_refresh_failed",
+    message: message.slice(0, 500),
+    retryable: true,
+  };
+}
+
+function readRetrievalRelationType(value: string): RetrievalRelationType {
+  if (
+    value === "wikilink" ||
+    value === "shared_source" ||
+    value === "common_neighbor" ||
+    value === "type_affinity" ||
+    value === "generated_relationship" ||
+    value === "evidence_relationship" ||
+    value === "manual"
+  ) {
+    return value;
+  }
+
+  return "generated_relationship";
+}
+
+function readRetrievalVisibilityOrigin(value: string | null): RetrievalVisibilityOrigin {
+  if (value === "fork_owned" || value === "upstream_inherited" || value === "canonical") {
+    return value;
+  }
+
+  return "canonical";
 }
 
 function summarizeError(error: unknown): string {

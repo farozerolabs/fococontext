@@ -11,7 +11,12 @@ import {
   Query,
   Req,
 } from "@nestjs/common";
-import { createListEnvelope, createRequestId, createSuccessEnvelope } from "@fococontext/contracts";
+import {
+  ApiError,
+  createListEnvelope,
+  createRequestId,
+  createSuccessEnvelope,
+} from "@fococontext/contracts";
 
 import { KnowledgeBaseService } from "./knowledge-base.service.js";
 import { requireApiKeyScope, type ApiKeyRequest } from "../auth/api-key.guard.js";
@@ -19,8 +24,14 @@ import {
   apiDatabaseHydratorToken,
   type ApiDatabaseHydrator,
 } from "../database/api-database-hydrator.js";
-import { parsePaginationQuery } from "../http/pagination.js";
+import {
+  parseCursorPaginationQuery,
+  parsePaginationQuery,
+  type CursorPaginationQuery,
+} from "../http/pagination.js";
 import { WebhookService } from "../webhooks/webhook.service.js";
+import { wikiStoreToken, type WikiStore } from "../wiki/wiki-store.js";
+import { toSystemPageResponse } from "./knowledge-base.helpers.js";
 import type {
   CreateKnowledgeBaseInput,
   ResolveKnowledgeBaseForkInput,
@@ -47,6 +58,7 @@ export class KnowledgeBaseController {
     private readonly knowledgeBaseService: KnowledgeBaseService,
     private readonly webhookService: WebhookService,
     @Inject(apiDatabaseHydratorToken) private readonly databaseHydrator: ApiDatabaseHydrator,
+    @Inject(wikiStoreToken) private readonly wikiStore: WikiStore,
   ) {}
 
   @Post()
@@ -58,7 +70,7 @@ export class KnowledgeBaseController {
   }
 
   @Get()
-  list(@Query() query: KnowledgeBaseListQuery, @Req() request: ApiKeyRequest) {
+  async list(@Query() query: KnowledgeBaseListQuery, @Req() request: ApiKeyRequest) {
     const { page, pageSize } = parsePaginationQuery(query);
     const listInput = {
       page,
@@ -66,7 +78,7 @@ export class KnowledgeBaseController {
       ...(query.keyword === undefined ? {} : { keyword: query.keyword }),
       ...(query.status === undefined ? {} : { status: query.status }),
     };
-    const result = this.knowledgeBaseService.list(listInput, requireApiKeyScope(request));
+    const result = await this.knowledgeBaseService.list(listInput, requireApiKeyScope(request));
 
     return createListEnvelope(result.items, {
       page: result.page,
@@ -80,20 +92,39 @@ export class KnowledgeBaseController {
   @Get(":id/system-pages")
   async systemPages(
     @Param("id") id: string,
-    @Query() query: KnowledgeBaseListQuery,
+    @Query() query: CursorPaginationQuery,
     @Req() request: ApiKeyRequest,
   ) {
-    const { page, pageSize } = parsePaginationQuery(query);
-    await this.refreshSystemPagesForKnowledgeBase(id);
-    const systemPages = this.knowledgeBaseService.listSystemPages(id, requireApiKeyScope(request));
-    const start = (page - 1) * pageSize;
-    const end = start + pageSize;
+    const { page, pageSize, cursor } = parseCursorPaginationQuery(query);
+    const scope = requireApiKeyScope(request);
+    this.knowledgeBaseService.assertReadableKnowledgeBase(id, scope);
+    const pagination = await this.wikiStore.listSystemPagesPaginated(id, {
+      page,
+      pageSize,
+      ...(cursor === undefined ? {} : { cursor }),
+    });
 
-    return createListEnvelope(systemPages.slice(start, end), {
+    if (pagination.total === 0) {
+      const fallbackItems = this.knowledgeBaseService.listSystemPages(id, scope);
+      const start = (page - 1) * pageSize;
+      const items = fallbackItems.slice(start, start + pageSize);
+
+      return createListEnvelope(items, {
+        page,
+        page_size: pageSize,
+        total: fallbackItems.length,
+        has_more: start + pageSize < fallbackItems.length,
+        next_cursor: null,
+        requestId: createRequestId(),
+      });
+    }
+
+    return createListEnvelope(pagination.items.map(toSystemPageResponse), {
       page,
       page_size: pageSize,
-      total: systemPages.length,
-      has_more: end < systemPages.length,
+      total: pagination.total,
+      has_more: pagination.hasMore,
+      next_cursor: pagination.nextCursor,
       requestId: createRequestId(),
     });
   }
@@ -128,12 +159,24 @@ export class KnowledgeBaseController {
     @Param("type") type: string,
     @Req() request: ApiKeyRequest,
   ) {
-    await this.refreshSystemPagesForKnowledgeBase(id);
+    const scope = requireApiKeyScope(request);
+    this.knowledgeBaseService.assertReadableKnowledgeBase(id, scope);
 
-    return createSuccessEnvelope(
-      this.knowledgeBaseService.getSystemPage(id, type, requireApiKeyScope(request)),
-      createRequestId(),
-    );
+    try {
+      return createSuccessEnvelope(
+        toSystemPageResponse(await this.wikiStore.getSystemPage(id, type)),
+        createRequestId(),
+      );
+    } catch (error) {
+      if (!isPageNotFoundError(error)) {
+        throw error;
+      }
+
+      return createSuccessEnvelope(
+        this.knowledgeBaseService.getSystemPage(id, type, scope),
+        createRequestId(),
+      );
+    }
   }
 
   @Post(":id/markdown-contract/validate")
@@ -195,13 +238,13 @@ export class KnowledgeBaseController {
   }
 
   @Get(":id/forks")
-  listForks(
+  async listForks(
     @Param("id") id: string,
     @Query() query: KnowledgeBaseListQuery,
     @Req() request: ApiKeyRequest,
   ) {
     const { page, pageSize } = parsePaginationQuery(query);
-    const result = this.knowledgeBaseService.listForks(
+    const result = await this.knowledgeBaseService.listForks(
       id,
       {
         page,
@@ -280,6 +323,10 @@ export class KnowledgeBaseController {
 
     await this.databaseHydrator.refresh();
   }
+}
+
+function isPageNotFoundError(error: unknown): boolean {
+  return error instanceof ApiError && error.code === "page_not_found";
 }
 
 @Controller("v1/forks")

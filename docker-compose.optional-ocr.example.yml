@@ -11,12 +11,23 @@ x-fococontext-env: &fococontext-env
     - ${FOCOCONTEXT_ENV_FILE:-.env}
 
 services:
+  migrate:
+    <<: *fococontext-env
+    image: "${FOCOCONTEXT_IMAGE_NAMESPACE:-ghcr.io/farozerolabs}/fococontext-api:${FOCOCONTEXT_IMAGE_TAG:?Set FOCOCONTEXT_IMAGE_TAG to a released Docker image tag, for example 0.1.0}"
+    command: ["node", "packages/db/dist/migrate.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   api:
     <<: *fococontext-env
     image: "${FOCOCONTEXT_IMAGE_NAMESPACE:-ghcr.io/farozerolabs}/fococontext-api:${FOCOCONTEXT_IMAGE_TAG:?Set FOCOCONTEXT_IMAGE_TAG to a released Docker image tag, for example 0.1.0}"
     environment:
       OCR_ENABLED: ${OCR_ENABLED:-false}
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -44,6 +55,8 @@ services:
     environment:
       OCR_ENABLED: ${OCR_ENABLED:-false}
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:

@@ -13,6 +13,7 @@ import {
   type ParserRegistry,
   evaluatePdfOcrEligibility,
   parseWithCache,
+  parseWithErrorBoundary,
   parseWithLimits,
 } from "@fococontext/parsers";
 import type { ObjectStorageAdapter } from "@fococontext/storage";
@@ -120,6 +121,7 @@ export interface SourceParseProcessorOptions {
   parserRegistry?: ParserRegistry;
   parserCache?: ParserCache;
   parserLimits?: ParserLimitConfig;
+  mediaAssetUploadConcurrency?: number;
   previewMaxChars?: number;
 }
 
@@ -148,6 +150,7 @@ export class SourceParseProcessor {
   private readonly parserRegistry: ParserRegistry;
   private readonly parserCache: ParserCache;
   private readonly parserLimits: ParserLimitConfig | undefined;
+  private readonly mediaAssetUploadConcurrency: number;
   private readonly previewMaxChars: number;
 
   constructor(options: SourceParseProcessorOptions) {
@@ -161,6 +164,10 @@ export class SourceParseProcessor {
     this.parserRegistry = options.parserRegistry ?? createDefaultParserRegistry();
     this.parserCache = options.parserCache ?? createInMemoryParserCache();
     this.parserLimits = options.parserLimits;
+    this.mediaAssetUploadConcurrency = normalizePositiveInteger(
+      options.mediaAssetUploadConcurrency,
+      4,
+    );
     this.previewMaxChars = options.previewMaxChars ?? defaultParsedMarkdownPreviewMaxChars;
   }
 
@@ -406,7 +413,10 @@ export class SourceParseProcessor {
     const limits = this.parserLimits;
 
     if (limits === undefined) {
-      return parser;
+      return {
+        ...parser,
+        parse: (input) => parseWithErrorBoundary(parser, input),
+      };
     }
 
     return {
@@ -420,20 +430,19 @@ export class SourceParseProcessor {
     payload: SourceParsePayload,
     parsedContentId: string,
   ): Promise<void> {
-    await Promise.all(
-      assets
-        .filter((asset) => asset.content !== undefined)
-        .map((asset) =>
-          this.objectStorage.putObject({
-            key: asset.objectKey,
-            body: asset.content ?? Buffer.alloc(0),
-            contentType: asset.mimeType,
-            metadata: {
-              documentId: payload.document_id,
-              parsedContentId,
-            },
-          }),
-        ),
+    await mapWithConcurrency(
+      assets.filter((asset) => asset.content !== undefined),
+      this.mediaAssetUploadConcurrency,
+      (asset) =>
+        this.objectStorage.putObject({
+          key: asset.objectKey,
+          body: asset.content ?? Buffer.alloc(0),
+          contentType: asset.mimeType,
+          metadata: {
+            documentId: payload.document_id,
+            parsedContentId,
+          },
+        }),
     );
   }
 
@@ -705,6 +714,33 @@ function createOcrRequiredError(reason: "disabled" | "no_candidate_pages"): Pars
 
 function sanitizeObjectKeySegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]+/g, "_");
+}
+
+function normalizePositiveInteger(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  mapper: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const normalizedConcurrency = Math.min(Math.max(1, concurrency), items.length);
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  await Promise.all(
+    Array.from({ length: normalizedConcurrency }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex;
+
+        nextIndex += 1;
+        results[currentIndex] = await mapper(items[currentIndex] as T);
+      }
+    }),
+  );
+
+  return results;
 }
 
 function basename(path: string): string {

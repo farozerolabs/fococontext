@@ -65,6 +65,7 @@ export interface KnowledgeCheckRecord {
   progress: number;
   checks: KnowledgeCheckType[];
   pageIds: string[];
+  sourceDocumentIds: string[];
   findings: KnowledgeCheckFinding[];
   semanticRun: KnowledgeCheckSemanticRun;
   configurationSnapshot: Record<string, unknown>;

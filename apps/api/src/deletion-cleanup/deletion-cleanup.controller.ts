@@ -17,6 +17,11 @@ interface CleanupOperationListQuery {
   status?: string;
 }
 
+interface CleanupOperationDetailQuery {
+  items_page?: string;
+  items_page_size?: string;
+}
+
 @Controller("v1/cleanup-operations")
 export class DeletionCleanupController {
   constructor(private readonly deletionCleanupService: DeletionCleanupService) {}
@@ -45,18 +50,32 @@ export class DeletionCleanupController {
   }
 
   @Get(":operationId")
-  async get(@Param("operationId") operationId: string, @Req() request: ApiKeyRequest) {
+  async get(
+    @Param("operationId") operationId: string,
+    @Query() query: CleanupOperationDetailQuery,
+    @Req() request: ApiKeyRequest,
+  ) {
     return createSuccessEnvelope(
-      await this.deletionCleanupService.get(operationId, requireApiKeyScope(request)),
+      await this.deletionCleanupService.get(operationId, requireApiKeyScope(request), {
+        page: parsePositiveIntegerQuery(query.items_page, 1),
+        pageSize: parseBoundedPositiveIntegerQuery(query.items_page_size, 100, 500),
+      }),
       createRequestId(),
     );
   }
 
   @Post(":operationId/retry")
   @HttpCode(200)
-  async retry(@Param("operationId") operationId: string, @Req() request: ApiKeyRequest) {
+  async retry(
+    @Param("operationId") operationId: string,
+    @Query() query: CleanupOperationDetailQuery,
+    @Req() request: ApiKeyRequest,
+  ) {
     return createSuccessEnvelope(
-      await this.deletionCleanupService.retry(operationId, requireApiKeyScope(request)),
+      await this.deletionCleanupService.retry(operationId, requireApiKeyScope(request), {
+        page: parsePositiveIntegerQuery(query.items_page, 1),
+        pageSize: parseBoundedPositiveIntegerQuery(query.items_page_size, 100, 500),
+      }),
       createRequestId(),
     );
   }
@@ -70,6 +89,14 @@ function parsePositiveIntegerQuery(value: string | undefined, fallback: number):
   const parsed = Number(value);
 
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseBoundedPositiveIntegerQuery(
+  value: string | undefined,
+  fallback: number,
+  max: number,
+): number {
+  return Math.min(parsePositiveIntegerQuery(value, fallback), max);
 }
 
 function readCleanupStatus(value: string): DeletionCleanupStatus {

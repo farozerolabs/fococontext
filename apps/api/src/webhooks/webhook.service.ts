@@ -8,6 +8,10 @@ import type { RuntimeConfig } from "@fococontext/core";
 import { defaultApiResourceScope, type ApiResourceScope } from "../auth/api-key.guard.js";
 import { isApiResourceInScope, requireScopedWebhook } from "../auth/resource-scope.js";
 import { apiDatabaseMirrorToken, type ApiDatabaseMirror } from "../database/api-database-mirror.js";
+import {
+  operationalReadStoreToken,
+  type OperationalReadStore,
+} from "../database/operational-read-store.js";
 import { KnowledgeBaseService } from "../knowledge-bases/knowledge-base.service.js";
 import {
   webhookDispatchQueueToken,
@@ -34,6 +38,7 @@ export class WebhookService {
     private readonly knowledgeBaseService: KnowledgeBaseService,
     private readonly repository: WebhookRepository,
     @Inject(apiDatabaseMirrorToken) private readonly databaseMirror: ApiDatabaseMirror,
+    @Inject(operationalReadStoreToken) private readonly operationalReadStore: OperationalReadStore,
     @Inject(runtimeConfigToken) private readonly runtimeConfig: RuntimeConfig,
     @Inject(webhookDispatchQueueToken) private readonly webhookDispatchQueue: WebhookDispatchQueue,
   ) {}
@@ -78,7 +83,58 @@ export class WebhookService {
     };
   }
 
-  get(webhookId: string, scope: ApiResourceScope = defaultApiResourceScope): WebhookEnvelope {
+  async listPaginated(
+    input: { page: number; pageSize: number },
+    scope: ApiResourceScope = defaultApiResourceScope,
+  ): Promise<{
+    webhooks: readonly WebhookResponse[];
+    page: number;
+    pageSize: number;
+    total: number;
+    hasMore: boolean;
+  }> {
+    try {
+      const dbResult = await this.operationalReadStore.listWebhooks(scope, input);
+
+      if (dbResult !== null) {
+        return {
+          webhooks: dbResult.items.map((webhook) =>
+            this.toWebhookResponse(webhook, dbResult.latestDeliveriesByWebhookId.get(webhook.id)),
+          ),
+          page: input.page,
+          pageSize: input.pageSize,
+          total: dbResult.total,
+          hasMore: dbResult.hasMore,
+        };
+      }
+    } catch (error) {
+      throw toOperationalListError(error);
+    }
+
+    const start = (input.page - 1) * input.pageSize;
+    const webhooks = this.list(scope).webhooks;
+
+    return {
+      webhooks: webhooks.slice(start, start + input.pageSize),
+      page: input.page,
+      pageSize: input.pageSize,
+      total: webhooks.length,
+      hasMore: start + input.pageSize < webhooks.length,
+    };
+  }
+
+  async get(
+    webhookId: string,
+    scope: ApiResourceScope = defaultApiResourceScope,
+  ): Promise<WebhookEnvelope> {
+    const dbResult = await this.getOperationalWebhook(webhookId, scope);
+
+    if (dbResult !== null) {
+      return {
+        webhook: this.toWebhookResponse(dbResult.webhook, dbResult.latestDelivery ?? undefined),
+      };
+    }
+
     const webhook = this.requireWebhook(webhookId, scope);
 
     return {
@@ -131,6 +187,49 @@ export class WebhookService {
       deliveries: this.repository
         .listDeliveriesForWebhook(webhookId)
         .map((delivery) => toWebhookDeliveryResponse(delivery)),
+    };
+  }
+
+  async listDeliveriesPaginated(
+    webhookId: string,
+    input: { page: number; pageSize: number },
+    scope: ApiResourceScope = defaultApiResourceScope,
+  ): Promise<{
+    deliveries: readonly WebhookDeliveryResponse[];
+    page: number;
+    pageSize: number;
+    total: number;
+    hasMore: boolean;
+  }> {
+    await this.requireWebhookForRead(webhookId, scope);
+    try {
+      const dbResult = await this.operationalReadStore.listWebhookDeliveriesByWebhookId(
+        webhookId,
+        input,
+      );
+
+      if (dbResult !== null) {
+        return {
+          deliveries: dbResult.items.map((delivery) => toWebhookDeliveryResponse(delivery)),
+          page: input.page,
+          pageSize: input.pageSize,
+          total: dbResult.total,
+          hasMore: dbResult.hasMore,
+        };
+      }
+    } catch (error) {
+      throw toOperationalListError(error);
+    }
+
+    const start = (input.page - 1) * input.pageSize;
+    const deliveries = this.listDeliveries(webhookId, scope).deliveries;
+
+    return {
+      deliveries: deliveries.slice(start, start + input.pageSize),
+      page: input.page,
+      pageSize: input.pageSize,
+      total: deliveries.length,
+      hasMore: start + input.pageSize < deliveries.length,
     };
   }
 
@@ -214,6 +313,39 @@ export class WebhookService {
     return webhook;
   }
 
+  private async requireWebhookForRead(
+    webhookId: string,
+    scope: ApiResourceScope,
+  ): Promise<WebhookRecord> {
+    const dbResult = await this.getOperationalWebhook(webhookId, scope);
+
+    if (dbResult !== null) {
+      return dbResult.webhook;
+    }
+
+    return this.requireWebhook(webhookId, scope);
+  }
+
+  private async getOperationalWebhook(
+    webhookId: string,
+    scope: ApiResourceScope,
+  ): Promise<{
+    webhook: WebhookRecord;
+    latestDelivery: WebhookDeliveryRecord | null;
+  } | null> {
+    try {
+      const dbResult = await this.operationalReadStore.getWebhookById(scope, webhookId);
+
+      if (dbResult !== null || !this.operationalReadStore.supportsOperationalReads) {
+        return dbResult;
+      }
+
+      throw createWebhookNotFoundError(webhookId);
+    } catch (error) {
+      throw toOperationalListError(error);
+    }
+  }
+
   private resolveEventScope(knowledgeBaseId: string | null): ApiResourceScope {
     if (knowledgeBaseId === null) {
       throw new ApiError("invalid_request", {
@@ -230,9 +362,12 @@ export class WebhookService {
     return scope;
   }
 
-  private toWebhookResponse(record: WebhookRecord): WebhookResponse {
-    const latestDelivery = this.repository.getLatestDelivery(record.id);
-
+  private toWebhookResponse(
+    record: WebhookRecord,
+    latestDelivery: WebhookDeliveryRecord | undefined = this.repository.getLatestDelivery(
+      record.id,
+    ),
+  ): WebhookResponse {
     return {
       id: record.id,
       knowledge_base_id: record.knowledgeBaseId,
@@ -486,6 +621,10 @@ function toWebhookDeliveryResponse(record: WebhookDeliveryRecord): WebhookDelive
     created_at: record.createdAt,
     delivered_at: record.deliveredAt,
   };
+}
+
+function toOperationalListError(error: unknown): ApiError {
+  return error instanceof ApiError ? error : new ApiError("internal_error");
 }
 
 function createWebhookNotFoundError(webhookId: string): ApiError {

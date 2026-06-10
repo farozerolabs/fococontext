@@ -140,6 +140,7 @@ const sourceExplorerCategories: SourceExplorerCategory[] = [
   "source_documents",
   "source_watch_rules",
 ]
+const sourceWatchScanHistoryPreviewLimit = 5
 
 export function KnowledgeBaseSourcesPage() {
   const { knowledgeBaseId } = useParams()
@@ -231,16 +232,26 @@ export function KnowledgeBaseSourcesPage() {
   })
   const selectedSourceWatchRuleId =
     selectedItem?.kind === "source_watch" ? selectedItem.rule.id : null
+  const sourceWatchScansListOptions = {
+    page: 1,
+    pageSize: sourceWatchScanHistoryPreviewLimit,
+  }
   const sourceWatchScansQuery = useQuery({
     enabled: selectedSourceWatchRuleId !== null,
     queryKey:
       selectedSourceWatchRuleId === null
         ? adminQueryKeys.sourceWatchScans("")
-        : adminQueryKeys.sourceWatchScans(selectedSourceWatchRuleId),
+        : adminQueryKeys.sourceWatchScans(
+            selectedSourceWatchRuleId,
+            sourceWatchScansListOptions
+          ),
     queryFn: async () =>
       selectedSourceWatchRuleId === null
         ? { data: [] }
-        : apiClient.listSourceWatchScans(selectedSourceWatchRuleId),
+        : apiClient.listSourceWatchScans(
+            selectedSourceWatchRuleId,
+            sourceWatchScansListOptions
+          ),
     refetchInterval: (query) =>
       (query.state.data?.data ?? []).some(
         (scan) => scan.status !== "completed" && scan.status !== "disabled"
@@ -1297,7 +1308,7 @@ function SourceInspector({
                           </TableRow>
                         </TableHeader>
                         <TableBody>
-                          {sourceWatchScans.slice(0, 5).map((scan) => (
+                          {sourceWatchScans.map((scan) => (
                             <TableRow key={scan.id}>
                               <TableCell>
                                 {t(

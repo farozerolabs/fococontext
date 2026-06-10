@@ -61,6 +61,23 @@ The release templates have two startup paths:
 | `docker-compose.optional-ocr.example.yml` | `OCR_ENABLED=false docker compose -f docker-compose.optional-ocr.example.yml up -d`              | Starts without OCR                  |
 | `docker-compose.optional-ocr.example.yml` | `OCR_ENABLED=true docker compose -f docker-compose.optional-ocr.example.yml --profile ocr up -d` | Starts OCR explicitly when required |
 
+The release templates start a dedicated `migrate` one-shot service before API
+and Worker. Fresh deployments initialize the latest schema. Existing
+deployments run pending migrations once during `docker compose up -d`. If
+migration fails, API and Worker stay blocked; inspect `docker compose logs
+migrate`, fix the cause, and run `docker compose up -d` again.
+
+For routine upgrades:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Rollback after a schema or data migration should restore the database snapshot
+that belongs to the previous image tag. Code-only rollbacks can pin
+`FOCOCONTEXT_IMAGE_TAG` back to the previous tag and restart the stack.
+
 For the first public release, maintainers should confirm the GHCR packages are
 public before publishing install instructions that reference those images.
 
@@ -130,6 +147,13 @@ After startup, open:
 | Redis        | `127.0.0.1:18379`                     |
 
 OpenAPI JSON is protected. Read it from an authenticated Admin Console session, or send `Authorization: Bearer <FOCOCONTEXT_API_KEY>` from a server process.
+
+Runtime pressure is visible in Admin Settings and `/health`. Check
+`dependencies.migration`, `dependencies.pressure.queue`,
+`dependencies.pressure.compile`,
+`dependencies.pressure.objectStorageOperations`, `dependencies.metrics.api`,
+`dependencies.metrics.cache`, and `dependencies.metrics.retrievalQuality` when
+large imports, graph refreshes, or Retrieve calls feel slow.
 
 ## Step 3: Sign in to Admin
 

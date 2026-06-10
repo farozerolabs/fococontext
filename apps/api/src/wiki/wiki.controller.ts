@@ -20,7 +20,7 @@ import {
   type WikiStore,
 } from "./wiki-store.js";
 import { requireApiKeyScope, type ApiKeyRequest } from "../auth/api-key.guard.js";
-import { parsePaginationQuery, type PaginationQuery } from "../http/pagination.js";
+import { parseCursorPaginationQuery, type CursorPaginationQuery } from "../http/pagination.js";
 import { KnowledgeBaseService } from "../knowledge-bases/knowledge-base.service.js";
 import { WebhookService } from "../webhooks/webhook.service.js";
 
@@ -34,20 +34,21 @@ export class KnowledgeBasePageController {
   @Get()
   async list(
     @Param("knowledgeBaseId") knowledgeBaseId: string,
-    @Query() query: PaginationQuery,
+    @Query() query: CursorPaginationQuery,
     @Req() request: ApiKeyRequest,
   ) {
     const scope = requireApiKeyScope(request);
 
     this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
-    const pages = await this.wikiStore.listPages(knowledgeBaseId);
-    const pagination = paginateArray(pages, parsePaginationQuery(query));
+    const paginationInput = parseCursorPaginationQuery(query);
+    const pagination = await this.wikiStore.listPagesPaginated(knowledgeBaseId, paginationInput);
 
     return createListEnvelope(pagination.items.map(toRenderableWikiPage), {
-      page: pagination.page,
-      page_size: pagination.pageSize,
+      page: paginationInput.page,
+      page_size: paginationInput.pageSize,
       total: pagination.total,
       has_more: pagination.hasMore,
+      next_cursor: pagination.nextCursor,
       requestId: createRequestId(),
     });
   }
@@ -132,28 +133,9 @@ export class WikiPageController {
   }
 
   @Get(":pageId/related")
-  async related(@Param("pageId") pageId: string, @Req() request: ApiKeyRequest) {
-    const scope = requireApiKeyScope(request);
-    const page = await this.wikiStore.getPage(pageId);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(
-      readRequiredString(page.knowledge_base_id),
-      scope,
-    );
-    const related = await this.wikiStore.listRelatedPages(pageId);
-
-    return createListEnvelope(related, {
-      page: 1,
-      page_size: related.length,
-      total: related.length,
-      has_more: false,
-      requestId: createRequestId(),
-    });
-  }
-
-  @Get(":pageId/versions")
-  async versions(
+  async related(
     @Param("pageId") pageId: string,
-    @Query() query: PaginationQuery,
+    @Query() query: CursorPaginationQuery,
     @Req() request: ApiKeyRequest,
   ) {
     const scope = requireApiKeyScope(request);
@@ -162,17 +144,43 @@ export class WikiPageController {
       readRequiredString(page.knowledge_base_id),
       scope,
     );
-    const versions = await this.wikiStore.listPageVersions(pageId);
-    const pagination = paginateArray(
-      versions.map(normalizeVersionRecord),
-      parsePaginationQuery(query),
-    );
+    const paginationInput = parseCursorPaginationQuery(query, {
+      defaultPageSize: 20,
+      maxPageSize: 100,
+    });
+    const related = await this.wikiStore.listRelatedPagesPaginated(pageId, paginationInput);
 
-    return createListEnvelope(pagination.items, {
-      page: pagination.page,
-      page_size: pagination.pageSize,
+    return createListEnvelope(related.items, {
+      page: paginationInput.page,
+      page_size: paginationInput.pageSize,
+      total: related.total,
+      has_more: related.hasMore,
+      next_cursor: related.nextCursor,
+      requestId: createRequestId(),
+    });
+  }
+
+  @Get(":pageId/versions")
+  async versions(
+    @Param("pageId") pageId: string,
+    @Query() query: CursorPaginationQuery,
+    @Req() request: ApiKeyRequest,
+  ) {
+    const scope = requireApiKeyScope(request);
+    const page = await this.wikiStore.getPage(pageId);
+    this.knowledgeBaseService.assertReadableKnowledgeBase(
+      readRequiredString(page.knowledge_base_id),
+      scope,
+    );
+    const paginationInput = parseCursorPaginationQuery(query);
+    const pagination = await this.wikiStore.listPageVersionsPaginated(pageId, paginationInput);
+
+    return createListEnvelope(pagination.items.map(normalizeVersionRecord), {
+      page: paginationInput.page,
+      page_size: paginationInput.pageSize,
       total: pagination.total,
       has_more: pagination.hasMore,
+      next_cursor: pagination.nextCursor,
       requestId: createRequestId(),
     });
   }
@@ -233,23 +241,24 @@ export class KnowledgeBaseVersionController {
   @Get()
   async list(
     @Param("knowledgeBaseId") knowledgeBaseId: string,
-    @Query() query: PaginationQuery,
+    @Query() query: CursorPaginationQuery,
     @Req() request: ApiKeyRequest,
   ) {
     const scope = requireApiKeyScope(request);
 
     this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
-    const versions = await this.wikiStore.listKnowledgeVersions(knowledgeBaseId);
-    const pagination = paginateArray(
-      versions.map(normalizeVersionRecord),
-      parsePaginationQuery(query),
+    const paginationInput = parseCursorPaginationQuery(query);
+    const pagination = await this.wikiStore.listKnowledgeVersionsPaginated(
+      knowledgeBaseId,
+      paginationInput,
     );
 
-    return createListEnvelope(pagination.items, {
-      page: pagination.page,
-      page_size: pagination.pageSize,
+    return createListEnvelope(pagination.items.map(normalizeVersionRecord), {
+      page: paginationInput.page,
+      page_size: paginationInput.pageSize,
       total: pagination.total,
       has_more: pagination.hasMore,
+      next_cursor: pagination.nextCursor,
       requestId: createRequestId(),
     });
   }
@@ -265,23 +274,57 @@ export class KnowledgeBasePageVersionController {
   @Get()
   async list(
     @Param("knowledgeBaseId") knowledgeBaseId: string,
-    @Query() query: PaginationQuery,
+    @Query() query: CursorPaginationQuery,
     @Req() request: ApiKeyRequest,
   ) {
     const scope = requireApiKeyScope(request);
 
     this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
-    const versions = await this.wikiStore.listKnowledgeBasePageVersions(knowledgeBaseId);
-    const pagination = paginateArray(
-      versions.map(normalizeVersionRecord),
-      parsePaginationQuery(query),
+    const paginationInput = parseCursorPaginationQuery(query);
+    const pagination = await this.wikiStore.listKnowledgeBasePageVersionsPaginated(
+      knowledgeBaseId,
+      paginationInput,
     );
 
-    return createListEnvelope(pagination.items, {
-      page: pagination.page,
-      page_size: pagination.pageSize,
+    return createListEnvelope(pagination.items.map(normalizeVersionRecord), {
+      page: paginationInput.page,
+      page_size: paginationInput.pageSize,
       total: pagination.total,
       has_more: pagination.hasMore,
+      next_cursor: pagination.nextCursor,
+      requestId: createRequestId(),
+    });
+  }
+}
+
+@Controller("v1/knowledge-bases/:knowledgeBaseId/change-sets")
+export class KnowledgeBaseChangeSetController {
+  constructor(
+    @Inject(wikiStoreToken) private readonly wikiStore: WikiStore,
+    private readonly knowledgeBaseService: KnowledgeBaseService,
+  ) {}
+
+  @Get()
+  async list(
+    @Param("knowledgeBaseId") knowledgeBaseId: string,
+    @Query() query: CursorPaginationQuery,
+    @Req() request: ApiKeyRequest,
+  ) {
+    const scope = requireApiKeyScope(request);
+
+    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    const paginationInput = parseCursorPaginationQuery(query);
+    const pagination = await this.wikiStore.listChangeSetsPaginated(
+      knowledgeBaseId,
+      paginationInput,
+    );
+
+    return createListEnvelope(pagination.items.map(normalizeVersionRecord), {
+      page: paginationInput.page,
+      page_size: paginationInput.pageSize,
+      total: pagination.total,
+      has_more: pagination.hasMore,
+      next_cursor: pagination.nextCursor,
       requestId: createRequestId(),
     });
   }
@@ -405,28 +448,6 @@ function readRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
-}
-
-function paginateArray<TItem>(
-  items: readonly TItem[],
-  input: { page: number; pageSize: number },
-): {
-  hasMore: boolean;
-  items: TItem[];
-  page: number;
-  pageSize: number;
-  total: number;
-} {
-  const start = (input.page - 1) * input.pageSize;
-  const end = start + input.pageSize;
-
-  return {
-    hasMore: end < items.length,
-    items: items.slice(start, end),
-    page: input.page,
-    pageSize: input.pageSize,
-    total: items.length,
-  };
 }
 
 function readString(value: unknown): string | null {

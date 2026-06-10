@@ -1,11 +1,13 @@
 import { loadRuntimeConfig } from "@fococontext/core";
-import { createPostgresDatabase, migrateToLatest, seedDefaultIdentity } from "@fococontext/db";
+import { createPostgresDatabase, seedDefaultIdentity } from "@fococontext/db";
 
 import { createPostgresApiDatabaseMirror } from "./database/api-database-mirror.js";
 import {
   apiDatabaseHydratorToken,
   createPostgresApiDatabaseHydrator,
 } from "./database/api-database-hydrator.js";
+import { createPostgresOperationalReadStore } from "./database/operational-read-store.js";
+import { createPostgresBoundedRetrievalRepository } from "./retrieve/postgres-bounded-retrieval-repository.js";
 import {
   createPostgresApiKeyResolver,
   upsertEnvBootstrapApiKey,
@@ -15,7 +17,6 @@ import { createApiApp } from "./app.js";
 
 async function main(): Promise<void> {
   const config = loadRuntimeConfig(process.env);
-  await migrateToLatest(config.database.url);
 
   const db = createPostgresDatabase(config.database.url);
   const identity = await seedDefaultIdentity(db, {
@@ -27,6 +28,8 @@ async function main(): Promise<void> {
     apiDatabaseMirror: createPostgresApiDatabaseMirror(db, identity),
     apiDatabaseHydratorFactory: (repositories) =>
       createPostgresApiDatabaseHydrator(db, repositories),
+    boundedRetrievalRepository: createPostgresBoundedRetrievalRepository(db),
+    operationalReadStore: createPostgresOperationalReadStore(db),
     defaultIdentity: identity,
     wikiStore: createPostgresWikiStore(db),
   });

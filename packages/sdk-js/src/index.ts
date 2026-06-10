@@ -11,9 +11,16 @@ export interface RequestOptions {
 }
 
 export interface ListOptions extends RequestOptions {
+  cursor?: string;
+  limit?: number;
   page?: number;
   pageSize?: number;
   [key: string]: string | number | boolean | undefined | HeadersInit;
+}
+
+export interface CleanupOperationItemListOptions extends RequestOptions {
+  itemsPage?: number;
+  itemsPageSize?: number;
 }
 
 export interface UploadSourceDocumentInput extends RequestOptions {
@@ -138,10 +145,25 @@ export interface CleanupSettledState extends JsonObject {
   };
 }
 
+export interface CleanupItemSummary extends JsonObject {
+  id: string;
+  item_type: "object" | "database_row" | "reference" | "audit";
+  operation_id: string;
+  phase: CleanupPhase;
+  status: "pending" | "running" | "deleted" | "skipped" | "failed";
+}
+
 export interface CleanupOperation {
   created_at: string;
   id: string;
   item_counts: CleanupItemCounts;
+  items?: CleanupItemSummary[];
+  items_pagination?: {
+    has_more: boolean;
+    page: number;
+    page_size: number;
+    total: number;
+  };
   knowledge_base_id: string | null;
   phase: CleanupPhase;
   retryable: boolean;
@@ -170,6 +192,38 @@ export interface CleanupRetryResponse {
   cleanup_operation: CleanupOperation;
 }
 
+export interface ChangeSet extends JsonObject {
+  applied_at: string | null;
+  base_version_id: string | null;
+  created_at: string;
+  description: string | null;
+  diff: JsonObject;
+  discarded_at: string | null;
+  id: string;
+  items: JsonObject[];
+  knowledge_base_id: string;
+  metadata: JsonObject;
+  status: string;
+  target_version_id: string | null;
+  title: string;
+  trigger_type: string;
+}
+
+export interface ChangeSetSummary extends JsonObject {
+  applied_at: string | null;
+  base_version_id: string | null;
+  created_at: string;
+  description: string | null;
+  discarded_at: string | null;
+  id: string;
+  knowledge_base_id: string;
+  metadata: JsonObject;
+  status: string;
+  target_version_id: string | null;
+  title: string;
+  trigger_type: string;
+}
+
 export interface ApiEnvelope<TData> {
   data?: TData;
   error?: ApiErrorPayload;
@@ -188,6 +242,7 @@ export interface Pagination {
   page_size: number;
   total: number;
   has_more: boolean;
+  next_cursor?: string | null;
 }
 
 export type JsonObject = Record<string, unknown>;
@@ -1495,19 +1550,26 @@ export class FococontextClient {
 
   getCleanupOperation<TData = CleanupOperation>(
     cleanupOperationId: string,
-    options: RequestOptions = {},
+    options: CleanupOperationItemListOptions = {},
   ): Promise<TData> {
-    return this.getJson(`/cleanup-operations/${encodePath(cleanupOperationId)}`, options);
+    return this.requestJson(`/cleanup-operations/${encodePath(cleanupOperationId)}`, options, {
+      method: "GET",
+      query: toCleanupItemPageQuery(options),
+    });
   }
 
   retryCleanupOperation<TData = CleanupRetryResponse>(
     cleanupOperationId: string,
-    options: RequestOptions = {},
+    options: CleanupOperationItemListOptions = {},
   ): Promise<TData> {
-    return this.postJson(
+    return this.requestJson(
       `/cleanup-operations/${encodePath(cleanupOperationId)}/retry`,
-      {},
       options,
+      {
+        body: {},
+        method: "POST",
+        query: toCleanupItemPageQuery(options),
+      },
     );
   }
 
@@ -1842,6 +1904,17 @@ export class FococontextClient {
     return this.getJson(`/change-sets/${encodePath(changeSetId)}`, options);
   }
 
+  listKnowledgeBaseChangeSets<TItem = ChangeSetSummary>(
+    knowledgeBaseId: string,
+    options: ListOptions = {},
+  ): Promise<ListResult<TItem>> {
+    return this.requestList(
+      `/knowledge-bases/${encodePath(knowledgeBaseId)}/change-sets`,
+      toPageQuery(options),
+      options,
+    );
+  }
+
   applyChangeSet<TData = JsonObject>(
     changeSetId: string,
     input: JsonObject = {},
@@ -2169,6 +2242,15 @@ function toPageQuery(options: ListOptions): Record<string, string | number | boo
   }
 
   return query;
+}
+
+function toCleanupItemPageQuery(
+  options: CleanupOperationItemListOptions,
+): Record<string, string | number | boolean | undefined> {
+  return {
+    items_page: options.itemsPage,
+    items_page_size: options.itemsPageSize,
+  };
 }
 
 function encodePath(value: string): string {

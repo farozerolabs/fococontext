@@ -8,17 +8,27 @@ import {
   type ApiDatabaseHydrator,
 } from "../database/api-database-hydrator.js";
 import { apiDatabaseMirrorToken, type ApiDatabaseMirror } from "../database/api-database-mirror.js";
+import {
+  operationalReadStoreToken,
+  type OperationalReadStore,
+} from "../database/operational-read-store.js";
 import { KnowledgeBaseService } from "../knowledge-bases/knowledge-base.service.js";
 import {
   deletionCleanupQueueToken,
   type DeletionCleanupQueue,
 } from "../queues/deletion-cleanup.queue.js";
 import {
+  toDeletionCleanupOperationSummaryResponse,
   toDeletionCleanupOperationDetailResponse,
+  type DeletionCleanupOperationSummaryResponse,
   type DeletionCleanupOperationDetailResponse,
 } from "./deletion-cleanup.response.js";
 import { DeletionCleanupRepository } from "./deletion-cleanup.repository.js";
-import type { DeletionCleanupStatus } from "./deletion-cleanup.types.js";
+import type {
+  DeletionCleanupItemRecord,
+  DeletionCleanupOperationRecord,
+  DeletionCleanupStatus,
+} from "./deletion-cleanup.types.js";
 
 export interface ListDeletionCleanupOperationsInput {
   page: number;
@@ -28,11 +38,16 @@ export interface ListDeletionCleanupOperationsInput {
 }
 
 export interface ListDeletionCleanupOperationsResult {
-  items: DeletionCleanupOperationDetailResponse[];
+  items: DeletionCleanupOperationSummaryResponse[];
   page: number;
   pageSize: number;
   total: number;
   hasMore: boolean;
+}
+
+export interface DeletionCleanupItemPaginationInput {
+  page: number;
+  pageSize: number;
 }
 
 @Injectable()
@@ -43,13 +58,13 @@ export class DeletionCleanupService {
     @Inject(deletionCleanupQueueToken) private readonly deletionCleanupQueue: DeletionCleanupQueue,
     @Inject(apiDatabaseHydratorToken) private readonly databaseHydrator: ApiDatabaseHydrator,
     @Inject(apiDatabaseMirrorToken) private readonly databaseMirror: ApiDatabaseMirror,
+    @Inject(operationalReadStoreToken) private readonly operationalReadStore: OperationalReadStore,
   ) {}
 
   async list(
     input: ListDeletionCleanupOperationsInput,
     scope?: ApiResourceScope,
   ): Promise<ListDeletionCleanupOperationsResult> {
-    await this.databaseHydrator.refresh();
     if (input.knowledgeBaseId !== undefined) {
       this.assertReadableKnowledgeBase(
         input.knowledgeBaseId,
@@ -57,6 +72,28 @@ export class DeletionCleanupService {
         () => new ApiError("knowledge_base_not_found"),
       );
     }
+    if (scope !== undefined) {
+      try {
+        const dbResult = await this.operationalReadStore.listDeletionCleanupOperations(
+          scope,
+          input,
+        );
+
+        if (dbResult !== null) {
+          return {
+            items: dbResult.items.map(toDeletionCleanupOperationSummaryResponse),
+            page: input.page,
+            pageSize: input.pageSize,
+            total: dbResult.total,
+            hasMore: dbResult.hasMore,
+          };
+        }
+      } catch (error) {
+        throw toOperationalListError(error);
+      }
+    }
+
+    await this.databaseHydrator.refresh();
 
     const operations = this.repository
       .listOperations({
@@ -68,14 +105,7 @@ export class DeletionCleanupService {
     const end = start + input.pageSize;
 
     return {
-      items: operations
-        .slice(start, end)
-        .map((operation) =>
-          toDeletionCleanupOperationDetailResponse(
-            operation,
-            this.repository.listItemsByOperationId(operation.id),
-          ),
-        ),
+      items: operations.slice(start, end).map(toDeletionCleanupOperationSummaryResponse),
       page: input.page,
       pageSize: input.pageSize,
       total: operations.length,
@@ -86,32 +116,28 @@ export class DeletionCleanupService {
   async get(
     operationId: string,
     scope?: ApiResourceScope,
+    itemPagination: DeletionCleanupItemPaginationInput = { page: 1, pageSize: 100 },
   ): Promise<DeletionCleanupOperationDetailResponse> {
-    await this.databaseHydrator.refresh();
-
-    const operation = this.repository.findOperationById(operationId);
-
-    if (operation === undefined || !this.isOperationVisible(operation.knowledgeBaseId, scope)) {
-      throw new ApiError("cleanup_operation_not_found");
-    }
-
-    return toDeletionCleanupOperationDetailResponse(
-      operation,
-      this.repository.listItemsByOperationId(operation.id),
+    const { operation, items, itemTotal, itemHasMore } = await this.loadOperationDetail(
+      operationId,
+      scope,
+      itemPagination,
     );
+
+    return toDeletionCleanupOperationDetailResponse(operation, items, {
+      ...itemPagination,
+      total: itemTotal,
+      hasMore: itemHasMore,
+    });
   }
 
   async retry(
     operationId: string,
     scope?: ApiResourceScope,
+    itemPagination: DeletionCleanupItemPaginationInput = { page: 1, pageSize: 100 },
   ): Promise<{ cleanup_operation: DeletionCleanupOperationDetailResponse }> {
-    await this.databaseHydrator.refresh();
+    const { operation, items } = await this.loadOperationDetail(operationId, scope, itemPagination);
 
-    const operation = this.repository.findOperationById(operationId);
-
-    if (operation === undefined || !this.isOperationVisible(operation.knowledgeBaseId, scope)) {
-      throw new ApiError("cleanup_operation_not_found");
-    }
     if (
       !operation.retryable ||
       operation.status === "completed" ||
@@ -119,6 +145,7 @@ export class DeletionCleanupService {
     ) {
       throw new ApiError("cleanup_operation_not_retryable");
     }
+    this.repository.updateOperation(operation);
 
     const now = new Date().toISOString();
     let queued = this.repository.updateOperation({
@@ -157,10 +184,11 @@ export class DeletionCleanupService {
     }
 
     return {
-      cleanup_operation: toDeletionCleanupOperationDetailResponse(
-        queued,
-        this.repository.listItemsByOperationId(queued.id),
-      ),
+      cleanup_operation: toDeletionCleanupOperationDetailResponse(queued, items, {
+        ...itemPagination,
+        total: queued.totalItemCount,
+        hasMore: itemPagination.page * itemPagination.pageSize < queued.totalItemCount,
+      }),
     };
   }
 
@@ -195,4 +223,58 @@ export class DeletionCleanupService {
       notFoundFactory,
     );
   }
+
+  private async loadOperationDetail(
+    operationId: string,
+    scope: ApiResourceScope | undefined,
+    itemPagination: DeletionCleanupItemPaginationInput,
+  ): Promise<{
+    operation: DeletionCleanupOperationRecord;
+    items: DeletionCleanupItemRecord[];
+    itemTotal: number;
+    itemHasMore: boolean;
+  }> {
+    if (scope !== undefined) {
+      try {
+        const dbResult = await this.operationalReadStore.getDeletionCleanupOperationById(
+          scope,
+          operationId,
+          itemPagination,
+        );
+
+        if (dbResult !== null) {
+          return dbResult;
+        }
+        if (this.operationalReadStore.supportsOperationalReads) {
+          throw new ApiError("cleanup_operation_not_found");
+        }
+      } catch (error) {
+        throw toOperationalListError(error);
+      }
+    }
+
+    await this.databaseHydrator.refresh();
+
+    const operation = this.repository.findOperationById(operationId);
+
+    if (operation === undefined || !this.isOperationVisible(operation.knowledgeBaseId, scope)) {
+      throw new ApiError("cleanup_operation_not_found");
+    }
+
+    return {
+      operation,
+      items: this.repository
+        .listItemsByOperationId(operation.id)
+        .slice(
+          (itemPagination.page - 1) * itemPagination.pageSize,
+          itemPagination.page * itemPagination.pageSize,
+        ),
+      itemTotal: operation.totalItemCount,
+      itemHasMore: itemPagination.page * itemPagination.pageSize < operation.totalItemCount,
+    };
+  }
+}
+
+function toOperationalListError(error: unknown): ApiError {
+  return error instanceof ApiError ? error : new ApiError("internal_error");
 }

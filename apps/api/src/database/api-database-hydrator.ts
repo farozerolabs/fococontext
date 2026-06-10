@@ -823,6 +823,7 @@ class PostgresApiDatabaseHydrator implements ApiDatabaseHydrator {
         checks: normalizeStringArray(metadata.checks) as KnowledgeCheckType[],
         configurationSnapshot: normalizeJsonObject(metadata.configuration_snapshot),
         pageIds: normalizeStringArray(metadata.page_ids),
+        sourceDocumentIds: normalizeStringArray(metadata.source_document_ids),
         findings: normalizeJsonArray(row.findings) as unknown as KnowledgeCheckRecord["findings"],
         semanticRun: normalizeKnowledgeCheckSemanticRun(metadata.semantic_run),
         createdAt: normalizeTimestamp(row.created_at),

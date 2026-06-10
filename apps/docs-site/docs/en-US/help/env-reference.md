@@ -223,6 +223,10 @@ Rerank uses an all-or-none contract. Leave every `RERANK_*` value empty to disab
 | `PARSER_TIMEOUT_SECONDS`                     | Parser timeout                                 | Default `120`                                     |
 | `PARSER_CONCURRENCY`                         | Parser concurrency compatibility fallback      | Default `2`                                       |
 | `SOURCE_PARSE_CONCURRENCY`                   | Source parsing stage concurrency               | Default `2`                                       |
+| `PARSER_ZIP_MAX_ENTRIES`                     | Max archive entries before parsing             | Default `10000`                                   |
+| `PARSER_ZIP_MAX_EXPANDED_MB`                 | Max total expanded archive size in MB          | Default `1000`                                    |
+| `PARSER_ZIP_MAX_ENTRY_MB`                    | Max single archive entry size in MB            | Default `50`                                      |
+| `PARSER_MEDIA_UPLOAD_CONCURRENCY`            | Extracted media upload concurrency             | Default `2`                                       |
 | `PARSER_MAX_IMAGES_PER_DOCUMENT`             | Max extracted visual assets per document       | Default `50`                                      |
 | `PARSER_MAX_RENDERED_SNAPSHOTS_PER_DOCUMENT` | Max rendered page/sheet snapshots per document | Default `10`                                      |
 | `PARSER_MAX_IMAGE_PIXELS`                    | Max pixels per extracted image                 | Default `16000000`                                |

@@ -5,9 +5,18 @@ export interface PaginationQuery {
   page_size?: string;
 }
 
+export interface CursorPaginationQuery extends PaginationQuery {
+  cursor?: string;
+  limit?: string;
+}
+
 export interface PaginationInput {
   page: number;
   pageSize: number;
+}
+
+export interface CursorPaginationInput extends PaginationInput {
+  cursor?: string;
 }
 
 export function parsePaginationQuery(
@@ -32,6 +41,42 @@ export function parsePaginationQuery(
       max: maxPageSize,
       min: 1,
     }),
+  };
+}
+
+export function parseCursorPaginationQuery(
+  query: CursorPaginationQuery,
+  input: {
+    defaultPageSize?: number;
+    maxPageSize?: number;
+  } = {},
+): CursorPaginationInput {
+  const defaultPageSize = input.defaultPageSize ?? 20;
+  const maxPageSize = input.maxPageSize ?? 100;
+  const cursor = query.cursor?.trim();
+
+  if (cursor !== undefined && cursor.length === 0) {
+    throw new ApiError("invalid_request", {
+      messageKey: "api.validation.pagination_invalid",
+      details: {
+        fields: ["cursor"],
+      },
+    });
+  }
+
+  return {
+    page: parsePaginationInteger(query.page, {
+      fallback: 1,
+      field: "page",
+      min: 1,
+    }),
+    pageSize: parsePaginationInteger(query.limit ?? query.page_size, {
+      fallback: defaultPageSize,
+      field: query.limit === undefined ? "page_size" : "limit",
+      max: maxPageSize,
+      min: 1,
+    }),
+    ...(cursor === undefined ? {} : { cursor }),
   };
 }
 

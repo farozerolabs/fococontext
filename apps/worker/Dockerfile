@@ -22,6 +22,7 @@ COPY packages/core/package.json packages/core/package.json
 COPY packages/db/package.json packages/db/package.json
 COPY packages/llm/package.json packages/llm/package.json
 COPY packages/parsers/package.json packages/parsers/package.json
+COPY packages/retrieval/package.json packages/retrieval/package.json
 COPY packages/storage/package.json packages/storage/package.json
 RUN --mount=type=cache,id=fococontext-pnpm-store,target=/pnpm/store \
   pnpm install --frozen-lockfile --prod --filter @fococontext/worker... --store-dir=/pnpm/store
@@ -55,6 +56,7 @@ COPY --from=production-deps /app/packages/db/node_modules ./packages/db/node_mod
 COPY --from=production-deps /app/packages/llm/package.json ./packages/llm/package.json
 COPY --from=production-deps /app/packages/parsers/package.json ./packages/parsers/package.json
 COPY --from=production-deps /app/packages/parsers/node_modules ./packages/parsers/node_modules
+COPY --from=production-deps /app/packages/retrieval/package.json ./packages/retrieval/package.json
 COPY --from=production-deps /app/packages/storage/package.json ./packages/storage/package.json
 COPY --from=production-deps /app/packages/storage/node_modules ./packages/storage/node_modules
 
@@ -65,6 +67,7 @@ COPY --from=build /app/packages/db/dist ./packages/db/dist
 COPY --from=build /app/packages/db/migrations ./packages/db/migrations
 COPY --from=build /app/packages/llm/dist ./packages/llm/dist
 COPY --from=build /app/packages/parsers/dist ./packages/parsers/dist
+COPY --from=build /app/packages/retrieval/dist ./packages/retrieval/dist
 COPY --from=build /app/packages/storage/dist ./packages/storage/dist
 RUN mkdir -p node_modules/@fococontext \
   && ln -sf ../../packages/contracts node_modules/@fococontext/contracts \
@@ -72,6 +75,7 @@ RUN mkdir -p node_modules/@fococontext \
   && ln -sf ../../packages/db node_modules/@fococontext/db \
   && ln -sf ../../packages/llm node_modules/@fococontext/llm \
   && ln -sf ../../packages/parsers node_modules/@fococontext/parsers \
+  && ln -sf ../../packages/retrieval node_modules/@fococontext/retrieval \
   && ln -sf ../../packages/storage node_modules/@fococontext/storage
 
 USER node

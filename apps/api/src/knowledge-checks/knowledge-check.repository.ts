@@ -36,6 +36,7 @@ function cloneCheck(record: KnowledgeCheckRecord): KnowledgeCheckRecord {
       unknown
     >,
     pageIds: [...record.pageIds],
+    sourceDocumentIds: [...record.sourceDocumentIds],
     findings: JSON.parse(JSON.stringify(record.findings)) as KnowledgeCheckRecord["findings"],
     semanticRun: JSON.parse(
       JSON.stringify(record.semanticRun),

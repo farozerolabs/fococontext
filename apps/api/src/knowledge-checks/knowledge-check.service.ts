@@ -25,6 +25,10 @@ import { KnowledgeBaseService } from "../knowledge-bases/knowledge-base.service.
 import type { KnowledgeBaseResponse } from "../knowledge-bases/knowledge-base.types.js";
 import { WebhookService } from "../webhooks/webhook.service.js";
 import { wikiStoreToken, type WikiPageApiRecord, type WikiStore } from "../wiki/wiki-store.js";
+import {
+  knowledgeCheckQueueToken,
+  type KnowledgeCheckQueue,
+} from "../queues/knowledge-check.queue.js";
 import { KnowledgeCheckRepository } from "./knowledge-check.repository.js";
 import {
   knowledgeCheckTypes,
@@ -39,6 +43,9 @@ import {
 const defaultChecks: KnowledgeCheckType[] = ["missing_sources"];
 const semanticCheckTypes = new Set<KnowledgeCheckType>(["semantic_consistency"]);
 const semanticStructuredOutputRepairAttempts = 3;
+const knowledgeCheckPageSize = 250;
+const largeKnowledgeCheckScopePageThreshold = 100;
+const knowledgeCheckRelatedPageConcurrency = 8;
 
 export const knowledgeCheckChatProviderToken = Symbol("knowledgeCheckChatProvider");
 
@@ -50,6 +57,7 @@ export class KnowledgeCheckService {
     @Inject(apiDatabaseMirrorToken) private readonly databaseMirror: ApiDatabaseMirror,
     @Inject(apiDatabaseHydratorToken) private readonly databaseHydrator: ApiDatabaseHydrator,
     @Inject(wikiStoreToken) private readonly wikiStore: WikiStore,
+    @Inject(knowledgeCheckQueueToken) private readonly knowledgeCheckQueue: KnowledgeCheckQueue,
     @Inject(knowledgeCheckChatProviderToken) private readonly chatProvider: ChatProvider,
     private readonly webhookService: WebhookService,
   ) {}
@@ -69,6 +77,32 @@ export class KnowledgeCheckService {
     const checks = readChecks(input.checks, knowledgeCheckConfig);
     const pageIds = readPageIds(input.page_ids);
     const sourceDocumentIds = readPageIds(input.source_document_ids);
+    const shouldQueue = await shouldQueueKnowledgeCheck({
+      knowledgeBaseId: knowledgeBase.id,
+      pageIds,
+      sourceDocumentIds,
+      wikiStore: this.wikiStore,
+    });
+
+    if (shouldQueue) {
+      return this.enqueueKnowledgeCheck({
+        checks,
+        datasetConfigurationSnapshot: {
+          id: datasetConfiguration.latest_snapshot_id,
+          preset_id: datasetConfiguration.preset_id,
+          version: datasetConfiguration.version,
+          values: {
+            knowledge_check: knowledgeCheckConfig,
+            prompt_templates: datasetConfiguration.values.prompt_templates,
+          },
+        },
+        knowledgeBaseId: knowledgeBase.id,
+        pageIds,
+        ...(scope === undefined ? {} : { scope }),
+        sourceDocumentIds,
+      });
+    }
+
     const result = await createFindings({
       chatProvider: this.chatProvider,
       checks,
@@ -92,6 +126,7 @@ export class KnowledgeCheckService {
       progress: 100,
       checks,
       pageIds,
+      sourceDocumentIds,
       findings: result.findings,
       semanticRun: result.semanticRun,
       configurationSnapshot: {
@@ -145,6 +180,70 @@ export class KnowledgeCheckService {
     }
 
     return toKnowledgeCheckResponse(record);
+  }
+
+  private async enqueueKnowledgeCheck(input: {
+    checks: KnowledgeCheckType[];
+    datasetConfigurationSnapshot: Record<string, unknown>;
+    knowledgeBaseId: string;
+    pageIds: string[];
+    scope?: ApiResourceScope;
+    sourceDocumentIds: string[];
+  }): Promise<KnowledgeCheckResponse> {
+    const now = new Date().toISOString();
+    const record: KnowledgeCheckRecord = {
+      id: createResourceId("knowledgeCheck"),
+      knowledgeBaseId: input.knowledgeBaseId,
+      status: "queued",
+      progress: 0,
+      checks: input.checks,
+      pageIds: input.pageIds,
+      sourceDocumentIds: input.sourceDocumentIds,
+      findings: [],
+      semanticRun: {
+        findings_count: 0,
+        repair_attempts: 0,
+        status: "skipped",
+        trace: {
+          queued: true,
+          reason: "large_scope",
+        },
+      },
+      configurationSnapshot: input.datasetConfigurationSnapshot,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const created = this.repository.create(record);
+    await this.databaseMirror.saveKnowledgeCheck(created);
+
+    try {
+      await this.knowledgeCheckQueue.enqueueKnowledgeCheckJob({
+        check_id: created.id,
+      });
+    } catch (error) {
+      const failed: KnowledgeCheckRecord = {
+        ...created,
+        status: "failed",
+        progress: 100,
+        semanticRun: {
+          findings_count: 0,
+          repair_attempts: 0,
+          status: "failed",
+          failure_reason: summarizeError(error),
+          trace: {
+            queued: true,
+            queue_error: "enqueue_failed",
+          },
+        },
+        updatedAt: new Date().toISOString(),
+      };
+
+      this.repository.create(failed);
+      await this.databaseMirror.saveKnowledgeCheck(failed);
+      throw error;
+    }
+
+    return toKnowledgeCheckResponse(created);
   }
 }
 
@@ -227,6 +326,42 @@ function readPageIds(value: string[] | undefined): string[] {
   return [...new Set((value ?? []).map((pageId) => pageId.trim()).filter(Boolean))];
 }
 
+async function shouldQueueKnowledgeCheck(input: {
+  knowledgeBaseId: string;
+  pageIds: readonly string[];
+  sourceDocumentIds: readonly string[];
+  wikiStore: WikiStore;
+}): Promise<boolean> {
+  if (
+    input.pageIds.length > largeKnowledgeCheckScopePageThreshold ||
+    input.sourceDocumentIds.length > largeKnowledgeCheckScopePageThreshold
+  ) {
+    return true;
+  }
+
+  if (input.wikiStore.countKnowledgeCheckPages !== undefined) {
+    const targetCount = await input.wikiStore.countKnowledgeCheckPages(input.knowledgeBaseId, {
+      page: 1,
+      pageIds: input.pageIds,
+      pageSize: 1,
+      sourceDocumentIds: input.sourceDocumentIds,
+    });
+
+    return targetCount > largeKnowledgeCheckScopePageThreshold;
+  }
+
+  if (input.pageIds.length > 0 || input.sourceDocumentIds.length > 0) {
+    return false;
+  }
+
+  const page = await input.wikiStore.listPagesPaginated(input.knowledgeBaseId, {
+    page: 1,
+    pageSize: 1,
+  });
+
+  return page.total > largeKnowledgeCheckScopePageThreshold;
+}
+
 interface CreateFindingsInput {
   chatProvider: ChatProvider;
   checks: readonly KnowledgeCheckType[];
@@ -254,19 +389,18 @@ async function createFindings(input: CreateFindingsInput): Promise<KnowledgeChec
     sourceDocumentIds,
     wikiStore,
   } = input;
-  const allPages = await wikiStore.listPages(knowledgeBaseId);
-  const targetPages =
-    pageIds.length === 0 ? allPages : allPages.filter((page) => pageIds.includes(page.id));
-  const sourceScopedPages =
-    sourceDocumentIds.length === 0
-      ? targetPages
-      : targetPages.filter((page) =>
-          page.source_document_ids.some((documentId) => sourceDocumentIds.includes(documentId)),
-        );
-  const pageIndex = createPageIndex(allPages);
+  const sourceScopedPages = await listKnowledgeCheckPages(wikiStore, knowledgeBaseId, {
+    pageIds,
+    sourceDocumentIds,
+  });
+  const pageIndex = await listKnowledgeCheckPageKeyIndex(
+    wikiStore,
+    knowledgeBaseId,
+    sourceScopedPages,
+  );
   const relatedByPageId =
     needsGraphData(checks) || checks.includes("orphan_pages")
-      ? await listRelatedPages(wikiStore, allPages)
+      ? await listRelatedPages(wikiStore, sourceScopedPages)
       : new Map<string, Record<string, unknown>[]>();
   const incomingPageIds = createIncomingPageIds(relatedByPageId);
   const findings: KnowledgeCheckFinding[] = [];
@@ -1052,11 +1186,139 @@ async function listRelatedPages(
   wikiStore: WikiStore,
   pages: readonly WikiPageApiRecord[],
 ): Promise<Map<string, Record<string, unknown>[]>> {
-  const entries = await Promise.all(
-    pages.map(async (page) => [page.id, await wikiStore.listRelatedPages(page.id)] as const),
+  if (wikiStore.listRelatedPagesByPageIds !== undefined) {
+    const relatedByPageId = new Map<string, Record<string, unknown>[]>();
+
+    for (let index = 0; index < pages.length; index += knowledgeCheckPageSize) {
+      const batch = pages.slice(index, index + knowledgeCheckPageSize);
+      const batchRelated = await wikiStore.listRelatedPagesByPageIds(batch.map((page) => page.id));
+
+      for (const page of batch) {
+        relatedByPageId.set(page.id, batchRelated.get(page.id) ?? []);
+      }
+    }
+
+    return relatedByPageId;
+  }
+
+  const entries = await mapWithConcurrency(
+    pages,
+    knowledgeCheckRelatedPageConcurrency,
+    async (page) => [page.id, await wikiStore.listRelatedPages(page.id)] as const,
   );
 
   return new Map(entries);
+}
+
+async function listKnowledgeCheckPages(
+  wikiStore: WikiStore,
+  knowledgeBaseId: string,
+  scope: {
+    pageIds: readonly string[];
+    sourceDocumentIds: readonly string[];
+  },
+): Promise<WikiPageApiRecord[]> {
+  if (wikiStore.listKnowledgeCheckPages !== undefined) {
+    const pages: WikiPageApiRecord[] = [];
+
+    for (let page = 1; ; page += 1) {
+      const result = await wikiStore.listKnowledgeCheckPages(knowledgeBaseId, {
+        page,
+        pageIds: scope.pageIds,
+        pageSize: knowledgeCheckPageSize,
+        sourceDocumentIds: scope.sourceDocumentIds,
+      });
+
+      pages.push(...result.items);
+
+      if (!result.hasMore) {
+        break;
+      }
+    }
+
+    return pages;
+  }
+
+  if (typeof wikiStore.listPagesPaginated !== "function") {
+    const pages = await wikiStore.listPages(knowledgeBaseId);
+
+    return filterKnowledgeCheckPages(pages, scope);
+  }
+
+  const pages: WikiPageApiRecord[] = [];
+
+  for (let page = 1; ; page += 1) {
+    const result = await wikiStore.listPagesPaginated(knowledgeBaseId, {
+      page,
+      pageSize: knowledgeCheckPageSize,
+    });
+
+    pages.push(...result.items);
+
+    if (!result.hasMore) {
+      break;
+    }
+  }
+
+  if (pages.length > 0) {
+    return filterKnowledgeCheckPages(pages, scope);
+  }
+
+  return filterKnowledgeCheckPages(await wikiStore.listPages(knowledgeBaseId), scope);
+}
+
+async function listKnowledgeCheckPageKeyIndex(
+  wikiStore: WikiStore,
+  knowledgeBaseId: string,
+  fallbackPages: readonly WikiPageApiRecord[],
+): Promise<ReadonlySet<string>> {
+  if (wikiStore.listKnowledgeCheckPageKeys !== undefined) {
+    return wikiStore.listKnowledgeCheckPageKeys(knowledgeBaseId);
+  }
+
+  return createPageIndex(fallbackPages);
+}
+
+function filterKnowledgeCheckPages(
+  pages: readonly WikiPageApiRecord[],
+  scope: {
+    pageIds: readonly string[];
+    sourceDocumentIds: readonly string[];
+  },
+): WikiPageApiRecord[] {
+  const targetPages =
+    scope.pageIds.length === 0 ? pages : pages.filter((page) => scope.pageIds.includes(page.id));
+
+  return scope.sourceDocumentIds.length === 0
+    ? [...targetPages]
+    : targetPages.filter((page) =>
+        page.source_document_ids.some((documentId) => scope.sourceDocumentIds.includes(documentId)),
+      );
+}
+
+async function mapWithConcurrency<TInput, TOutput>(
+  items: readonly TInput[],
+  concurrency: number,
+  mapper: (item: TInput) => Promise<TOutput>,
+): Promise<TOutput[]> {
+  const output: TOutput[] = [];
+  let nextIndex = 0;
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        const item = items[index];
+
+        if (item !== undefined) {
+          output[index] = await mapper(item);
+        }
+      }
+    }),
+  );
+
+  return output;
 }
 
 function createIncomingPageIds(

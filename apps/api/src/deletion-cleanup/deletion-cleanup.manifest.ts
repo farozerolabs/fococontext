@@ -9,6 +9,7 @@ import { DocumentRepository } from "../documents/document.repository.js";
 import type {
   JobEventRecord,
   JobRecord,
+  MediaAssetRecord,
   ParsedContentRecord,
   SourceDocumentRecord,
   UploadSessionRecord,
@@ -36,8 +37,80 @@ export interface CollectSourceDocumentManifestInput extends CollectManifestInput
   documentId: string;
 }
 
+export interface CollectSourceDocumentManifestRecordsInput extends CollectManifestInput {
+  knowledgeBaseId: string;
+  document: SourceDocumentRecord;
+  parsedContent: ParsedContentRecord | null;
+  mediaAssets: readonly MediaAssetRecord[];
+  jobs: readonly JobRecord[];
+  jobEventsByJobId: ReadonlyMap<string, readonly JobEventRecord[]>;
+  activeObjectKeys: ReadonlySet<string>;
+}
+
 export interface CollectUploadSessionManifestInput extends CollectManifestInput {
   session: UploadSessionRecord;
+}
+
+export function collectSourceDocumentObjectKeysFromRecords(input: {
+  document: SourceDocumentRecord;
+  parsedContent: ParsedContentRecord | null;
+  mediaAssets: readonly MediaAssetRecord[];
+}): string[] {
+  return uniqueObjectEntries(collectDocumentEntriesFromRecords(input)).map(
+    (entry) => entry.objectKey,
+  );
+}
+
+export function collectSourceDocumentManifestFromRecords(
+  input: CollectSourceDocumentManifestRecordsInput,
+): DeletionCleanupManifestResult {
+  if (input.document.knowledgeBaseId !== input.knowledgeBaseId) {
+    return createManifestResult({
+      input,
+      targetType: "source_document",
+      targetId: input.document.id,
+      knowledgeBaseId: input.knowledgeBaseId,
+      objectEntries: [],
+      rowRefs: [],
+    });
+  }
+
+  const objectEntries = uniqueObjectEntries(
+    collectDocumentEntriesFromRecords({
+      document: input.document,
+      parsedContent: input.parsedContent,
+      mediaAssets: input.mediaAssets,
+    }),
+  ).map((entry) => {
+    if (input.activeObjectKeys.has(entry.objectKey)) {
+      return {
+        ...entry,
+        status: "skipped" as const,
+        skipReason: "object_key_referenced_by_active_resource",
+        itemType: "reference" as const,
+      };
+    }
+
+    return {
+      ...entry,
+      status: "pending" as const,
+    };
+  });
+
+  return createManifestResult({
+    input,
+    targetType: "source_document",
+    targetId: input.document.id,
+    knowledgeBaseId: input.document.knowledgeBaseId,
+    objectEntries,
+    rowRefs: collectDocumentRowRefsFromRecords({
+      document: input.document,
+      parsedContent: input.parsedContent,
+      mediaAssets: input.mediaAssets,
+      jobs: input.jobs,
+      jobEventsByJobId: input.jobEventsByJobId,
+    }),
+  });
 }
 
 @Injectable()
@@ -59,7 +132,7 @@ export class DeletionCleanupManifestCollector {
         : []),
     ];
 
-    return this.createManifestResult({
+    return createManifestResult({
       input,
       targetType: "knowledge_base",
       targetId: input.knowledgeBaseId,
@@ -78,7 +151,7 @@ export class DeletionCleanupManifestCollector {
     const document = this.documentRepository.findDocumentById(input.documentId);
 
     if (document === undefined) {
-      return this.createManifestResult({
+      return createManifestResult({
         input,
         targetType: "source_document",
         targetId: input.documentId,
@@ -89,7 +162,7 @@ export class DeletionCleanupManifestCollector {
     }
 
     if (document.knowledgeBaseId !== input.knowledgeBaseId) {
-      return this.createManifestResult({
+      return createManifestResult({
         input,
         targetType: "source_document",
         targetId: input.documentId,
@@ -99,39 +172,32 @@ export class DeletionCleanupManifestCollector {
       });
     }
 
-    const activeObjectKeys = this.collectActiveObjectKeysForOtherSources(document);
-    const objectEntries = uniqueObjectEntries(this.collectDocumentEntries(document)).map(
-      (entry) => {
-        if (activeObjectKeys.has(entry.objectKey)) {
-          return {
-            ...entry,
-            status: "skipped" as const,
-            skipReason: "object_key_referenced_by_active_resource",
-            itemType: "reference" as const,
-          };
-        }
-
-        return {
-          ...entry,
-          status: "pending" as const,
-        };
-      },
+    const jobs = this.documentRepository
+      .listJobs(document.knowledgeBaseId)
+      .filter((job) => job.documentId === document.id);
+    const jobEventsByJobId = new Map(
+      jobs.map((job) => [job.id, this.documentRepository.listJobEvents(job.id)]),
     );
 
-    return this.createManifestResult({
-      input,
-      targetType: "source_document",
-      targetId: document.id,
-      knowledgeBaseId: document.knowledgeBaseId,
-      objectEntries,
-      rowRefs: this.collectDocumentRowRefs(document),
+    return collectSourceDocumentManifestFromRecords({
+      operationId: input.operationId,
+      now: input.now,
+      maxAttempts: input.maxAttempts,
+      retainedUntil: input.retainedUntil,
+      knowledgeBaseId: input.knowledgeBaseId,
+      document,
+      parsedContent: this.documentRepository.findParsedContentByDocumentId(document.id) ?? null,
+      mediaAssets: this.documentRepository.listMediaAssetsByDocumentId(document.id),
+      jobs,
+      jobEventsByJobId,
+      activeObjectKeys: this.collectActiveObjectKeysForOtherSources(document),
     });
   }
 
   collectUploadSessionManifest(
     input: CollectUploadSessionManifestInput,
   ): DeletionCleanupManifestResult {
-    return this.createManifestResult({
+    return createManifestResult({
       input,
       targetType: "source_document",
       targetId: input.session.documentId,
@@ -149,17 +215,11 @@ export class DeletionCleanupManifestCollector {
   }
 
   private collectDocumentEntries(document: SourceDocumentRecord): ObjectEntry[] {
-    const parsedContent = this.documentRepository.findParsedContentByDocumentId(document.id);
-    const mediaAssets = this.documentRepository.listMediaAssetsByDocumentId(document.id);
-
-    return [
-      createObjectEntry(document.objectKey, "source_documents", document.id),
-      ...extractKnownObjectKeys(document.metadata).map((objectKey) =>
-        createObjectEntry(objectKey, "source_documents.metadata", document.id),
-      ),
-      ...(parsedContent === undefined ? [] : collectParsedContentObjectEntries(parsedContent)),
-      ...mediaAssets.map((asset) => createObjectEntry(asset.objectKey, "media_assets", asset.id)),
-    ].filter(isObjectEntry);
+    return collectDocumentEntriesFromRecords({
+      document,
+      parsedContent: this.documentRepository.findParsedContentByDocumentId(document.id) ?? null,
+      mediaAssets: this.documentRepository.listMediaAssetsByDocumentId(document.id),
+    });
   }
 
   private collectDocumentRowRefs(document: SourceDocumentRecord): DatabaseRowRef[] {
@@ -168,22 +228,17 @@ export class DeletionCleanupManifestCollector {
     const jobs = this.documentRepository
       .listJobs(document.knowledgeBaseId)
       .filter((job) => job.documentId === document.id);
-    const jobEvents = jobs.flatMap((job) =>
-      this.documentRepository.listJobEvents(job.id).map((event) => ({ job, event })),
+    const jobEventsByJobId = new Map(
+      jobs.map((job) => [job.id, this.documentRepository.listJobEvents(job.id)]),
     );
 
-    return [
-      { tableName: "source_documents", resourceId: document.id },
-      ...(parsedContent === undefined
-        ? []
-        : [{ tableName: "parsed_contents", resourceId: parsedContent.id }]),
-      ...mediaAssets.map((asset) => ({ tableName: "media_assets", resourceId: asset.id })),
-      ...jobs.map((job) => ({ tableName: "jobs", resourceId: job.id })),
-      ...jobEvents.map(({ job, event }) => ({
-        tableName: "job_events",
-        resourceId: createJobEventResourceId(job, event),
-      })),
-    ];
+    return collectDocumentRowRefsFromRecords({
+      document,
+      parsedContent: parsedContent ?? null,
+      mediaAssets,
+      jobs,
+      jobEventsByJobId,
+    });
   }
 
   private collectKnowledgeBaseJobRowRefs(
@@ -220,77 +275,6 @@ export class DeletionCleanupManifestCollector {
         this.collectDocumentEntries(candidate).map((entry) => entry.objectKey),
       ),
     );
-  }
-
-  private createManifestResult(input: {
-    input: CollectManifestInput;
-    targetType: "knowledge_base" | "source_document";
-    targetId: string;
-    knowledgeBaseId: string | null;
-    objectEntries: ManifestObjectEntry[];
-    rowRefs: DatabaseRowRef[];
-  }): DeletionCleanupManifestResult {
-    const objectItems = input.objectEntries.map((entry, index) =>
-      createCleanupItem({
-        operationId: input.input.operationId,
-        index,
-        itemType: entry.itemType ?? "object",
-        resourceType: entry.resourceType,
-        resourceId: entry.resourceId,
-        objectKey: entry.objectKey,
-        tableName: null,
-        knowledgeBaseId: input.knowledgeBaseId,
-        sourceDocumentId: input.targetType === "source_document" ? input.targetId : null,
-        status: entry.status,
-        skipReason: entry.skipReason ?? null,
-        phase: entry.status === "skipped" ? "object_cleanup" : "queued",
-        now: input.input.now,
-        maxAttempts: input.input.maxAttempts,
-        retainedUntil: input.input.retainedUntil,
-      }),
-    );
-    const databaseItems = input.rowRefs.sort(compareDatabaseRowRefs).map((row, index) =>
-      createCleanupItem({
-        operationId: input.input.operationId,
-        index: objectItems.length + index,
-        itemType: "database_row",
-        resourceType:
-          row.scope === undefined || row.scope === "id"
-            ? row.tableName
-            : `${row.tableName}.${row.scope}`,
-        resourceId: row.resourceId,
-        objectKey: null,
-        tableName: row.tableName,
-        knowledgeBaseId: input.knowledgeBaseId,
-        sourceDocumentId: input.targetType === "source_document" ? input.targetId : null,
-        status: "pending",
-        skipReason: null,
-        phase: "queued",
-        now: input.input.now,
-        maxAttempts: input.input.maxAttempts,
-        retainedUntil: input.input.retainedUntil,
-      }),
-    );
-    const items = [...objectItems, ...databaseItems];
-    const objectItemCount = objectItems.filter((item) => item.itemType === "object").length;
-    const skippedReferenceCount = objectItems.filter(
-      (item) => item.itemType === "reference",
-    ).length;
-
-    return {
-      manifest: {
-        target_type: input.targetType,
-        target_id: input.targetId,
-        knowledge_base_id: input.knowledgeBaseId,
-        object_key_count: objectItemCount,
-        database_row_count: databaseItems.length,
-        skipped_reference_count: skippedReferenceCount,
-        total_item_count: items.length,
-        item_page_size: items.length,
-        item_page_count: items.length === 0 ? 0 : 1,
-      },
-      items,
-    };
   }
 }
 
@@ -345,6 +329,117 @@ function collectParsedContentObjectEntries(record: ParsedContentRecord): ObjectE
       createObjectEntry(objectKey, "parsed_contents.ocr_provider_metadata", record.id),
     ),
   ].filter(isObjectEntry);
+}
+
+function collectDocumentEntriesFromRecords(input: {
+  document: SourceDocumentRecord;
+  parsedContent: ParsedContentRecord | null;
+  mediaAssets: readonly MediaAssetRecord[];
+}): ObjectEntry[] {
+  return [
+    createObjectEntry(input.document.objectKey, "source_documents", input.document.id),
+    ...extractKnownObjectKeys(input.document.metadata).map((objectKey) =>
+      createObjectEntry(objectKey, "source_documents.metadata", input.document.id),
+    ),
+    ...(input.parsedContent === null ? [] : collectParsedContentObjectEntries(input.parsedContent)),
+    ...input.mediaAssets.map((asset) =>
+      createObjectEntry(asset.objectKey, "media_assets", asset.id),
+    ),
+  ].filter(isObjectEntry);
+}
+
+function collectDocumentRowRefsFromRecords(input: {
+  document: SourceDocumentRecord;
+  parsedContent: ParsedContentRecord | null;
+  mediaAssets: readonly MediaAssetRecord[];
+  jobs: readonly JobRecord[];
+  jobEventsByJobId: ReadonlyMap<string, readonly JobEventRecord[]>;
+}): DatabaseRowRef[] {
+  const jobEvents = input.jobs.flatMap((job) =>
+    (input.jobEventsByJobId.get(job.id) ?? []).map((event) => ({ job, event })),
+  );
+
+  return [
+    { tableName: "source_documents", resourceId: input.document.id },
+    ...(input.parsedContent === null
+      ? []
+      : [{ tableName: "parsed_contents", resourceId: input.parsedContent.id }]),
+    ...input.mediaAssets.map((asset) => ({ tableName: "media_assets", resourceId: asset.id })),
+    ...input.jobs.map((job) => ({ tableName: "jobs", resourceId: job.id })),
+    ...jobEvents.map(({ job, event }) => ({
+      tableName: "job_events",
+      resourceId: createJobEventResourceId(job, event),
+    })),
+  ];
+}
+
+function createManifestResult(input: {
+  input: CollectManifestInput;
+  targetType: "knowledge_base" | "source_document";
+  targetId: string;
+  knowledgeBaseId: string | null;
+  objectEntries: ManifestObjectEntry[];
+  rowRefs: DatabaseRowRef[];
+}): DeletionCleanupManifestResult {
+  const objectItems = input.objectEntries.map((entry, index) =>
+    createCleanupItem({
+      operationId: input.input.operationId,
+      index,
+      itemType: entry.itemType ?? "object",
+      resourceType: entry.resourceType,
+      resourceId: entry.resourceId,
+      objectKey: entry.objectKey,
+      tableName: null,
+      knowledgeBaseId: input.knowledgeBaseId,
+      sourceDocumentId: input.targetType === "source_document" ? input.targetId : null,
+      status: entry.status,
+      skipReason: entry.skipReason ?? null,
+      phase: entry.status === "skipped" ? "object_cleanup" : "queued",
+      now: input.input.now,
+      maxAttempts: input.input.maxAttempts,
+      retainedUntil: input.input.retainedUntil,
+    }),
+  );
+  const databaseItems = input.rowRefs.sort(compareDatabaseRowRefs).map((row, index) =>
+    createCleanupItem({
+      operationId: input.input.operationId,
+      index: objectItems.length + index,
+      itemType: "database_row",
+      resourceType:
+        row.scope === undefined || row.scope === "id"
+          ? row.tableName
+          : `${row.tableName}.${row.scope}`,
+      resourceId: row.resourceId,
+      objectKey: null,
+      tableName: row.tableName,
+      knowledgeBaseId: input.knowledgeBaseId,
+      sourceDocumentId: input.targetType === "source_document" ? input.targetId : null,
+      status: "pending",
+      skipReason: null,
+      phase: "queued",
+      now: input.input.now,
+      maxAttempts: input.input.maxAttempts,
+      retainedUntil: input.input.retainedUntil,
+    }),
+  );
+  const items = [...objectItems, ...databaseItems];
+  const objectItemCount = objectItems.filter((item) => item.itemType === "object").length;
+  const skippedReferenceCount = objectItems.filter((item) => item.itemType === "reference").length;
+
+  return {
+    manifest: {
+      target_type: input.targetType,
+      target_id: input.targetId,
+      knowledge_base_id: input.knowledgeBaseId,
+      object_key_count: objectItemCount,
+      database_row_count: databaseItems.length,
+      skipped_reference_count: skippedReferenceCount,
+      total_item_count: items.length,
+      item_page_size: items.length,
+      item_page_count: items.length === 0 ? 0 : 1,
+    },
+    items,
+  };
 }
 
 function createObjectEntry(

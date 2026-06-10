@@ -7,8 +7,15 @@ export interface FococontextApiClientOptions {
 }
 
 export interface ListOptions {
+  cursor?: string
+  limit?: number
   page?: number
   pageSize?: number
+}
+
+export interface CleanupOperationItemListOptions {
+  itemsPage?: number
+  itemsPageSize?: number
 }
 
 export interface FococontextApiClient {
@@ -35,12 +42,16 @@ export interface FococontextApiClient {
   deleteKnowledgeBaseFork(forkId: string): Promise<DeletedFork>
   deleteSourceDocument(documentId: string): Promise<DeletedSourceDocument>
   deleteKnowledgeBase(id: string): Promise<DeletedKnowledgeBase>
-  getCleanupOperation(operationId: string): Promise<CleanupOperation>
+  getCleanupOperation(
+    operationId: string,
+    options?: CleanupOperationItemListOptions
+  ): Promise<CleanupOperation>
   listCleanupOperations(
     options?: ListOptions
   ): Promise<CleanupOperationListResult>
   retryCleanupOperation(
-    operationId: string
+    operationId: string,
+    options?: CleanupOperationItemListOptions
   ): Promise<CleanupOperationRetryResult>
   reingestSourceDocument(documentId: string): Promise<DocumentUploadResult>
   retryMediaAssetCaption(mediaAssetId: string): Promise<JobDetail>
@@ -85,6 +96,10 @@ export interface FococontextApiClient {
     knowledgeBaseId: string,
     options?: ListOptions
   ): Promise<KnowledgeVersionListResult>
+  listKnowledgeBaseChangeSets(
+    knowledgeBaseId: string,
+    options?: ListOptions
+  ): Promise<ChangeSetListResult>
   listKnowledgeBasePageVersions(
     knowledgeBaseId: string,
     options?: ListOptions
@@ -93,7 +108,10 @@ export interface FococontextApiClient {
     pageId: string,
     options?: ListOptions
   ): Promise<WikiPageVersionListResult>
-  listRelatedPages(pageId: string): Promise<RelatedPageListResult>
+  listRelatedPages(
+    pageId: string,
+    options?: ListOptions
+  ): Promise<RelatedPageListResult>
   listSourceDocuments(
     knowledgeBaseId: string,
     options?: ListOptions
@@ -196,6 +214,7 @@ interface ApiListEnvelope<TData> {
 
 export interface Pagination {
   has_more: boolean
+  next_cursor?: string | null
   page: number
   page_size: number
   total: number
@@ -459,6 +478,12 @@ export interface CleanupOperation {
     object_keys: number
     pending: number
     skipped: number
+    total: number
+  }
+  items_pagination?: {
+    has_more: boolean
+    page: number
+    page_size: number
     total: number
   }
   items?: CleanupOperationItem[]
@@ -1140,6 +1165,26 @@ export interface ChangeSet {
   trigger_type: string
 }
 
+export interface ChangeSetSummary {
+  applied_at: string | null
+  base_version_id: string | null
+  created_at: string
+  description: string | null
+  discarded_at: string | null
+  id: string
+  knowledge_base_id: string
+  metadata: Record<string, unknown>
+  status: string
+  target_version_id: string | null
+  title: string
+  trigger_type: string
+}
+
+export interface ChangeSetListResult {
+  data: ChangeSetSummary[]
+  pagination: Pagination
+}
+
 export interface SourceRef {
   document_id: string
   locator?: string
@@ -1197,6 +1242,7 @@ export interface GraphSignalContribution {
 
 export interface GraphResponse {
   edges: readonly GraphEdge[]
+  graph_readiness?: GraphInsightStatus
   knowledge_base_id: string
   nodes: readonly GraphNode[]
   version_id: string | null
@@ -1407,6 +1453,7 @@ export interface RetrieveResponse {
     used_tokens: number
   } | null
   expandable_graph: Record<string, unknown> | null
+  graph_readiness?: GraphInsightStatus
   graph_expansions: readonly Record<string, unknown>[]
   knowledge_base_id: string
   mode: string
@@ -1852,11 +1899,14 @@ export function createFococontextApiClient(
           method: "DELETE",
         }
       ),
-    getCleanupOperation: (operationId) =>
+    getCleanupOperation: (operationId, itemOptions = {}) =>
       requestJson(
         fetchFn,
         baseUrl,
-        `/cleanup-operations/${encodeURIComponent(operationId)}`,
+        appendCleanupItemQuery(
+          `/cleanup-operations/${encodeURIComponent(operationId)}`,
+          itemOptions
+        ),
         options
       ),
     listCleanupOperations: (listOptions = {}) =>
@@ -1866,11 +1916,14 @@ export function createFococontextApiClient(
         appendListQuery("/cleanup-operations", listOptions),
         options
       ),
-    retryCleanupOperation: (operationId) =>
+    retryCleanupOperation: (operationId, itemOptions = {}) =>
       requestJson(
         fetchFn,
         baseUrl,
-        `/cleanup-operations/${encodeURIComponent(operationId)}/retry`,
+        appendCleanupItemQuery(
+          `/cleanup-operations/${encodeURIComponent(operationId)}/retry`,
+          itemOptions
+        ),
         options,
         {
           method: "POST",
@@ -2066,6 +2119,16 @@ export function createFococontextApiClient(
         ),
         options
       ),
+    listKnowledgeBaseChangeSets: (knowledgeBaseId, listOptions = {}) =>
+      requestListJson(
+        fetchFn,
+        baseUrl,
+        appendListQuery(
+          `/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/change-sets`,
+          listOptions
+        ),
+        options
+      ),
     listKnowledgeBasePageVersions: (knowledgeBaseId, listOptions = {}) =>
       requestListJson(
         fetchFn,
@@ -2088,11 +2151,14 @@ export function createFococontextApiClient(
         ),
         options
       ),
-    listRelatedPages: (pageId) =>
+    listRelatedPages: (pageId, listOptions = {}) =>
       requestListJson(
         fetchFn,
         baseUrl,
-        `/pages/${encodeURIComponent(pageId)}/related`,
+        appendListQuery(
+          `/pages/${encodeURIComponent(pageId)}/related`,
+          listOptions
+        ),
         options
       ),
     listSourceDocuments: (knowledgeBaseId, listOptions = {}) =>
@@ -2448,6 +2514,34 @@ function appendListQuery(path: string, options: ListOptions): string {
   }
   if (options.pageSize !== undefined) {
     params.set("page_size", String(options.pageSize))
+  }
+  if (options.cursor !== undefined) {
+    params.set("cursor", options.cursor)
+  }
+  if (options.limit !== undefined) {
+    params.set("limit", String(options.limit))
+  }
+
+  const query = params.toString()
+
+  if (query.length === 0) {
+    return path
+  }
+
+  return `${path}${path.includes("?") ? "&" : "?"}${query}`
+}
+
+function appendCleanupItemQuery(
+  path: string,
+  options: CleanupOperationItemListOptions
+): string {
+  const params = new URLSearchParams()
+
+  if (options.itemsPage !== undefined) {
+    params.set("items_page", String(options.itemsPage))
+  }
+  if (options.itemsPageSize !== undefined) {
+    params.set("items_page_size", String(options.itemsPageSize))
   }
 
   const query = params.toString()

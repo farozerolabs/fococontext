@@ -16,27 +16,30 @@
 
 ## 端点矩阵
 
-| 方法    | 路径                                               | 说明               | operationId               |
-| ------- | -------------------------------------------------- | ------------------ | ------------------------- |
-| `GET`   | `/v1/knowledge-bases/{knowledge_base_id}/versions` | 列出知识库版本     | listKnowledgeBaseVersions |
-| `GET`   | `/v1/change-sets/{change_set_id}`                  | 获取变更集         | getChangeSet              |
-| `POST`  | `/v1/change-sets/{change_set_id}/apply`            | 应用变更集         | applyChangeSet            |
-| `POST`  | `/v1/change-sets/{change_set_id}/discard`          | 丢弃变更集         | discardChangeSet          |
-| `POST`  | `/v1/knowledge-bases/{knowledge_base_id}/rollback` | 回滚知识库         | rollbackKnowledgeBase     |
-| `GET`   | `/v1/pages/{page_id}/versions`                     | 列出 Wiki 页面版本 | listWikiPageVersions      |
-| `POST`  | `/v1/pages/{page_id}/rollback`                     | 回滚 Wiki 页面     | rollbackWikiPage          |
-| `GET`   | `/v1/pages/{page_id}`                              | 获取 Wiki 页面     | getWikiPage               |
-| `PATCH` | `/v1/pages/{page_id}`                              | 更新 Wiki 页面     | updateWikiPage            |
+| 方法    | 路径                                                  | 说明               | operationId                 |
+| ------- | ----------------------------------------------------- | ------------------ | --------------------------- |
+| `GET`   | `/v1/knowledge-bases/{knowledge_base_id}/versions`    | 列出知识库版本     | listKnowledgeBaseVersions   |
+| `GET`   | `/v1/knowledge-bases/{knowledge_base_id}/change-sets` | 列出知识库变更集   | listKnowledgeBaseChangeSets |
+| `GET`   | `/v1/change-sets/{change_set_id}`                     | 获取变更集         | getChangeSet                |
+| `POST`  | `/v1/change-sets/{change_set_id}/apply`               | 应用变更集         | applyChangeSet              |
+| `POST`  | `/v1/change-sets/{change_set_id}/discard`             | 丢弃变更集         | discardChangeSet            |
+| `POST`  | `/v1/knowledge-bases/{knowledge_base_id}/rollback`    | 回滚知识库         | rollbackKnowledgeBase       |
+| `GET`   | `/v1/pages/{page_id}/versions`                        | 列出 Wiki 页面版本 | listWikiPageVersions        |
+| `POST`  | `/v1/pages/{page_id}/rollback`                        | 回滚 Wiki 页面     | rollbackWikiPage            |
+| `GET`   | `/v1/pages/{page_id}`                                 | 获取 Wiki 页面     | getWikiPage                 |
+| `PATCH` | `/v1/pages/{page_id}`                                 | 更新 Wiki 页面     | updateWikiPage              |
 
 ## 字段说明
 
-| 字段                   | 说明                                                                                     |
-| ---------------------- | ---------------------------------------------------------------------------------------- |
-| `knowledge_version_id` | 不可变知识库检查点。                                                                     |
-| `page_version_id`      | 不可变 Wiki 页面检查点。                                                                 |
-| `change_set_id`        | 描述变更内容和原因的 diff 容器。                                                         |
-| `trigger`              | 来源，例如 ingest、rollback、source_delete、page_merge、fork_submission 或 manual_edit。 |
-| `rollback`             | 创建指向旧内容的新版本；历史版本继续保留。                                               |
+| 字段                     | 说明                                                                                                            |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| `knowledge_version_id`   | 不可变知识库检查点。                                                                                            |
+| `page_version_id`        | 不可变 Wiki 页面检查点。                                                                                        |
+| `change_set_id`          | 描述变更内容和原因的 diff 容器。                                                                                |
+| `trigger`                | 来源，例如 ingest、rollback、source_delete、page_merge、fork_submission 或 manual_edit。                        |
+| `rollback`               | 创建指向旧内容的新版本；历史版本继续保留。                                                                      |
+| `cursor`                 | 大型版本和 Change Set 列表使用的不透明查询游标。把 `pagination.next_cursor` 和 `limit` 一起传回即可读取下一页。 |
+| `pagination.next_cursor` | 支持 cursor 的列表返回的下一页游标；没有下一页时为 `null` 或不返回。                                            |
 
 ## OpenAPI
 
@@ -58,6 +61,18 @@ paths:
       responses:
         200:
           description: "Standard JSON response envelope"
+          content:
+            "application/json":
+              schema:
+                "$ref": "#/components/schemas/SuccessEnvelope"
+  "/knowledge-bases/{knowledge_base_id}/change-sets":
+    get:
+      summary: "List knowledge base change sets"
+      description: "Returns Knowledge Base-scoped Change Set summaries. Use the Change Set detail endpoint for full diff and item payloads."
+      operationId: "listKnowledgeBaseChangeSets"
+      responses:
+        200:
+          description: "Standard JSON list response envelope"
           content:
             "application/json":
               schema:

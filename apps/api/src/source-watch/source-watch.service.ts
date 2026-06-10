@@ -11,9 +11,17 @@ import {
   type ApiDatabaseHydrator,
 } from "../database/api-database-hydrator.js";
 import { apiDatabaseMirrorToken, type ApiDatabaseMirror } from "../database/api-database-mirror.js";
+import {
+  operationalReadStoreToken,
+  type OperationalReadStore,
+} from "../database/operational-read-store.js";
 import { runtimeConfigToken } from "../runtime-config.provider.js";
 import { mapWithConcurrency } from "../utils/bounded-concurrency.js";
 import { SourceWatchRuleRepository } from "./source-watch.repository.js";
+import {
+  sourceWatchScanCoordinatorToken,
+  type SourceWatchScanCoordinator,
+} from "./source-watch.coordinator.js";
 import { sourceWatchScannerToken, type SourceWatchScanner } from "./source-watch.scanner.js";
 import {
   assertDatasetSupportsSourceKind,
@@ -61,15 +69,16 @@ import {
 
 @Injectable()
 export class SourceWatchService {
-  private readonly activeScans = new Set<string>();
-
   constructor(
     private readonly knowledgeBaseService: KnowledgeBaseService,
     private readonly repository: SourceWatchRuleRepository,
     private readonly documentService: DocumentService,
     @Inject(sourceWatchScannerToken) private readonly scanner: SourceWatchScanner,
+    @Inject(sourceWatchScanCoordinatorToken)
+    private readonly scanCoordinator: SourceWatchScanCoordinator,
     @Inject(apiDatabaseMirrorToken) private readonly databaseMirror: ApiDatabaseMirror,
     @Inject(apiDatabaseHydratorToken) private readonly databaseHydrator: ApiDatabaseHydrator,
+    @Inject(operationalReadStoreToken) private readonly operationalReadStore: OperationalReadStore,
     @Inject(runtimeConfigToken) private readonly config: RuntimeConfig,
   ) {}
 
@@ -121,8 +130,28 @@ export class SourceWatchService {
     input: ListSourceWatchRulesInput,
     scope?: ApiResourceScope,
   ): Promise<ListSourceWatchRulesResult> {
-    await this.databaseHydrator.refresh();
     this.getKnowledgeBase(knowledgeBaseId, scope);
+    try {
+      const dbResult = await this.operationalReadStore.listSourceWatchRules({
+        knowledgeBaseId,
+        page: input.page,
+        pageSize: input.pageSize,
+      });
+
+      if (dbResult !== null) {
+        return {
+          items: dbResult.items.map((record) => toSourceWatchRuleResponse(record, this.config)),
+          page: input.page,
+          pageSize: input.pageSize,
+          total: dbResult.total,
+          hasMore: dbResult.hasMore,
+        };
+      }
+    } catch (error) {
+      throw toOperationalListError(error);
+    }
+
+    await this.databaseHydrator.refresh();
 
     const records = this.repository
       .listByKnowledgeBaseId(knowledgeBaseId)
@@ -224,6 +253,33 @@ export class SourceWatchService {
     input: ListScheduledImportJobsInput,
     scope?: ApiResourceScope,
   ): Promise<ListScheduledImportJobsResult> {
+    try {
+      const dbRule = await this.operationalReadStore.getSourceWatchRuleById(ruleId);
+
+      if (dbRule !== null) {
+        this.assertRuleKnowledgeBaseVisible(dbRule, scope);
+        const dbResult = await this.operationalReadStore.listScheduledImportJobsByRuleId(
+          dbRule.id,
+          {
+            page: input.page,
+            pageSize: input.pageSize,
+          },
+        );
+
+        if (dbResult !== null) {
+          return {
+            items: dbResult.items.map((item) => toScheduledImportJobResponse(item)),
+            page: input.page,
+            pageSize: input.pageSize,
+            total: dbResult.total,
+            hasMore: dbResult.hasMore,
+          };
+        }
+      }
+    } catch (error) {
+      throw toOperationalListError(error);
+    }
+
     await this.databaseHydrator.refresh();
     this.requireRule(ruleId, scope);
     const records = this.repository.listScheduledImportJobsByRuleId(ruleId);
@@ -312,11 +368,19 @@ export class SourceWatchService {
     await this.databaseHydrator.refresh();
     const record = this.requireRule(ruleId, scope);
 
-    if (this.activeScans.has(record.id)) {
-      return this.createCoalescedScanResponse(record);
-    }
+    return this.scanCoordinator.runExclusive({
+      ruleId: record.id,
+      onConflict: () => this.createCoalescedScanResponse(record),
+      run: () => this.executeScanWithTrigger(record, triggerType, scheduledFor, scope),
+    });
+  }
 
-    this.activeScans.add(record.id);
+  private async executeScanWithTrigger(
+    record: SourceWatchRuleRecord,
+    triggerType: SourceWatchScanTriggerType,
+    scheduledFor: string | null,
+    scope?: ApiResourceScope,
+  ): Promise<SourceWatchScanEnvelope> {
     const startedAt = new Date().toISOString();
     const startedMs = Date.now();
 
@@ -396,8 +460,6 @@ export class SourceWatchService {
         startedMs,
         triggerType,
       });
-    } finally {
-      this.activeScans.delete(record.id);
     }
   }
 
@@ -650,6 +712,10 @@ function compareUpdatedAtDesc(
   const updatedAtOrder = rightUpdatedAt.localeCompare(leftUpdatedAt);
 
   return updatedAtOrder === 0 ? rightId.localeCompare(leftId) : updatedAtOrder;
+}
+
+function toOperationalListError(error: unknown): ApiError {
+  return error instanceof ApiError ? error : new ApiError("internal_error");
 }
 
 function createSourceWatchRuleNotFoundError(ruleId: string): ApiError {

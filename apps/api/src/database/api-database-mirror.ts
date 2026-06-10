@@ -971,6 +971,7 @@ class PostgresApiDatabaseMirror implements ApiDatabaseMirror {
           checks: record.checks,
           configuration_snapshot: record.configurationSnapshot,
           page_ids: record.pageIds,
+          source_document_ids: record.sourceDocumentIds,
           semantic_run: record.semanticRun,
         })}::jsonb,
         ${visibility.ownerKnowledgeBaseId},

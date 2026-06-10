@@ -8,6 +8,7 @@ import type { RuntimeConfig } from "@fococontext/core";
 import { ApiModule, type ApiModuleOptions } from "./api.module.js";
 import { ApiErrorFilter } from "./errors/api-error.filter.js";
 import { ApiLocalizationInterceptor, apiLocaleHeaderName } from "./errors/api-localization.js";
+import { RuntimeApiMetricsInterceptor } from "./runtime/runtime-api-metrics.js";
 
 export type ApiApplication = NestFastifyApplication;
 
@@ -44,7 +45,7 @@ export async function createApiApp(
     },
   });
   app.useGlobalFilters(new ApiErrorFilter());
-  app.useGlobalInterceptors(new ApiLocalizationInterceptor());
+  app.useGlobalInterceptors(new RuntimeApiMetricsInterceptor(), new ApiLocalizationInterceptor());
   await app.init();
   await app.getHttpAdapter().getInstance().ready();
 

@@ -45,6 +45,11 @@ import {
   type ApiDatabaseHydrator,
   type ApiDatabaseHydratorRepositories,
 } from "./database/api-database-hydrator.js";
+import {
+  createNoopOperationalReadStore,
+  operationalReadStoreToken,
+  type OperationalReadStore,
+} from "./database/operational-read-store.js";
 import { DeletionCleanupController } from "./deletion-cleanup/deletion-cleanup.controller.js";
 import { DeletionCleanupRepository } from "./deletion-cleanup/deletion-cleanup.repository.js";
 import { DeletionCleanupManifestCollector } from "./deletion-cleanup/deletion-cleanup.manifest.js";
@@ -99,6 +104,11 @@ import {
   type DeletionCleanupQueue,
 } from "./queues/deletion-cleanup.queue.js";
 import {
+  createBullMqKnowledgeCheckQueue,
+  knowledgeCheckQueueToken,
+  type KnowledgeCheckQueue,
+} from "./queues/knowledge-check.queue.js";
+import {
   createBullMqSourceOcrQueue,
   sourceOcrQueueToken,
   type SourceOcrQueue,
@@ -113,11 +123,13 @@ import { ForkSubmissionService } from "./fork-submissions/fork-submission.servic
 import { GraphController } from "./retrieve/graph.controller.js";
 import { RetrieveController } from "./retrieve/retrieve.controller.js";
 import {
+  boundedRetrievalRepositoryToken,
   createOpenAICompatibleRetrievalEmbeddingProvider,
   createOpenAICompatibleRetrievalRerankProvider,
   retrievalEmbeddingProviderToken,
   retrievalRepositoryToken,
   retrievalRerankProviderToken,
+  type ApiBoundedRetrievalRepository,
 } from "./retrieve/retrieve.provider.js";
 import { RetrieveService } from "./retrieve/retrieve.service.js";
 import { runtimeConfigToken } from "./runtime-config.provider.js";
@@ -126,6 +138,11 @@ import {
   ScheduledImportJobController,
   SourceWatchRuleController,
 } from "./source-watch/source-watch.controller.js";
+import {
+  createRedisSourceWatchScanCoordinator,
+  sourceWatchScanCoordinatorToken,
+  type SourceWatchScanCoordinator,
+} from "./source-watch/source-watch.coordinator.js";
 import { SourceWatchRuleRepository } from "./source-watch/source-watch.repository.js";
 import { SourceWatchSchedulerService } from "./source-watch/source-watch-scheduler.service.js";
 import {
@@ -144,6 +161,7 @@ import { WikiDraftRepository } from "./wiki-drafts/wiki-draft.repository.js";
 import { WikiDraftService } from "./wiki-drafts/wiki-draft.service.js";
 import {
   ChangeSetController,
+  KnowledgeBaseChangeSetController,
   KnowledgeBasePageController,
   KnowledgeBasePageVersionController,
   KnowledgeBaseRollbackController,
@@ -156,11 +174,14 @@ export interface ApiModuleOptions {
   objectStorage?: ObjectStorageAdapter;
   mediaCaptionQueue?: MediaCaptionQueue;
   deletionCleanupQueue?: DeletionCleanupQueue;
+  knowledgeCheckQueue?: KnowledgeCheckQueue;
   sourceOcrQueue?: SourceOcrQueue;
   webhookDispatchQueue?: WebhookDispatchQueue;
   sourceParseQueue?: SourceParseQueue;
+  sourceWatchScanCoordinator?: SourceWatchScanCoordinator;
   sourceWatchScanner?: SourceWatchScanner;
   retrievalRepository?: RetrievalRepository;
+  boundedRetrievalRepository?: ApiBoundedRetrievalRepository;
   retrievalEmbeddingProvider?: RetrievalEmbeddingProvider;
   retrievalRerankProvider?: RetrievalRerankProvider;
   knowledgeCheckChatProvider?: ChatProvider;
@@ -168,6 +189,7 @@ export interface ApiModuleOptions {
   apiDatabaseHydratorFactory?: (
     repositories: ApiDatabaseHydratorRepositories,
   ) => ApiDatabaseHydrator;
+  operationalReadStore?: OperationalReadStore;
   defaultIdentity?: DefaultIdentitySeed;
   wikiStore?: WikiStore;
   apiKeyResolver?: ApiKeyResolver;
@@ -209,6 +231,7 @@ export class ApiModule implements NestModule {
         KnowledgeBasePageVersionController,
         WikiPageController,
         KnowledgeBaseVersionController,
+        KnowledgeBaseChangeSetController,
         ChangeSetController,
         KnowledgeBaseRollbackController,
       ],
@@ -264,6 +287,10 @@ export class ApiModule implements NestModule {
           useValue: options.deletionCleanupQueue ?? createBullMqDeletionCleanupQueue(config),
         },
         {
+          provide: knowledgeCheckQueueToken,
+          useValue: options.knowledgeCheckQueue ?? createBullMqKnowledgeCheckQueue(config),
+        },
+        {
           provide: sourceOcrQueueToken,
           useValue: options.sourceOcrQueue ?? createBullMqSourceOcrQueue(config),
         },
@@ -276,19 +303,43 @@ export class ApiModule implements NestModule {
           useValue: options.apiDatabaseMirror ?? createNoopApiDatabaseMirror(),
         },
         {
+          provide: operationalReadStoreToken,
+          useValue: options.operationalReadStore ?? createNoopOperationalReadStore(),
+        },
+        {
           provide: wikiStoreToken,
           useValue: options.wikiStore ?? createNoopWikiStore(),
         },
         {
           provide: sourceWatchScannerToken,
-          useFactory: (documentRepository: DocumentRepository) =>
+          useFactory: (
+            documentRepository: DocumentRepository,
+            operationalReadStore: OperationalReadStore,
+          ) =>
             options.sourceWatchScanner ??
-            createDefaultSourceWatchScanner(documentRepository, config),
-          inject: [DocumentRepository],
+            createDefaultSourceWatchScanner(documentRepository, config, {
+              existingDocumentProvider: {
+                listExistingDocuments: (rule) =>
+                  operationalReadStore.listSourceWatchDocuments({
+                    knowledgeBaseId: rule.knowledgeBaseId,
+                    sourceWatchRuleId: rule.id,
+                  }),
+              },
+            }),
+          inject: [DocumentRepository, operationalReadStoreToken],
+        },
+        {
+          provide: sourceWatchScanCoordinatorToken,
+          useValue:
+            options.sourceWatchScanCoordinator ?? createRedisSourceWatchScanCoordinator(config),
         },
         {
           provide: retrievalRepositoryToken,
           useValue: options.retrievalRepository ?? createInMemoryRetrievalRepository(),
+        },
+        {
+          provide: boundedRetrievalRepositoryToken,
+          useValue: options.boundedRetrievalRepository,
         },
         {
           provide: retrievalEmbeddingProviderToken,

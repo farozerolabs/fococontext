@@ -23,6 +23,8 @@ import {
 } from "../deletion-cleanup/deletion-cleanup.response.js";
 import {
   applyManifestToOperation,
+  collectSourceDocumentManifestFromRecords,
+  collectSourceDocumentObjectKeysFromRecords,
   DeletionCleanupManifestCollector,
 } from "../deletion-cleanup/deletion-cleanup.manifest.js";
 import { DeletionCleanupRepository } from "../deletion-cleanup/deletion-cleanup.repository.js";
@@ -30,6 +32,10 @@ import {
   apiDatabaseHydratorToken,
   type ApiDatabaseHydrator,
 } from "../database/api-database-hydrator.js";
+import {
+  operationalReadStoreToken,
+  type OperationalReadStore,
+} from "../database/operational-read-store.js";
 import {
   sourceParseQueueToken,
   type SourceParseQueue,
@@ -99,6 +105,10 @@ interface MultipartFieldPart {
 type MultipartPart = MultipartFilePart | MultipartFieldPart;
 
 const parsedMarkdownPreviewMaxChars = 200_000;
+const parsedContentMediaAssetPreviewLimit = 100;
+const documentDetailRelatedPageLimit = 100;
+const documentDetailPageVersionLimit = 200;
+const sourceDocumentDeletionMediaAssetLimit = 10_000;
 
 interface ParsedMarkdownPreviewOptions {
   enabled: boolean;
@@ -206,6 +216,7 @@ export class DocumentService {
     private readonly deletionCleanupQueue: DeletionCleanupQueue,
     @Inject(apiDatabaseMirrorToken) private readonly databaseMirror: ApiDatabaseMirror,
     @Inject(apiDatabaseHydratorToken) private readonly databaseHydrator: ApiDatabaseHydrator,
+    @Inject(operationalReadStoreToken) private readonly operationalReadStore: OperationalReadStore,
     @Inject(wikiStoreToken) private readonly wikiStore: WikiStore,
     @Inject(runtimeConfigToken) private readonly runtimeConfig: RuntimeConfig,
     private readonly knowledgeBaseService: KnowledgeBaseService,
@@ -719,6 +730,33 @@ export class DocumentService {
     input: ListSourceDocumentsInput,
     scope?: ApiResourceScope,
   ): Promise<ListSourceDocumentsResult> {
+    const knowledgeBase = this.getKnowledgeBase(knowledgeBaseId, scope);
+
+    if (knowledgeBase.knowledge_base_type === "canonical") {
+      try {
+        const dbResult = await this.operationalReadStore.listSourceDocuments({
+          knowledgeBaseId,
+          page: input.page,
+          pageSize: input.pageSize,
+          ...(input.keyword === undefined ? {} : { keyword: input.keyword }),
+          ...(input.status === undefined ? {} : { status: input.status }),
+          ...(input.sourceType === undefined ? {} : { sourceType: input.sourceType }),
+        });
+
+        if (dbResult !== null) {
+          return {
+            items: dbResult.items.map(toSourceDocumentResponse),
+            page: input.page,
+            pageSize: input.pageSize,
+            total: dbResult.total,
+            hasMore: dbResult.hasMore,
+          };
+        }
+      } catch (error) {
+        throw toOperationalListError(error);
+      }
+    }
+
     await this.databaseHydrator.refresh();
     this.getKnowledgeBase(knowledgeBaseId, scope);
 
@@ -748,6 +786,57 @@ export class DocumentService {
     documentId: string,
     scope?: ApiResourceScope,
   ): Promise<SourceDocumentDetailResponse> {
+    if (this.operationalReadStore.supportsOperationalReads) {
+      const document = this.requireOperationalLiveDocument(
+        documentId,
+        await this.operationalReadStore.getSourceDocumentById(documentId),
+        scope,
+      );
+      const [latestJob, parsedContent, mediaAssetsResult, wikiPages] = await Promise.all([
+        this.operationalReadStore.getLatestJobByDocumentId(document.id),
+        this.operationalReadStore.getParsedContentByDocumentId(document.id),
+        this.operationalReadStore.listMediaAssetsByDocumentId(document.id, {
+          page: 1,
+          pageSize: parsedContentMediaAssetPreviewLimit,
+        }),
+        this.operationalReadStore.listWikiPageRecordsBySourceDocumentId(
+          document.knowledgeBaseId,
+          document.id,
+          documentDetailRelatedPageLimit,
+        ),
+      ]);
+      const mediaAssets = mediaAssetsResult?.items ?? [];
+      const pageRecords = wikiPages ?? [];
+      const pageVersions =
+        (await this.operationalReadStore.listWikiPageVersionRecordsByPageIds(
+          pageRecords.flatMap((page) => {
+            const pageId = page.id;
+
+            return typeof pageId === "string" ? [pageId] : [];
+          }),
+          documentDetailPageVersionLimit,
+        )) ?? [];
+
+      return {
+        document: toSourceDocumentResponse(document),
+        latest_job: latestJob === null ? null : toJobResponse(latestJob),
+        parsed_content:
+          parsedContent === null
+            ? null
+            : await toParsedContentResponse(
+                parsedContent,
+                mediaAssets,
+                this.objectStorage,
+                this.createParsedMarkdownPreviewOptions(),
+              ),
+        media_assets: mediaAssets.map(toMediaAssetResponse),
+        wiki_pages: pageRecords,
+        page_versions: pageVersions,
+        delete_preview_required: false,
+        update_preview_required: false,
+      };
+    }
+
     await this.databaseHydrator.refresh();
     const document = this.requireLiveDocument(documentId, scope);
     const latestJob = this.repository.findLatestJobByDocumentId(documentId);
@@ -784,6 +873,54 @@ export class DocumentService {
     documentId: string,
     scope?: ApiResourceScope,
   ): Promise<DeleteImpactPreviewResponse> {
+    if (this.operationalReadStore.supportsOperationalReads) {
+      const document = this.requireOperationalLiveDocument(
+        documentId,
+        await this.operationalReadStore.getSourceDocumentById(documentId),
+        scope,
+      );
+      const affectedPages =
+        (await this.operationalReadStore.listWikiPageRecordsBySourceDocumentId(
+          document.knowledgeBaseId,
+          document.id,
+          documentDetailRelatedPageLimit,
+        )) ?? [];
+      const affectedPageIds = affectedPages.flatMap((page) => {
+        const pageId = page.id;
+
+        return typeof pageId === "string" ? [pageId] : [];
+      });
+      const changeSetId = createResourceId("changeSet");
+
+      return {
+        document_id: document.id,
+        knowledge_base_id: document.knowledgeBaseId,
+        status: "ready",
+        affected_page_ids: affectedPageIds,
+        affected_edge_ids: [],
+        system_page_keys: ["index", "overview", "log"],
+        change_set_id: changeSetId,
+        impact: {
+          affected_resources: affectedPages.map((page) => ({
+            id: page.id,
+            object_type: "wiki_page",
+            title: page.title,
+          })),
+          unsafe_reasons: [],
+          retrieval_index_update: {
+            required: true,
+            reason: "source_delete",
+          },
+        },
+        apply_action: {
+          method: "DELETE",
+          path: `/v1/documents/${document.id}`,
+          requires_preview_confirmation: true,
+        },
+        can_apply: true,
+      };
+    }
+
     await this.databaseHydrator.refresh();
     const document = this.requireLiveDocument(documentId, scope);
     const affectedPages = (await this.wikiStore.listPages(document.knowledgeBaseId)).filter(
@@ -825,6 +962,10 @@ export class DocumentService {
     documentId: string,
     scope?: ApiResourceScope,
   ): Promise<SourceDocumentDeleteResponse> {
+    if (this.operationalReadStore.supportsOperationalReads) {
+      return this.deleteDocumentWithOperationalReads(documentId, scope);
+    }
+
     await this.databaseHydrator.refresh();
     const document = this.requireLiveDocument(documentId, scope);
     const affectedPages = (await this.wikiStore.listPages(document.knowledgeBaseId)).filter(
@@ -912,10 +1053,184 @@ export class DocumentService {
     };
   }
 
+  private async deleteDocumentWithOperationalReads(
+    documentId: string,
+    scope?: ApiResourceScope,
+  ): Promise<SourceDocumentDeleteResponse> {
+    const document = this.requireOperationalLiveDocument(
+      documentId,
+      await this.operationalReadStore.getSourceDocumentById(documentId),
+      scope,
+    );
+    const affectedPages =
+      (await this.operationalReadStore.listWikiPageRecordsBySourceDocumentId(
+        document.knowledgeBaseId,
+        document.id,
+        documentDetailRelatedPageLimit,
+      )) ?? [];
+    const affectedPageIds = affectedPages.flatMap((page) => {
+      const pageId = page.id;
+
+      return typeof pageId === "string" ? [pageId] : [];
+    });
+
+    const now = new Date().toISOString();
+    const changeSetId = createResourceId("changeSet");
+
+    await this.cancelOpenOperationalJobsForDeletedSourceDocument(document, now);
+
+    const updated = this.repository.updateDocument({
+      ...document,
+      status: "deleted",
+      metadata: {
+        ...document.metadata,
+        lifecycle_history: [
+          ...readLifecycleHistory(document.metadata.lifecycle_history),
+          {
+            type: "deleted",
+            affected_page_ids: affectedPageIds,
+            change_set_id: changeSetId,
+            deleted_at: now,
+          },
+        ],
+      },
+      updatedAt: now,
+    });
+    const createdCleanupOperation = this.deletionCleanupRepository.createOperation(
+      createQueuedDeletionCleanupOperation({
+        targetType: "source_document",
+        targetId: updated.id,
+        knowledgeBaseId: updated.knowledgeBaseId,
+        now,
+        maxAttempts: this.runtimeConfig.limits.deletionCleanup.maxRetries + 1,
+        retentionExpiresAt: createRetentionTimestamp(
+          now,
+          this.runtimeConfig.limits.deletionCleanup.operationRetentionDays,
+        ),
+        itemRetentionExpiresAt: createRetentionTimestamp(
+          now,
+          this.runtimeConfig.limits.deletionCleanup.itemRetentionDays,
+        ),
+      }),
+    );
+    const [parsedContent, mediaAssetsResult, jobs] = await Promise.all([
+      this.operationalReadStore.getParsedContentByDocumentId(updated.id),
+      this.operationalReadStore.listMediaAssetsByDocumentId(updated.id, {
+        page: 1,
+        pageSize: sourceDocumentDeletionMediaAssetLimit,
+      }),
+      this.operationalReadStore.listJobsByDocumentId(updated.id),
+    ]);
+    const mediaAssets = mediaAssetsResult?.items ?? [];
+
+    if (mediaAssetsResult?.hasMore === true) {
+      throw new ApiError("invalid_request", {
+        message: "Source document cleanup planning exceeded the synchronous media asset limit.",
+        details: {
+          limit: sourceDocumentDeletionMediaAssetLimit,
+          target_type: "source_document",
+          target_id: updated.id,
+        },
+      });
+    }
+
+    const jobEventsByJobId = await this.operationalReadStore.listJobEventsByJobIds(
+      jobs.map((job) => job.id),
+    );
+    const activeObjectKeys = await this.operationalReadStore.findReferencedObjectKeys({
+      knowledgeBaseId: updated.knowledgeBaseId,
+      documentId: updated.id,
+      objectKeys: collectSourceDocumentObjectKeysFromRecords({
+        document: updated,
+        parsedContent,
+        mediaAssets,
+      }),
+    });
+    const manifest = collectSourceDocumentManifestFromRecords({
+      operationId: createdCleanupOperation.id,
+      now,
+      maxAttempts: createdCleanupOperation.maxAttempts,
+      retainedUntil: createdCleanupOperation.itemRetentionExpiresAt,
+      knowledgeBaseId: updated.knowledgeBaseId,
+      document: updated,
+      parsedContent,
+      mediaAssets,
+      jobs,
+      jobEventsByJobId,
+      activeObjectKeys,
+    });
+    const cleanupOperation = this.deletionCleanupRepository.updateOperation(
+      applyManifestToOperation(createdCleanupOperation, manifest),
+    );
+
+    this.deletionCleanupRepository.replaceItemsForOperation(cleanupOperation.id, manifest.items);
+
+    await this.databaseMirror.updateSourceDocument(updated);
+    await this.databaseMirror.saveDeletionCleanupOperation(cleanupOperation);
+    await this.databaseMirror.saveDeletionCleanupItems(manifest.items);
+    const queuedCleanupOperation = await this.enqueueDeletionCleanupOperation(cleanupOperation);
+
+    return {
+      ...toSourceDocumentResponse(updated),
+      document_id: updated.id,
+      cleanup_operation: toDeletionCleanupOperationSummaryResponse(queuedCleanupOperation),
+      lifecycle_operation: {
+        type: "delete_apply",
+        status: "applied",
+        affected_page_ids: affectedPageIds,
+        affected_edge_ids: [],
+      },
+      change_set: {
+        id: changeSetId,
+        trigger: "source_delete",
+        status: "applied",
+      },
+      index_update: {
+        queued: true,
+        reason: "source_delete",
+      },
+    };
+  }
+
   async getParsedContent(
     documentId: string,
     scope?: ApiResourceScope,
   ): Promise<DocumentParsedContentResponse> {
+    if (this.operationalReadStore.supportsOperationalReads) {
+      const document = this.requireOperationalLiveDocument(
+        documentId,
+        await this.operationalReadStore.getSourceDocumentById(documentId),
+        scope,
+      );
+      const parsedContent = await this.operationalReadStore.getParsedContentByDocumentId(
+        document.id,
+      );
+
+      if (parsedContent === null) {
+        return {
+          document_id: document.id,
+          parsed_content: null,
+          status: "not_available",
+        };
+      }
+
+      const mediaAssets = await this.operationalReadStore.listMediaAssetsByDocumentId(document.id, {
+        page: 1,
+        pageSize: parsedContentMediaAssetPreviewLimit,
+      });
+
+      return {
+        document_id: document.id,
+        parsed_content: await toParsedContentResponse(
+          parsedContent,
+          mediaAssets?.items ?? [],
+          this.objectStorage,
+          this.createParsedMarkdownPreviewOptions(),
+        ),
+        status: "available",
+      };
+    }
+
     await this.databaseHydrator.refresh();
     this.requireLiveDocument(documentId, scope);
 
@@ -1055,6 +1370,28 @@ export class DocumentService {
     input: ListMediaAssetsInput,
     scope?: ApiResourceScope,
   ): Promise<ListMediaAssetsResult> {
+    if (this.operationalReadStore.supportsOperationalReads) {
+      const document = this.requireOperationalLiveDocument(
+        documentId,
+        await this.operationalReadStore.getSourceDocumentById(documentId),
+        scope,
+      );
+      const dbResult = await this.operationalReadStore.listMediaAssetsByDocumentId(
+        document.id,
+        input,
+      );
+
+      if (dbResult !== null) {
+        return {
+          items: dbResult.items.map(toMediaAssetResponse),
+          page: input.page,
+          pageSize: input.pageSize,
+          total: dbResult.total,
+          hasMore: dbResult.hasMore,
+        };
+      }
+    }
+
     await this.databaseHydrator.refresh();
     this.requireLiveDocument(documentId, scope);
 
@@ -1614,6 +1951,36 @@ export class DocumentService {
       : this.knowledgeBaseService.get(knowledgeBaseId, scope);
   }
 
+  private requireOperationalLiveDocument(
+    documentId: string,
+    record: SourceDocumentRecord | null,
+    scope?: ApiResourceScope,
+    notFoundFactory: () => ApiError = () => new ApiError("document_not_found"),
+  ): SourceDocumentRecord {
+    if (record === null) {
+      throw notFoundFactory();
+    }
+    this.assertKnowledgeBaseVisible(record.knowledgeBaseId, scope, notFoundFactory);
+
+    if (record.status === "deleted") {
+      const cleanupOperation = this.deletionCleanupRepository.findLatestOperationForTarget({
+        targetType: "source_document",
+        targetId: documentId,
+      });
+
+      throw new ApiError("resource_deleted", {
+        details: {
+          target_type: "source_document",
+          target_id: documentId,
+          cleanup_operation_id: cleanupOperation?.id ?? null,
+          guidance: "Reload the source list and select an active source document.",
+        },
+      });
+    }
+
+    return record;
+  }
+
   private requireDocument(
     documentId: string,
     scope?: ApiResourceScope,
@@ -1973,6 +2340,39 @@ export class DocumentService {
       .listJobs(document.knowledgeBaseId)
       .filter((job) => job.documentId === document.id)
       .filter((job) => job.status === "queued" || job.status === "running");
+
+    for (const job of openJobs) {
+      const updated = this.repository.updateJob({
+        ...job,
+        status: "canceled",
+        progressMessage: message,
+        updatedAt: now,
+      });
+      const event = this.repository.appendJobEvent({
+        jobId: updated.id,
+        type: "job.canceled",
+        stage: updated.stage,
+        status: updated.status,
+        message,
+        metadata: {
+          source_document_deleted: true,
+        },
+        createdAt: now,
+      });
+
+      await this.databaseMirror.updateJob(updated);
+      await this.databaseMirror.appendJobEvent(event);
+    }
+  }
+
+  private async cancelOpenOperationalJobsForDeletedSourceDocument(
+    document: SourceDocumentRecord,
+    now: string,
+  ): Promise<void> {
+    const message = "Canceled because the source document was deleted.";
+    const openJobs = (await this.operationalReadStore.listJobsByDocumentId(document.id)).filter(
+      (job) => job.status === "queued" || job.status === "running",
+    );
 
     for (const job of openJobs) {
       const updated = this.repository.updateJob({
@@ -3535,6 +3935,10 @@ function createRetentionTimestamp(now: string, days: number | null): string | nu
   timestamp.setUTCDate(timestamp.getUTCDate() + days);
 
   return timestamp.toISOString();
+}
+
+function toOperationalListError(error: unknown): ApiError {
+  return error instanceof ApiError ? error : new ApiError("internal_error");
 }
 
 function sanitizeObjectKeySegment(value: string): string {

@@ -90,12 +90,47 @@ export const enUSMessages = {
     exportGraph: "Export graph",
     graphView: "Graph View",
     insights: "Graph Insights",
+    loadFailedDescription:
+      "Graph data could not be loaded. Retry after checking API connectivity and Knowledge Base access.",
     noGraph: "No graph yet",
     noInsights: "No insights",
     noSourceRefs: "No source refs",
     nodes: "Nodes",
     insightMembership: "Insight membership",
     reasonCodes: "Reason codes",
+    readiness: {
+      failed: {
+        description:
+          "Graph refresh failed. Existing graph data may still be visible, but insight freshness is not guaranteed.",
+        title: "Graph refresh failed",
+      },
+      loadFailedDescription:
+        "Graph insight status could not be loaded. Retry to refresh the readiness state.",
+      loadFailedTitle: "Graph readiness unavailable",
+      partial: {
+        description:
+          "Graph insights are partially available. Some signals may still be recomputing or missing.",
+        title: "Graph insights are partial",
+      },
+      queued: {
+        description:
+          "Graph refresh is queued. The graph remains usable while the worker catches up.",
+        title: "Graph refresh queued",
+      },
+      sourceJob: "Source job {{value}}",
+      stale: {
+        description:
+          "Graph data is stale compared with recent Knowledge Base changes. Refresh or wait for the worker to complete.",
+        title: "Graph data is stale",
+      },
+      state: "State {{state}}",
+      updatedAt: "Updated {{value}}",
+      updating: {
+        description:
+          "Graph refresh is running. Results may change while the worker updates graph signals.",
+        title: "Graph refresh running",
+      },
+    },
     relation: "Relation",
     resetFocus: "Reset focus",
     resetView: "Reset view",
@@ -460,12 +495,20 @@ export const enUSMessages = {
     },
     knowledgeBaseJob: "Knowledge Base",
     listTotal: "{{total}} jobs",
+    emptyDescription:
+      "Ingest, retry, OCR, compile, cleanup, and graph refresh jobs appear here after work starts.",
     metadata: "Metadata",
     ingestProgressSummary:
-      "{{completed}}/{{total}} jobs completed · {{progress}}% overall",
+      "{{completed}}/{{total}} jobs completed · {{progress}}% stage-average progress",
+    loadFailedDescription:
+      "Jobs could not be loaded. Retry to request the current page again.",
     retrieveNotReady: "Retrieve is waiting for active ingest jobs",
     retrieveReady: "Retrieve ready",
+    runtimeStatusUnavailable: "Runtime status unavailable",
+    runtimeStatusUnavailableDescription:
+      "Job data is still usable, but queue pressure and degraded runtime warnings cannot be shown until system status loads.",
     retryFailed: "Retry failed",
+    stageAverageProgress: "Stage-average progress",
     viewDetails: "Details",
     section: {
       artifacts: "Artifacts",
@@ -1067,6 +1110,12 @@ export const enUSMessages = {
     lastSignIn: "Last sign-in",
     maskedKey: "Masked key",
     maskedSecret: "Masked secret",
+    migrationLastOutcome: "Last migration outcome",
+    migrationManagedByStartup:
+      "Database migrations are managed by the startup migration service before API and Worker containers begin serving traffic.",
+    migrationMode: "Migration mode",
+    migrationPendingCount: "Pending migrations",
+    migrationStatus: "Database migration status",
     noValue: "Not available",
     objectStorageOperationMetrics: "S3-compatible operation metrics",
     objectStorageOperationPressure: "S3-compatible operation pressure",
@@ -1114,6 +1163,8 @@ export const enUSMessages = {
     webhookSecret: "Webhook secret",
     workerRelease: "Worker release metadata",
     workerStatus: "Worker",
+    loadFailedDescription:
+      "System settings could not be loaded. Retry to refresh runtime, storage, migration, and pressure status.",
   },
   outputLanguage: {
     auto: "Auto",
@@ -1193,10 +1244,12 @@ export const enUSMessages = {
     rolledBack: "Rolled back",
     running: "Running",
     resolved: "Resolved",
+    seeded: "Seeded",
     skipped: "Skipped",
     stale: "Stale",
     uploaded: "Uploaded",
     outdated: "Outdated",
+    updating: "Updating",
     unavailable: "Unavailable",
     limited: "Limited",
     unknown: "Unknown",

@@ -3,10 +3,16 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Kysely, PostgresDialect, sql } from "kysely";
-import { type Migration, type MigrationProvider, Migrator } from "kysely/migration";
+import {
+  type Migration,
+  type MigrationProvider,
+  Migrator,
+  type MigrationResultSet,
+} from "kysely/migration";
 import { Pool } from "pg";
 
 export * from "./tenant-project-scope.js";
+export { sql };
 
 export const expectedSchemaTables = [
   "tenants",
@@ -65,6 +71,11 @@ export interface SqlMigration {
   downSql: string;
 }
 
+export interface MigrationLogOptions {
+  logger?: Pick<Console, "info">;
+  serviceName?: string;
+}
+
 export type DefaultIdentityScope = "tenant" | "account" | "project";
 
 export interface DefaultTenantSeed {
@@ -112,6 +123,189 @@ const defaultIdentityName = {
 } as const;
 
 const defaultIdentitySlug = "default";
+
+const operationalListIndexSql = String.raw`
+create index if not exists jobs_kb_visible_updated_idx
+  on jobs(knowledge_base_id, updated_at desc, id desc)
+  where coalesce(job_type, '') <> 'graph.insights.refresh';
+
+create index if not exists jobs_kb_visible_status_updated_idx
+  on jobs(knowledge_base_id, status, updated_at desc, id desc)
+  where coalesce(job_type, '') <> 'graph.insights.refresh';
+
+create index if not exists jobs_kb_visible_stage_updated_idx
+  on jobs(knowledge_base_id, stage, updated_at desc, id desc)
+  where coalesce(job_type, '') <> 'graph.insights.refresh';
+
+create index if not exists jobs_kb_visible_queued_idx
+  on jobs(knowledge_base_id, queued_at desc, id desc)
+  where coalesce(job_type, '') <> 'graph.insights.refresh';
+
+create index if not exists job_events_job_created_id_idx
+  on job_events(job_id, created_at asc, id asc);
+
+create index if not exists knowledge_bases_scope_active_updated_idx
+  on knowledge_bases(tenant_id, project_id, updated_at desc, id desc)
+  where deleted_at is null and status <> 'deleted';
+
+create index if not exists knowledge_bases_scope_status_updated_idx
+  on knowledge_bases(tenant_id, project_id, status, updated_at desc, id desc)
+  where deleted_at is null;
+
+create index if not exists knowledge_bases_scope_upstream_fork_updated_idx
+  on knowledge_bases(tenant_id, project_id, upstream_knowledge_base_id, updated_at desc, id desc)
+  where deleted_at is null and status <> 'deleted' and knowledge_base_type = 'fork';
+
+create index if not exists source_documents_kb_visible_updated_idx
+  on source_documents(knowledge_base_id, updated_at desc, id desc)
+  where deleted_at is null and status <> 'deleted';
+
+create index if not exists source_documents_kb_owner_visible_updated_idx
+  on source_documents(knowledge_base_id, owner_knowledge_base_id, updated_at desc, id desc)
+  where deleted_at is null and status <> 'deleted' and fork_tombstoned_at is null;
+
+create index if not exists source_documents_kb_visible_status_updated_idx
+  on source_documents(knowledge_base_id, status, updated_at desc, id desc)
+  where deleted_at is null;
+
+create index if not exists source_documents_kb_visible_type_updated_idx
+  on source_documents(knowledge_base_id, source_type, updated_at desc, id desc)
+  where deleted_at is null and status <> 'deleted';
+
+create index if not exists source_documents_kb_source_path_updated_idx
+  on source_documents(knowledge_base_id, lower((metadata->>'source_path')), updated_at desc, id desc)
+  where deleted_at is null and status <> 'deleted' and fork_tombstoned_at is null;
+
+create index if not exists source_documents_kb_hash_updated_idx
+  on source_documents(knowledge_base_id, content_hash, updated_at desc, id desc)
+  where deleted_at is null and status <> 'deleted' and content_hash is not null;
+
+create index if not exists parsed_contents_document_created_id_idx
+  on parsed_contents(source_document_id, created_at desc, id desc)
+  where fork_tombstoned_at is null;
+
+create index if not exists media_assets_document_created_id_idx
+  on media_assets(source_document_id, created_at desc, id desc)
+  where fork_tombstoned_at is null;
+
+create index if not exists wiki_pages_kb_visible_updated_idx
+  on wiki_pages(knowledge_base_id, updated_at desc, id desc)
+  where deleted_at is null and fork_tombstoned_at is null;
+
+create index if not exists wiki_pages_owner_visible_updated_idx
+  on wiki_pages(owner_knowledge_base_id, updated_at desc, id desc)
+  where deleted_at is null and fork_tombstoned_at is null;
+
+create index if not exists wiki_pages_kb_slug_visible_idx
+  on wiki_pages(knowledge_base_id, slug, updated_at desc, id desc)
+  where deleted_at is null and fork_tombstoned_at is null;
+
+create index if not exists wiki_pages_kb_status_visible_updated_idx
+  on wiki_pages(knowledge_base_id, status, updated_at desc, id desc)
+  where deleted_at is null and fork_tombstoned_at is null;
+
+create index if not exists wiki_pages_kb_type_visible_updated_idx
+  on wiki_pages(knowledge_base_id, page_type, updated_at desc, id desc)
+  where deleted_at is null and fork_tombstoned_at is null;
+
+create index if not exists wiki_pages_kb_lexical_simple_idx
+  on wiki_pages using gin (
+    to_tsvector(
+      'simple',
+      coalesce(title, '') || ' ' ||
+      coalesce(slug, '') || ' ' ||
+      coalesce(markdown, '') || ' ' ||
+      coalesce(metadata::text, '')
+    )
+  )
+  where deleted_at is null and fork_tombstoned_at is null;
+
+create index if not exists wiki_pages_source_document_ids_gin_idx
+  on wiki_pages using gin (source_document_ids)
+  where deleted_at is null and fork_tombstoned_at is null;
+
+create index if not exists wiki_page_versions_source_snapshot_lexical_simple_idx
+  on wiki_page_versions using gin (
+    to_tsvector('simple', coalesce(source_snapshot::text, ''))
+  );
+
+create index if not exists system_pages_kb_updated_idx
+  on system_pages(knowledge_base_id, updated_at desc, id desc);
+
+create index if not exists system_pages_kb_key_updated_idx
+  on system_pages(knowledge_base_id, system_key, updated_at desc, id desc);
+
+create index if not exists knowledge_versions_kb_created_idx
+  on knowledge_versions(knowledge_base_id, created_at desc, id desc);
+
+create index if not exists change_sets_kb_created_idx
+  on change_sets(knowledge_base_id, created_at desc, id desc);
+
+create index if not exists change_sets_kb_status_created_idx
+  on change_sets(knowledge_base_id, status, created_at desc, id desc);
+
+create index if not exists wiki_page_versions_page_created_idx
+  on wiki_page_versions(page_id, created_at desc, id desc);
+
+create index if not exists wiki_edges_kb_from_relation_updated_idx
+  on wiki_edges(knowledge_base_id, from_page_id, relation_type, updated_at desc, id desc)
+  where fork_tombstoned_at is null;
+
+create index if not exists wiki_edges_kb_to_relation_updated_idx
+  on wiki_edges(knowledge_base_id, to_page_id, relation_type, updated_at desc, id desc)
+  where fork_tombstoned_at is null;
+
+create index if not exists wiki_edges_kb_version_updated_idx
+  on wiki_edges(knowledge_base_id, knowledge_version_id, updated_at desc, id desc)
+  where fork_tombstoned_at is null and knowledge_version_id is not null;
+
+create index if not exists wiki_edges_owner_from_relation_updated_idx
+  on wiki_edges(owner_knowledge_base_id, from_page_id, relation_type, updated_at desc, id desc)
+  where fork_tombstoned_at is null;
+
+create index if not exists wiki_edge_sources_source_document_created_idx
+  on wiki_edge_sources(source_document_id, created_at desc, id desc)
+  where source_document_id is not null and fork_tombstoned_at is null;
+
+create index if not exists page_embeddings_kb_model_dimensions_idx
+  on page_embeddings(knowledge_base_id, model, dimensions, created_at desc, id desc)
+  where embedding is not null and fork_tombstoned_at is null;
+
+create index if not exists page_embeddings_owner_model_dimensions_idx
+  on page_embeddings(owner_knowledge_base_id, model, dimensions, created_at desc, id desc)
+  where embedding is not null and fork_tombstoned_at is null;
+
+create index if not exists source_watch_rules_kb_updated_idx
+  on source_watch_rules(knowledge_base_id, updated_at desc, id desc);
+
+create index if not exists scheduled_import_jobs_rule_updated_idx
+  on scheduled_import_jobs(source_watch_rule_id, updated_at desc, id desc);
+
+create index if not exists scheduled_import_jobs_kb_updated_idx
+  on scheduled_import_jobs(knowledge_base_id, updated_at desc, id desc);
+
+create index if not exists webhooks_kb_updated_idx
+  on webhooks(knowledge_base_id, updated_at desc, id desc);
+
+create index if not exists webhook_deliveries_webhook_created_idx
+  on webhook_deliveries(webhook_id, created_at desc, id desc);
+
+create index if not exists deletion_cleanup_operations_scope_updated_idx
+  on deletion_cleanup_operations(tenant_id, project_id, updated_at desc, id desc);
+
+create index if not exists deletion_cleanup_operations_scope_kb_status_updated_idx
+  on deletion_cleanup_operations(tenant_id, project_id, knowledge_base_id, status, updated_at desc, id desc);
+
+create index if not exists deletion_cleanup_items_operation_created_idx
+  on deletion_cleanup_items(operation_id, created_at asc, id asc);
+
+create index if not exists deletion_cleanup_items_operation_retryable_type_idx
+  on deletion_cleanup_items(operation_id, item_type, status, created_at asc, id asc)
+  where status in ('pending', 'failed') and attempt_count < max_attempts;
+
+create index if not exists knowledge_checks_kb_updated_idx
+  on knowledge_checks(knowledge_base_id, updated_at desc, id desc);
+`;
 
 export function getDefaultMigrationDirectory(): string {
   return fileURLToPath(new URL("../migrations", import.meta.url));
@@ -172,6 +366,18 @@ export function createSqlMigrationProvider(
       );
     },
   };
+}
+
+export function getOperationalListIndexSql(): string {
+  return operationalListIndexSql;
+}
+
+export async function ensureOperationalListIndexes(
+  db: Kysely<DatabaseSchema>,
+  options: MigrationLogOptions = {},
+): Promise<void> {
+  await sql.raw(operationalListIndexSql).execute(db);
+  options.logger?.info(formatOperationalIndexLogMessage(options.serviceName));
 }
 
 export function createInternalIdentityId(scope: DefaultIdentityScope): string {
@@ -256,7 +462,7 @@ export function createMigrator(db: Kysely<DatabaseSchema>): Migrator {
   });
 }
 
-export async function migrateToLatest(databaseUrl: string) {
+export async function migrateToLatest(databaseUrl: string, options: MigrationLogOptions = {}) {
   const db = createPostgresDatabase(databaseUrl);
 
   try {
@@ -266,10 +472,51 @@ export async function migrateToLatest(databaseUrl: string) {
       throw result.error;
     }
 
+    options.logger?.info(formatMigrationLogMessage(result, options.serviceName));
+    await ensureOperationalListIndexes(db, options);
+
     return result;
   } finally {
     await db.destroy();
   }
+}
+
+export function describeMigrationResult(result: MigrationResultSet): string {
+  const appliedMigrations =
+    result.results
+      ?.filter((migration) => migration.status === "Success")
+      .map((migration) => migration.migrationName) ?? [];
+
+  if (appliedMigrations.length === 0) {
+    return "Database migrations are already up to date.";
+  }
+
+  return `Applied database migrations (${appliedMigrations.length}): ${appliedMigrations.join(", ")}.`;
+}
+
+function formatMigrationLogMessage(
+  result: MigrationResultSet,
+  serviceName: string | undefined,
+): string {
+  const message = describeMigrationResult(result);
+  const trimmedServiceName = serviceName?.trim();
+
+  if (trimmedServiceName === undefined || trimmedServiceName.length === 0) {
+    return message;
+  }
+
+  return `[${trimmedServiceName}] ${message}`;
+}
+
+function formatOperationalIndexLogMessage(serviceName: string | undefined): string {
+  const message = "Operational list indexes are ensured.";
+  const trimmedServiceName = serviceName?.trim();
+
+  if (trimmedServiceName === undefined || trimmedServiceName.length === 0) {
+    return message;
+  }
+
+  return `[${trimmedServiceName}] ${message}`;
 }
 
 export function assertSafeLocalResetDatabaseUrl(databaseUrl: string): void {

@@ -118,6 +118,10 @@ export interface RuntimeConfigLimits {
     maxFileSizeMb: number;
     timeoutSeconds: number;
     concurrency: number;
+    maxZipEntries: number;
+    maxZipExpandedMb: number;
+    maxZipEntryMb: number;
+    mediaUploadConcurrency: number;
     maxImagesPerDocument: number;
     maxRenderedSnapshotsPerDocument: number;
     maxImagePixels: number;
@@ -606,6 +610,7 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
   const sourceWatchS3Region = readOptional(env, "SOURCE_WATCH_S3_REGION");
   const sourceWatchS3SecretAccessKey = readOptional(env, "SOURCE_WATCH_S3_SECRET_ACCESS_KEY");
   const uploadLimits = parseUploadLimits(env, invalid);
+  const parserMaxFileSizeMb = parsePositiveInteger(env, "PARSER_MAX_FILE_SIZE_MB", invalid);
   const parserConcurrency = parsePositiveInteger(env, "PARSER_CONCURRENCY", invalid);
   const queueConcurrency = parsePositiveInteger(env, "FOCOCONTEXT_QUEUE_CONCURRENCY", invalid);
   const sourceParseConcurrency = parseOptionalPositiveInteger(
@@ -846,9 +851,28 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
       upload: uploadLimits,
       objectStorageOperations,
       parser: {
-        maxFileSizeMb: parsePositiveInteger(env, "PARSER_MAX_FILE_SIZE_MB", invalid),
+        maxFileSizeMb: parserMaxFileSizeMb,
         timeoutSeconds: parsePositiveInteger(env, "PARSER_TIMEOUT_SECONDS", invalid),
         concurrency: parserConcurrency,
+        maxZipEntries: parseOptionalPositiveInteger(env, "PARSER_ZIP_MAX_ENTRIES", 10_000, invalid),
+        maxZipExpandedMb: parseOptionalPositiveInteger(
+          env,
+          "PARSER_ZIP_MAX_EXPANDED_MB",
+          parserMaxFileSizeMb * 20,
+          invalid,
+        ),
+        maxZipEntryMb: parseOptionalPositiveInteger(
+          env,
+          "PARSER_ZIP_MAX_ENTRY_MB",
+          parserMaxFileSizeMb,
+          invalid,
+        ),
+        mediaUploadConcurrency: parseOptionalPositiveInteger(
+          env,
+          "PARSER_MEDIA_UPLOAD_CONCURRENCY",
+          parserConcurrency,
+          invalid,
+        ),
         maxImagesPerDocument: parsePositiveInteger(env, "PARSER_MAX_IMAGES_PER_DOCUMENT", invalid),
         maxRenderedSnapshotsPerDocument: parseOptionalNonNegativeInteger(
           env,

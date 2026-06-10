@@ -258,9 +258,35 @@ export function KnowledgeBaseJobsPage() {
       <h1 className="sr-only">{t("nav.jobs")}</h1>
 
       {jobsQuery.isLoading ? <LoadingState label={t("state.loading")} /> : null}
-      {jobsQuery.isError ? <ErrorAlert title={t("state.loadFailed")} /> : null}
+      {jobsQuery.isError ? (
+        <ErrorAlert
+          action={
+            <Button
+              onClick={() => void jobsQuery.refetch()}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              {t("action.retry")}
+            </Button>
+          }
+          description={t("job.loadFailedDescription")}
+          title={t("state.loadFailed")}
+        />
+      ) : null}
       {jobsQuery.isSuccess && jobsPagination.total === 0 ? (
-        <EmptyState title={t("empty.noJobs")} />
+        <EmptyState
+          description={t("job.emptyDescription")}
+          title={t("empty.noJobs")}
+        />
+      ) : null}
+      {systemSettingsQuery.isError ? (
+        <Alert>
+          <AlertTitle>{t("job.runtimeStatusUnavailable")}</AlertTitle>
+          <AlertDescription>
+            {t("job.runtimeStatusUnavailableDescription")}
+          </AlertDescription>
+        </Alert>
       ) : null}
       {pressureWarnings.length === 0 ? null : (
         <Alert variant="destructive">
@@ -292,7 +318,10 @@ export function KnowledgeBaseJobsPage() {
                 : t("job.retrieveNotReady")}
             </Badge>
           </div>
-          <Progress value={ingestProgress.overall_progress} />
+          <Progress
+            label={t("job.stageAverageProgress")}
+            value={ingestProgress.overall_progress}
+          />
         </div>
       ) : null}
       {jobsQuery.isSuccess && jobsPagination.total > 0 ? (
