@@ -3,6 +3,7 @@ export const runtimeLockResourceKinds = [
   "graph-refresh",
   "knowledge-check-run",
   "deletion-cleanup-operation",
+  "background-operation",
   "migration-one-shot",
 ] as const;
 

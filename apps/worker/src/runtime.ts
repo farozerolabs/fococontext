@@ -3,7 +3,12 @@ import { rmSync, writeFileSync } from "node:fs";
 import { Queue } from "bullmq";
 import { loadRuntimeConfig } from "@fococontext/core";
 import type { RuntimeConfig } from "@fococontext/core";
-import { createPostgresCompileArtifactRepository, createPostgresDatabase } from "@fococontext/db";
+import {
+  createPostgresBackgroundOperationCheckpointRepository,
+  createPostgresCompileArtifactRepository,
+  createPostgresDatabase,
+  requireKnowledgeBaseTenantProject,
+} from "@fococontext/db";
 import {
   createOpenAICompatibleChatProvider,
   createOpenAICompatibleVisionCaptionProvider,
@@ -37,6 +42,11 @@ import {
   graphInsightsRefreshQueueName,
   PostgresGraphInsightsRefreshProcessor,
 } from "./graph-insights-refresh.worker.js";
+import {
+  BullMqReindexWorker,
+  createPostgresReindexProcessor,
+  reindexQueueName,
+} from "./reindex.worker.js";
 import {
   BullMqMediaCaptionQueue,
   BullMqMediaCaptionWorker,
@@ -99,6 +109,7 @@ async function main(): Promise<void> {
     multipartPartSizeBytes: config.limits.objectStorageOperations.multipartPartSizeBytes,
   });
   const artifactRepository = createPostgresCompileArtifactRepository(db);
+  const backgroundOperationCheckpoints = createPostgresBackgroundOperationCheckpointRepository(db);
   const modelCallRecorder = new PostgresModelCallRecorder(artifactRepository);
   const modelProfiles = resolveModelProviderProfiles(config.models);
   const chatProvider = createOpenAICompatibleChatProvider(modelProfiles.chat);
@@ -112,7 +123,9 @@ async function main(): Promise<void> {
     db,
     config.models.embedding,
   );
-  const mergeApplier = new PostgresWikiMergeApplier(db, undefined, pageEmbeddingIndexer);
+  const mergeApplier = new PostgresWikiMergeApplier(db, undefined, pageEmbeddingIndexer, {
+    graphInsightBatchSize: config.limits.backgroundJobs.graphInsights.batchSize,
+  });
   const wikiAnalyzeQueue = new BullMqWikiAnalyzeQueue(config);
   const wikiGenerateQueue = new BullMqWikiGenerateQueue(config);
   const wikiMergeQueue = new BullMqWikiMergeQueue(config);
@@ -121,16 +134,19 @@ async function main(): Promise<void> {
     new DeletionCleanupProcessor({
       repository: new PostgresDeletionCleanupRepository(db),
       databaseCleanup: new PostgresDeletionCleanupDatabaseCleaner(db),
+      checkpointRepository: backgroundOperationCheckpoints,
       manifestPlanner: new PostgresDeletionCleanupManifestPlanner(db),
       targetGuard: new PostgresDeletionCleanupTargetGuard(db),
       ...(webhookEventEmitter === undefined ? {} : { webhookEvents: webhookEventEmitter }),
       objectStorage,
-      objectBatchSize: config.limits.deletionCleanup.objectBatchSize,
+      objectBatchSize: config.limits.backgroundJobs.cleanup.batchSize,
     }),
   );
   const knowledgeCheckWorker = new BullMqKnowledgeCheckWorker(
     config,
     new KnowledgeCheckProcessor(new PostgresKnowledgeCheckStore(db), {
+      batchSize: config.limits.backgroundJobs.knowledgeCheck.batchSize,
+      checkpointRepository: backgroundOperationCheckpoints,
       ...(webhookEventEmitter === undefined ? {} : { webhookEvents: webhookEventEmitter }),
     }),
   );
@@ -217,7 +233,9 @@ async function main(): Promise<void> {
                 ? {}
                 : { apiKey: config.ocr.serviceApiKey }),
             }),
-            repository: new PostgresSourceOcrRepository(db),
+            repository: new PostgresSourceOcrRepository(db, {
+              writeBatchSize: config.limits.backgroundJobs.ocr.batchSize,
+            }),
           }),
         )
       : undefined;
@@ -257,7 +275,21 @@ async function main(): Promise<void> {
   );
   const graphInsightsRefreshWorker = new BullMqGraphInsightsRefreshWorker(
     config,
-    new PostgresGraphInsightsRefreshProcessor(mergeApplier),
+    new PostgresGraphInsightsRefreshProcessor(mergeApplier, {
+      checkpointRepository: backgroundOperationCheckpoints,
+      resolveKnowledgeBaseScope: (knowledgeBaseId) =>
+        requireKnowledgeBaseTenantProject(db, knowledgeBaseId),
+    }),
+  );
+  const reindexWorker = new BullMqReindexWorker(
+    config,
+    createPostgresReindexProcessor({
+      checkpointRepository: backgroundOperationCheckpoints,
+      config,
+      db,
+      jobGuard: jobProgress,
+      jobProgress,
+    }),
   );
   const webhookRetryQueue = config.webhook.delivery.enabled
     ? new Queue(webhookDispatchQueueName, {
@@ -288,6 +320,7 @@ async function main(): Promise<void> {
     deletionCleanupWorker,
     knowledgeCheckWorker,
     graphInsightsRefreshWorker,
+    reindexWorker,
     wikiAnalyzeWorker,
     wikiGenerateWorker,
     wikiMergeWorker,
@@ -315,7 +348,7 @@ async function main(): Promise<void> {
 
   writeFileSync(WORKER_READY_FILE, "ready\n", "utf8");
   console.log(
-    `FocoContext worker runtime started with ${deletionCleanupQueueName}, ${knowledgeCheckQueueName}, ${graphInsightsRefreshQueueName}, ${webhookDispatchQueueName}.`,
+    `FocoContext worker runtime started with ${deletionCleanupQueueName}, ${knowledgeCheckQueueName}, ${graphInsightsRefreshQueueName}, ${reindexQueueName}, ${webhookDispatchQueueName}.`,
   );
 }
 

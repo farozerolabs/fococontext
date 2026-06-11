@@ -12,6 +12,9 @@ import {
 import { Pool } from "pg";
 
 export * from "./tenant-project-scope.js";
+export * from "./background-operation-checkpoint.js";
+export * from "./bounded-pagination.js";
+export * from "./idempotent-batch.js";
 export { sql };
 
 export const expectedSchemaTables = [
@@ -57,6 +60,7 @@ export const expectedSchemaTables = [
   "webhook_deliveries",
   "page_embeddings",
   "retrieval_traces",
+  "background_operations",
   "deletion_cleanup_operations",
   "deletion_cleanup_items",
 ] as const;
@@ -274,6 +278,13 @@ create index if not exists page_embeddings_kb_model_dimensions_idx
 create index if not exists page_embeddings_owner_model_dimensions_idx
   on page_embeddings(owner_knowledge_base_id, model, dimensions, created_at desc, id desc)
   where embedding is not null and fork_tombstoned_at is null;
+
+create index if not exists background_operations_scope_kind_status_updated_idx
+  on background_operations(tenant_id, project_id, knowledge_base_id, operation_kind, status, updated_at desc, id desc);
+
+create index if not exists background_operations_job_stage_idx
+  on background_operations(job_id, stage, updated_at desc, id desc)
+  where job_id is not null;
 
 create index if not exists source_watch_rules_kb_updated_idx
   on source_watch_rules(knowledge_base_id, updated_at desc, id desc);

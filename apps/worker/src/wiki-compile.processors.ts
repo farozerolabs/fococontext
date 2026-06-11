@@ -22,7 +22,8 @@ import {
   resolveDatasetPromptTemplateFromSnapshot,
 } from "@fococontext/llm";
 import {
-  createGraphInsightsFromRecords,
+  type GraphAlgorithmMetadata,
+  type GraphInsightItem,
   type GraphInsightsResponse,
   type RetrievalRelationType,
   type RetrievalVisibilityOrigin,
@@ -70,6 +71,13 @@ const generationStructuredOutputRepairAttempts = 3;
 const sourceFrontmatterMetadataKey = "source_frontmatter";
 const sourceDocumentMetadataKey = "source_document_metadata";
 const systemPageLogMaxEntries = 200;
+
+interface GraphInsightsRefreshProgress {
+  metadata: Record<string, unknown>;
+  processedCount: number;
+  stage: "graph_signals" | "snapshot";
+  totalCount: number;
+}
 
 export interface WikiAnalyzeContext {
   currentKnowledgeVersionId: string;
@@ -2256,6 +2264,7 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     private readonly db: Kysely<DatabaseSchema>,
     private readonly idFactory: (scope: string) => string = createWorkerId,
     private readonly embeddingIndexer?: WikiPageEmbeddingIndexer,
+    private readonly options: { graphInsightBatchSize?: number } = {},
   ) {}
 
   async applyDraft(input: WikiMergeApplyInput): Promise<WikiMergeApplyResult> {
@@ -2769,7 +2778,9 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
   async refreshGraphInsightsForJob(input: {
     jobId: string;
     knowledgeBaseId: string;
+    onProgress?: (progress: GraphInsightsRefreshProgress) => Promise<void>;
     requestedKnowledgeVersionId: string | null;
+    skipDerivedGraphSignals?: boolean;
   }): Promise<{ status: "completed" | "failed"; knowledge_base_id: string; job_id: string }> {
     let context: { changeSetId: string | null; knowledgeVersionId: string } | null = null;
     const startedAt = new Date().toISOString();
@@ -2792,15 +2803,34 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
       let graphInsights: GraphInsightsResponse | null = null;
       const refreshContext = context;
 
-      await this.db.transaction().execute(async (trx) => {
-        await this.insertDerivedGraphSignalEdges(
-          input.knowledgeBaseId,
-          refreshContext.changeSetId,
-          refreshContext.knowledgeVersionId,
-          startedAt,
-          trx,
-        );
-        graphInsights = await this.createGraphInsightsSnapshot(input.knowledgeBaseId, trx);
+      if (input.skipDerivedGraphSignals !== true) {
+        await this.db.transaction().execute(async (trx) => {
+          await this.insertDerivedGraphSignalEdges(
+            input.knowledgeBaseId,
+            refreshContext.changeSetId,
+            refreshContext.knowledgeVersionId,
+            startedAt,
+            trx,
+          );
+        });
+        await input.onProgress?.({
+          metadata: {
+            derived_graph_signals_completed: true,
+          },
+          processedCount: 1,
+          stage: "graph_signals",
+          totalCount: 2,
+        });
+      }
+
+      graphInsights = await this.createGraphInsightsSnapshot(input.knowledgeBaseId, this.db);
+      await input.onProgress?.({
+        metadata: {
+          graph_insights_summary: createGraphInsightsCompactSummary(graphInsights),
+        },
+        processedCount: 2,
+        stage: "snapshot",
+        totalCount: 2,
       });
 
       if (graphInsights === null) {
@@ -2839,7 +2869,6 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
       };
     }
   }
-
   private async loadSystemPageMarkdown(
     knowledgeBaseId: string,
     systemKey: string,
@@ -2864,7 +2893,13 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
   ): Promise<void> {
     const relationships = await this.loadAnalysisRelationships(input.draft.analysisResultId, db);
-    const pages = await this.listRelationshipPages(input.draft.knowledgeBaseId, db);
+    const pageLookupLimit = Math.max(1, this.options.graphInsightBatchSize ?? 100);
+    const pages = await this.listRelationshipPagesForRelationships(
+      input.draft.knowledgeBaseId,
+      relationships,
+      pageLookupLimit,
+      db,
+    );
     const edges = resolveRelationshipEdgesForPages({
       knowledgeBaseId: input.draft.knowledgeBaseId,
       pages,
@@ -2888,12 +2923,18 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     now: string,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
   ): Promise<void> {
-    const pages = await this.listGraphSignalPages(knowledgeBaseId, db);
-    const existingEdges = await this.listExistingGraphEdges(knowledgeBaseId, db);
+    const limit = Math.max(1, this.options.graphInsightBatchSize ?? 100);
+    const pages = await this.listGraphSignalPages(knowledgeBaseId, limit, db);
+    const existingEdges = await this.listExistingGraphEdges(knowledgeBaseId, limit, db);
     const edges = deriveGraphSignalEdgesForPages({
       knowledgeBaseId,
       pages,
       existingEdges,
+      limits: {
+        maxCommonNeighborPairs: limit * limit,
+        maxSharedSourcePairs: limit * limit,
+        maxTypeAffinityPairs: limit * limit,
+      },
     });
 
     await this.insertResolvedEdges(
@@ -2910,14 +2951,321 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     knowledgeBaseId: string,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
   ): Promise<GraphInsightsResponse> {
-    const pages = await this.listGraphInsightPages(knowledgeBaseId, db);
-    const edges = await this.listGraphInsightEdges(knowledgeBaseId, db);
+    const limit = Math.max(1, this.options.graphInsightBatchSize ?? 100);
+    const [counts, isolatedPages, sparsePages, bridgePages, communities, surprisingConnections] =
+      await Promise.all([
+        this.countGraphInsightInputs(knowledgeBaseId, db),
+        this.listBoundedDegreeGraphInsights({
+          knowledgeBaseId,
+          db,
+          insightType: "isolated_page",
+          maxDegree: 0,
+          limit,
+        }),
+        this.listBoundedDegreeGraphInsights({
+          knowledgeBaseId,
+          db,
+          insightType: "sparse_page",
+          minDegree: 1,
+          maxDegree: 1,
+          limit,
+        }),
+        this.listBoundedDegreeGraphInsights({
+          knowledgeBaseId,
+          db,
+          insightType: "bridge_page",
+          minDegree: 2,
+          limit,
+          orderByDegreeDesc: true,
+        }),
+        this.listBoundedCommunityGraphInsights(knowledgeBaseId, limit, db),
+        this.listBoundedSurprisingConnections(knowledgeBaseId, limit, db),
+      ]);
+    const knowledgeGaps = [
+      ...isolatedPages.map((item) => ({
+        ...item,
+        id: createStableWorkerGraphInsightId("knowledge_gap", item.page_id ?? "", "isolated"),
+        insight_type: "knowledge_gap" as const,
+        reason: "Page has no relationship evidence.",
+        reason_codes: ["isolated_page"],
+      })),
+      ...sparsePages.map((item) => ({
+        ...item,
+        id: createStableWorkerGraphInsightId("knowledge_gap", item.page_id ?? "", "sparse"),
+        insight_type: "knowledge_gap" as const,
+        reason: "Page has fewer than two graph relationships.",
+        reason_codes: ["sparse_page"],
+      })),
+    ];
 
-    return createGraphInsightsFromRecords({
-      knowledgeBaseId,
-      pages,
-      edges,
+    return {
+      knowledge_base_id: knowledgeBaseId,
+      status: {
+        failure_reason: null,
+        source_job_id: null,
+        started_at: null,
+        state: counts.nodeCount > limit || counts.edgeCount > limit ? "partial" : "ready",
+        updated_at: null,
+      },
+      snapshot: {
+        algorithm: createBoundedGraphInsightAlgorithmMetadata(),
+        edge_count: counts.edgeCount,
+        graph_hash: createWorkerGraphHash({
+          edgeCount: counts.edgeCount,
+          knowledgeBaseId,
+          nodeCount: counts.nodeCount,
+        }),
+        node_count: counts.nodeCount,
+      },
+      empty_reasons: createWorkerGraphInsightEmptyReasons({
+        bridge_pages: bridgePages,
+        communities,
+        isolated_pages: isolatedPages,
+        knowledge_gaps: knowledgeGaps,
+        sparse_pages: sparsePages,
+        surprising_connections: surprisingConnections,
+      }),
+      isolated_pages: isolatedPages,
+      sparse_pages: sparsePages,
+      bridge_pages: bridgePages,
+      knowledge_gaps: knowledgeGaps,
+      communities,
+      surprising_connections: surprisingConnections,
+    };
+  }
+
+  private async countGraphInsightInputs(
+    knowledgeBaseId: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ): Promise<{ edgeCount: number; nodeCount: number }> {
+    const result = await sql<{
+      edge_count: string | number | bigint;
+      node_count: string | number | bigint;
+    }>`
+      select
+        (
+          select count(*)
+          from wiki_pages
+          where knowledge_base_id = ${knowledgeBaseId}
+            and deleted_at is null
+            and fork_tombstoned_at is null
+        ) as node_count,
+        (
+          select count(*)
+          from wiki_edges
+          where knowledge_base_id = ${knowledgeBaseId}
+            and fork_tombstoned_at is null
+        ) as edge_count
+    `.execute(db);
+    const row = result.rows[0];
+
+    return {
+      edgeCount: readSqlCount(row?.edge_count),
+      nodeCount: readSqlCount(row?.node_count),
+    };
+  }
+
+  private async listBoundedDegreeGraphInsights(input: {
+    knowledgeBaseId: string;
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema>;
+    insightType: "isolated_page" | "sparse_page" | "bridge_page";
+    minDegree?: number;
+    maxDegree?: number;
+    limit: number;
+    orderByDegreeDesc?: boolean;
+  }): Promise<GraphInsightItem[]> {
+    const minDegree = input.minDegree ?? 0;
+    const maxDegree = input.maxDegree ?? Number.MAX_SAFE_INTEGER;
+    const orderDirection = input.orderByDegreeDesc === true ? sql`degree desc` : sql`degree asc`;
+    const result = await sql<{
+      page_id: string;
+      title: string;
+      degree: string | number | bigint;
+    }>`
+      with edge_degrees as (
+        select page_id, count(*) as degree
+        from (
+          select from_page_id as page_id
+          from wiki_edges
+          where knowledge_base_id = ${input.knowledgeBaseId}
+            and fork_tombstoned_at is null
+          union all
+          select to_page_id as page_id
+          from wiki_edges
+          where knowledge_base_id = ${input.knowledgeBaseId}
+            and fork_tombstoned_at is null
+        ) edge_pages
+        group by page_id
+      )
+      select
+        wiki_pages.id as page_id,
+        wiki_pages.title,
+        coalesce(edge_degrees.degree, 0) as degree
+      from wiki_pages
+      left join edge_degrees on edge_degrees.page_id = wiki_pages.id
+      where wiki_pages.knowledge_base_id = ${input.knowledgeBaseId}
+        and wiki_pages.deleted_at is null
+        and wiki_pages.fork_tombstoned_at is null
+        and coalesce(edge_degrees.degree, 0) >= ${minDegree}
+        and coalesce(edge_degrees.degree, 0) <= ${maxDegree}
+      order by ${orderDirection}, wiki_pages.updated_at desc, wiki_pages.id desc
+      limit ${input.limit}
+    `.execute(input.db);
+
+    return result.rows.map((row) => {
+      const degree = readSqlCount(row.degree);
+      const reasonCodes =
+        input.insightType === "isolated_page"
+          ? ["isolated_page"]
+          : input.insightType === "sparse_page"
+            ? ["sparse_page"]
+            : ["high_degree_bridge_candidate"];
+
+      return {
+        id: createStableWorkerGraphInsightId(input.insightType, row.page_id, ...reasonCodes),
+        insight_type: input.insightType,
+        page_id: row.page_id,
+        title: row.title,
+        reason:
+          input.insightType === "isolated_page"
+            ? "Page has no relationship evidence."
+            : input.insightType === "sparse_page"
+              ? "Page has fewer than two graph relationships."
+              : "Page has many graph relationships and may connect multiple areas.",
+        reason_codes: reasonCodes,
+        severity: input.insightType === "isolated_page" ? "medium" : "low",
+        score: input.insightType === "bridge_page" ? degree : Math.max(1 - degree / 2, 0),
+        metadata: {
+          degree,
+          algorithm: "bounded_degree_summary",
+        },
+        evidence_refs: [
+          {
+            object_type: "wiki_page",
+            page_id: row.page_id,
+          },
+        ],
+      };
     });
+  }
+
+  private async listBoundedCommunityGraphInsights(
+    knowledgeBaseId: string,
+    limit: number,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ): Promise<GraphInsightItem[]> {
+    const result = await sql<{
+      page_type: string;
+      member_count: string | number | bigint;
+      page_ids: string[] | null;
+      titles: string[] | null;
+    }>`
+      select
+        page_type,
+        count(*) as member_count,
+        (array_agg(id order by updated_at desc, id desc))[1:5] as page_ids,
+        (array_agg(title order by updated_at desc, id desc))[1:5] as titles
+      from wiki_pages
+      where knowledge_base_id = ${knowledgeBaseId}
+        and deleted_at is null
+        and fork_tombstoned_at is null
+      group by page_type
+      having count(*) >= 2
+      order by count(*) desc, page_type asc
+      limit ${limit}
+    `.execute(db);
+
+    return result.rows.map((row) => {
+      const memberCount = readSqlCount(row.member_count);
+      const pageIds = row.page_ids ?? [];
+      const titles = row.titles ?? [];
+
+      return {
+        id: createStableWorkerGraphInsightId("community", row.page_type),
+        insight_type: "community",
+        page_ids: pageIds,
+        title: titles[0] ?? row.page_type,
+        reason: "Pages share the same page type.",
+        reason_codes: ["type_affinity_cluster"],
+        score: memberCount,
+        community: {
+          algorithm: createBoundedGraphInsightAlgorithmMetadata().community_algorithm,
+          cohesion: 1,
+          confidence: 0.5,
+          id: `type:${row.page_type}`,
+          member_count: memberCount,
+          representative_page_ids: pageIds,
+          representative_titles: titles,
+        },
+        metadata: {
+          page_type: row.page_type,
+          algorithm: "bounded_type_cluster",
+        },
+      };
+    });
+  }
+
+  private async listBoundedSurprisingConnections(
+    knowledgeBaseId: string,
+    limit: number,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ): Promise<GraphInsightItem[]> {
+    const result = await sql<{
+      edge_id: string;
+      from_page_id: string;
+      from_title: string;
+      relation_type: RetrievalRelationType;
+      to_page_id: string;
+      to_title: string;
+      weight: string | number;
+      explanation: string | null;
+    }>`
+      select
+        wiki_edges.id as edge_id,
+        wiki_edges.from_page_id,
+        from_pages.title as from_title,
+        wiki_edges.to_page_id,
+        to_pages.title as to_title,
+        wiki_edges.relation_type,
+        wiki_edges.weight::float as weight,
+        wiki_edges.explanation
+      from wiki_edges
+      join wiki_pages from_pages on from_pages.id = wiki_edges.from_page_id
+      join wiki_pages to_pages on to_pages.id = wiki_edges.to_page_id
+      where wiki_edges.knowledge_base_id = ${knowledgeBaseId}
+        and wiki_edges.fork_tombstoned_at is null
+        and from_pages.deleted_at is null
+        and to_pages.deleted_at is null
+        and from_pages.fork_tombstoned_at is null
+        and to_pages.fork_tombstoned_at is null
+      order by wiki_edges.weight desc, wiki_edges.updated_at desc, wiki_edges.id desc
+      limit ${limit}
+    `.execute(db);
+
+    return result.rows.map((row) => ({
+      id: createStableWorkerGraphInsightId(
+        "surprising_connection",
+        row.from_page_id,
+        row.to_page_id,
+        row.edge_id,
+      ),
+      insight_type: "surprising_connection",
+      page_ids: [row.from_page_id, row.to_page_id],
+      title: `${row.from_title} -> ${row.to_title}`,
+      reason: row.explanation ?? "High-weight relationship connects two pages.",
+      reason_codes: ["high_weight_relationship"],
+      score: Number(row.weight),
+      reasons: [
+        {
+          edge_id: row.edge_id,
+          explanation: row.explanation ?? `${row.from_title} relates to ${row.to_title}.`,
+          relation_type: row.relation_type,
+        },
+      ],
+      metadata: {
+        algorithm: "bounded_high_weight_edges",
+      },
+    }));
   }
 
   private async listGraphInsightPages(
@@ -3475,6 +3823,7 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
 
   private async listGraphSignalPages(
     knowledgeBaseId: string,
+    limit: number,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
   ): Promise<GraphSignalPageRecord[]> {
     const result = await sql<{
@@ -3495,6 +3844,9 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
       from wiki_pages
       where knowledge_base_id = ${knowledgeBaseId}
         and deleted_at is null
+        and fork_tombstoned_at is null
+      order by updated_at desc, id desc
+      limit ${limit}
     `.execute(db);
 
     return result.rows.map((row) => ({
@@ -3509,6 +3861,7 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
 
   private async listExistingGraphEdges(
     knowledgeBaseId: string,
+    limit: number,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
   ): Promise<ResolvedRelationshipEdgeWrite[]> {
     const result = await sql<{
@@ -3532,6 +3885,9 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
         metadata
       from wiki_edges
       where knowledge_base_id = ${knowledgeBaseId}
+        and fork_tombstoned_at is null
+      order by updated_at desc, id desc
+      limit ${limit}
     `.execute(db);
 
     return result.rows.map((row) => ({
@@ -3560,15 +3916,32 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     return readRecordArray(result.rows[0]?.relationships);
   }
 
-  private async listRelationshipPages(
+  private async listRelationshipPagesForRelationships(
     knowledgeBaseId: string,
+    relationships: readonly Record<string, unknown>[],
+    limit: number,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
   ): Promise<RelationshipPageRecord[]> {
+    const references = createRelationshipPageReferences(relationships);
+
+    if (references.pageIds.length === 0 && references.lookupKeys.length === 0) {
+      return [];
+    }
+
+    const pageIds = formatTextArray(references.pageIds);
+    const lookupKeys = formatTextArray(references.lookupKeys);
     const result = await sql<RelationshipPageRecord>`
       select id, slug, title
       from wiki_pages
       where knowledge_base_id = ${knowledgeBaseId}
         and deleted_at is null
+        and (
+          id = any(${pageIds})
+          or lower(slug) = any(${lookupKeys})
+          or lower(title) = any(${lookupKeys})
+        )
+      order by updated_at desc, id desc
+      limit ${limit}
     `.execute(db);
 
     return result.rows;
@@ -4736,6 +5109,55 @@ function createRelationshipPageLookup(pages: readonly RelationshipPageRecord[]) 
   return { byId, byKey };
 }
 
+function createRelationshipPageReferences(relationships: readonly Record<string, unknown>[]): {
+  lookupKeys: string[];
+  pageIds: string[];
+} {
+  const lookupKeys = new Set<string>();
+  const pageIds = new Set<string>();
+
+  for (const relationship of relationships) {
+    addRelationshipReferenceId(pageIds, relationship.from_page_id);
+    addRelationshipReferenceId(pageIds, relationship.to_page_id);
+    addRelationshipReferenceId(pageIds, relationship.target_page_id);
+
+    addRelationshipReferenceKey(lookupKeys, relationship.from_slug);
+    addRelationshipReferenceKey(lookupKeys, relationship.source_slug);
+    addRelationshipReferenceKey(lookupKeys, relationship.to_slug);
+    addRelationshipReferenceKey(lookupKeys, relationship.target_slug);
+    addRelationshipReferenceKey(lookupKeys, relationship.from_title);
+    addRelationshipReferenceKey(lookupKeys, relationship.source_title);
+    addRelationshipReferenceKey(lookupKeys, relationship.to_title);
+    addRelationshipReferenceKey(lookupKeys, relationship.target_title);
+  }
+
+  return {
+    lookupKeys: [...lookupKeys],
+    pageIds: [...pageIds],
+  };
+}
+
+function addRelationshipReferenceId(lookup: Set<string>, value: unknown): void {
+  const id = readString(value);
+
+  if (id !== null) {
+    lookup.add(id);
+  }
+}
+
+function addRelationshipReferenceKey(lookup: Set<string>, value: unknown): void {
+  const rawValue = readString(value);
+
+  for (const candidate of [rawValue, readSlugTail(rawValue)]) {
+    const key = normalizeRelationshipLookupKey(candidate);
+
+    if (key !== null) {
+      lookup.add(key);
+      lookup.add(createSlug(key));
+    }
+  }
+}
+
 function addRelationshipPageKey(
   lookup: Map<string, RelationshipPageRecord>,
   value: string,
@@ -4796,6 +5218,10 @@ function readRecordArray(value: unknown): Record<string, unknown>[] {
 
     return record === null ? [] : [record];
   });
+}
+
+function formatTextArray(values: readonly string[]) {
+  return values.length === 0 ? sql`array[]::text[]` : sql`array[${sql.join(values)}]::text[]`;
 }
 
 function readPositiveNumber(value: unknown): number | null {
@@ -5001,6 +5427,93 @@ function readRetrievalVisibilityOrigin(value: string | null): RetrievalVisibilit
   }
 
   return "canonical";
+}
+
+function createBoundedGraphInsightAlgorithmMetadata(): GraphAlgorithmMetadata {
+  return {
+    name: "bounded_graph_insight_summary",
+    version: "1",
+    community_algorithm: {
+      name: "bounded_type_cluster",
+      version: "1",
+      weighted: false,
+    },
+  };
+}
+
+function createStableWorkerGraphInsightId(...parts: readonly string[]): string {
+  return `gins_${createWorkerHash(parts.join(":")).slice(0, 24)}`;
+}
+
+function createWorkerGraphHash(input: {
+  edgeCount: number;
+  knowledgeBaseId: string;
+  nodeCount: number;
+}): string {
+  return createWorkerHash(
+    JSON.stringify({
+      edge_count: input.edgeCount,
+      knowledge_base_id: input.knowledgeBaseId,
+      node_count: input.nodeCount,
+    }),
+  );
+}
+
+function createGraphInsightsCompactSummary(
+  graphInsights: GraphInsightsResponse,
+): Record<string, unknown> {
+  return {
+    bridge_pages_count: graphInsights.bridge_pages.length,
+    communities_count: graphInsights.communities.length,
+    graph_hash: graphInsights.snapshot.graph_hash,
+    isolated_pages_count: graphInsights.isolated_pages.length,
+    knowledge_gaps_count: graphInsights.knowledge_gaps.length,
+    node_count: graphInsights.snapshot.node_count,
+    edge_count: graphInsights.snapshot.edge_count,
+    sparse_pages_count: graphInsights.sparse_pages?.length ?? 0,
+    state: graphInsights.status.state,
+    surprising_connections_count: graphInsights.surprising_connections.length,
+  };
+}
+
+function createWorkerHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function createWorkerGraphInsightEmptyReasons(
+  collections: Record<string, readonly GraphInsightItem[]>,
+): Record<string, string> {
+  const reasons: Record<string, string> = {};
+  const defaults: Record<string, string> = {
+    bridge_pages: "No bridge pages were detected.",
+    communities: "The graph does not contain a connected community large enough to report.",
+    isolated_pages: "No isolated pages were detected.",
+    knowledge_gaps: "No knowledge gaps were detected.",
+    sparse_pages: "No sparse pages were detected.",
+    surprising_connections: "No surprising connections were detected.",
+  };
+
+  for (const [key, items] of Object.entries(collections)) {
+    if (items.length === 0) {
+      reasons[key] = defaults[key] ?? "No graph insight data was detected.";
+    }
+  }
+
+  return reasons;
+}
+
+function readSqlCount(value: string | number | bigint | undefined): number {
+  if (value === undefined) {
+    return 0;
+  }
+  if (typeof value === "bigint") {
+    return Number(value);
+  }
+  if (typeof value === "number") {
+    return value;
+  }
+
+  return Number.parseInt(value, 10);
 }
 
 function summarizeError(error: unknown): string {

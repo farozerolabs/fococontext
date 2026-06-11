@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { Queue, Worker } from "bullmq";
 import { sql, type Kysely } from "kysely";
 import type {
@@ -9,8 +11,11 @@ import type {
   DeletionCleanupStatus,
   DeletionCleanupTargetType,
 } from "@fococontext/contracts";
-import type { RuntimeConfig } from "@fococontext/core";
+import { createBackgroundOperationDedupeKey, type RuntimeConfig } from "@fococontext/core";
 import {
+  backgroundOperationIdPrefix,
+  type BackgroundOperationCheckpointRecord,
+  type BackgroundOperationCheckpointRepository,
   requirePersistedCleanupItemTenantProject,
   requirePersistedCleanupOperationTenantProject,
   requireCleanupItemTenantProject,
@@ -59,6 +64,7 @@ export interface DeletionCleanupStore {
   listItemsByOperationId(
     operationId: string,
   ): DeletionCleanupItemRecord[] | Promise<DeletionCleanupItemRecord[]>;
+  resolveOperationScope?(operationId: string): Promise<{ tenantId: string; projectId: string }>;
   listRetryableItemsByOperationId?(
     operationId: string,
     input: ListRetryableDeletionCleanupItemsInput,
@@ -138,6 +144,7 @@ export interface DeletionCleanupProcessorOptions {
   manifestPlanner?: DeletionCleanupManifestPlanner;
   targetGuard?: DeletionCleanupTargetGuard;
   webhookEvents?: WorkerWebhookEventEmitter;
+  checkpointRepository?: BackgroundOperationCheckpointRepository;
   objectBatchSize?: number;
   now?: () => string;
 }
@@ -216,7 +223,7 @@ export function createDeletionCleanupQueueOptions(config: RuntimeConfig) {
 
 export function createDeletionCleanupWorkerOptions(config: RuntimeConfig) {
   return {
-    concurrency: config.limits.deletionCleanup.concurrency,
+    concurrency: config.limits.backgroundJobs.cleanup.concurrency,
     connection: {
       url: config.redis.url,
     },
@@ -244,6 +251,7 @@ export class DeletionCleanupProcessor {
     if (operation.status === "completed" || operation.status === "canceled") {
       return operation;
     }
+    const checkpoint = await this.createOrReuseCheckpoint(operation);
 
     const fenced = await this.updateOperation(operation, {
       status: "running",
@@ -252,10 +260,11 @@ export class DeletionCleanupProcessor {
       startedAt: operation.startedAt ?? this.now(),
       updatedAt: this.now(),
     });
+    await this.saveCheckpointProgress(checkpoint, fenced);
     const guardResult = await this.checkCleanupAllowed(fenced);
 
     if (!guardResult.allowed) {
-      return this.updateOperation(fenced, {
+      const failed = await this.updateOperation(fenced, {
         status: "failed",
         phase: "fencing",
         retryable: false,
@@ -266,11 +275,15 @@ export class DeletionCleanupProcessor {
         failedAt: this.now(),
         updatedAt: this.now(),
       });
+      await this.saveTerminalCheckpoint(checkpoint, failed);
+
+      return failed;
     }
 
     const planned = await this.ensureManifestPlanned(fenced);
 
     if (planned.status === "failed" || planned.status === "canceled") {
+      await this.saveTerminalCheckpoint(checkpoint, planned);
       return planned;
     }
 
@@ -279,10 +292,12 @@ export class DeletionCleanupProcessor {
       phase: "object_cleanup",
       updatedAt: this.now(),
     });
+    await this.saveCheckpointProgress(checkpoint, started);
     let objectItems = await this.listRetryableItems(operationId, "object", started.updatedAt);
 
     while (objectItems.length > 0) {
       await this.deleteObjectItems(objectItems);
+      await this.refreshCheckpointCounts(checkpoint, operationId, "object_cleanup");
       if (await this.hasFailedItems(operationId, "object")) {
         return this.finishOperation(started.id);
       }
@@ -307,9 +322,11 @@ export class DeletionCleanupProcessor {
         phase: "database_cleanup",
         updatedAt: this.now(),
       });
+      await this.saveCheckpointProgress(checkpoint, databasePhase);
 
       while (databaseItems.length > 0) {
         await this.deleteDatabaseItems(databaseItems);
+        await this.refreshCheckpointCounts(checkpoint, operationId, "database_cleanup");
         if (await this.hasFailedItems(operationId, "database_row")) {
           return this.finishOperation(databasePhase.id);
         }
@@ -324,6 +341,121 @@ export class DeletionCleanupProcessor {
     }
 
     return this.finishOperation(started.id);
+  }
+
+  private async createOrReuseCheckpoint(
+    operation: DeletionCleanupOperationRecord,
+  ): Promise<BackgroundOperationCheckpointRecord | null> {
+    if (
+      this.options.checkpointRepository === undefined ||
+      this.options.repository.resolveOperationScope === undefined
+    ) {
+      return null;
+    }
+    const scope = await this.options.repository.resolveOperationScope(operation.id);
+
+    return this.options.checkpointRepository.createOrReuse({
+      id: createStableDeletionCleanupOperationId(operation.id),
+      tenantId: scope.tenantId,
+      projectId: scope.projectId,
+      knowledgeBaseId: operation.knowledgeBaseId,
+      jobId: operation.queueJobId ?? operation.id,
+      operationKind: "deletion_cleanup",
+      stage: operation.phase,
+      lockKey: createBackgroundOperationDedupeKey({
+        operationId: createStableDeletionCleanupOperationId(operation.id),
+        operationKind: "deletion_cleanup",
+        scopeId: operation.knowledgeBaseId ?? operation.id,
+      }),
+      processedCount: operation.deletedItemCount + operation.skippedItemCount,
+      failedCount: operation.failedItemCount,
+      totalCount: operation.totalItemCount,
+      metadata: {
+        operation_id: operation.id,
+        target_id: operation.targetId,
+        target_type: operation.targetType,
+      },
+      now: this.now(),
+    });
+  }
+
+  private async saveCheckpointProgress(
+    checkpoint: BackgroundOperationCheckpointRecord | null,
+    operation: DeletionCleanupOperationRecord,
+  ): Promise<void> {
+    if (checkpoint === null) {
+      return;
+    }
+    await this.options.checkpointRepository?.saveProgress({
+      id: checkpoint.id,
+      stage: operation.phase,
+      processedCount: operation.deletedItemCount + operation.skippedItemCount,
+      failedCount: operation.failedItemCount,
+      totalCount: operation.totalItemCount,
+      metadata: {
+        pending_item_count: operation.pendingItemCount,
+        skipped_item_count: operation.skippedItemCount,
+      },
+      now: this.now(),
+    });
+  }
+
+  private async refreshCheckpointCounts(
+    checkpoint: BackgroundOperationCheckpointRecord | null,
+    operationId: string,
+    stage: string,
+  ): Promise<void> {
+    if (checkpoint === null) {
+      return;
+    }
+    const counts = await this.countItems(operationId);
+
+    await this.options.checkpointRepository?.saveProgress({
+      id: checkpoint.id,
+      stage,
+      processedCount: counts.deletedItemCount + counts.skippedItemCount,
+      failedCount: counts.failedItemCount,
+      totalCount: counts.totalItemCount,
+      metadata: {
+        pending_item_count: counts.pendingItemCount,
+        skipped_item_count: counts.skippedItemCount,
+      },
+      now: this.now(),
+    });
+  }
+
+  private async saveTerminalCheckpoint(
+    checkpoint: BackgroundOperationCheckpointRecord | null,
+    operation: DeletionCleanupOperationRecord,
+  ): Promise<void> {
+    if (checkpoint === null) {
+      return;
+    }
+    const input = {
+      id: checkpoint.id,
+      stage: operation.phase,
+      processedCount: operation.deletedItemCount + operation.skippedItemCount,
+      failedCount: operation.failedItemCount,
+      totalCount: operation.totalItemCount,
+      metadata: {
+        pending_item_count: operation.pendingItemCount,
+        skipped_item_count: operation.skippedItemCount,
+      },
+      now: this.now(),
+    };
+
+    if (operation.status === "completed") {
+      await this.options.checkpointRepository?.markCompleted(input);
+      return;
+    }
+    if (operation.status === "failed") {
+      await this.options.checkpointRepository?.markFailed({
+        ...input,
+        safeError: operation.lastError ?? {
+          message: "Deletion cleanup failed.",
+        },
+      });
+    }
   }
 
   private async deleteObjectItems(items: DeletionCleanupItemRecord[]): Promise<void> {
@@ -494,6 +626,13 @@ export class DeletionCleanupProcessor {
     });
 
     await this.options.repository.pruneExpiredRecords?.(now);
+    const checkpoint =
+      this.options.checkpointRepository === undefined
+        ? null
+        : await this.options.checkpointRepository.getById(
+            createStableDeletionCleanupOperationId(updated.id),
+          );
+    await this.saveTerminalCheckpoint(checkpoint, updated);
     await this.options.webhookEvents?.emit({
       eventType: updated.status === "completed" ? "cleanup.completed" : "cleanup.failed",
       knowledgeBaseId: updated.knowledgeBaseId,
@@ -697,6 +836,12 @@ export class PostgresDeletionCleanupRepository implements DeletionCleanupStore {
     `.execute(this.db);
 
     return result.rows[0] === undefined ? undefined : toOperationRecord(result.rows[0]);
+  }
+
+  async resolveOperationScope(
+    operationId: string,
+  ): Promise<{ tenantId: string; projectId: string }> {
+    return requirePersistedCleanupOperationTenantProject(this.db, operationId);
   }
 
   async updateOperation(
@@ -1524,6 +1669,12 @@ function shouldPlanManifest(operation: DeletionCleanupOperationRecord): boolean 
     operation.totalItemCount === 0 &&
     operation.manifest.planning_status !== "completed"
   );
+}
+
+function createStableDeletionCleanupOperationId(operationId: string): string {
+  const digest = createHash("sha256").update(operationId).digest("hex").slice(0, 32);
+
+  return `${backgroundOperationIdPrefix}deletion_cleanup_${digest}`;
 }
 
 async function readOperationItemCounts(

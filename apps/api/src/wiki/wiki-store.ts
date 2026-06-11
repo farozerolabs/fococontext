@@ -1,15 +1,20 @@
 import { sql, type Kysely } from "kysely";
 import { ApiError, createResourceId } from "@fococontext/contracts";
-import { requireKnowledgeBaseTenantProject, type DatabaseSchema } from "@fococontext/db";
 import {
-  EmbeddingIndexService,
+  requireKnowledgeBaseTenantProject,
+  writeIdempotentBatches,
+  type DatabaseSchema,
+} from "@fococontext/db";
+import {
   createBoundedRetrievalExecutionContext,
+  createEmbeddingUnits,
   type GraphInsightsResponse,
   type GraphInsightStatus,
   type RetrievalEmbeddingObjectType,
   type RetrievalEmbeddingProvider,
   type RetrievalEmbeddingRecord,
   type RetrievalKnowledgeBaseScopeRecord,
+  type RetrievalPageRecord,
   type RetrievalRepository,
   type RetrievalSourceRef,
   type RetrievalTraceRecord,
@@ -19,6 +24,8 @@ import {
 import type { SystemPageRecord, SystemPageType } from "../knowledge-bases/knowledge-base.types.js";
 
 export const wikiStoreToken = Symbol("wikiStore");
+const retrievalReindexPageSize = 100;
+const retrievalEmbeddingWriteBatchSize = 100;
 
 export interface WikiStore {
   listPages(knowledgeBaseId: string): Promise<WikiPageApiRecord[]>;
@@ -2170,17 +2177,95 @@ class PostgresWikiStore implements WikiStore {
     knowledgeBaseId: string,
     provider: RetrievalEmbeddingProvider,
   ): Promise<RetrievalIndexStats> {
-    const repository = await this.loadRetrievalRepository(knowledgeBaseId);
-    const embeddings = await new EmbeddingIndexService(repository, provider).indexKnowledgeBase(
-      knowledgeBaseId,
-    );
+    await this.deleteEmbeddingsForKnowledgeBase(knowledgeBaseId);
 
-    await this.replaceEmbeddings(knowledgeBaseId, embeddings);
+    let cursor: string | null = null;
+    let indexedEmbeddingCount = 0;
+    let indexedPageCount = 0;
+
+    do {
+      const page = await this.listPagesPaginated(knowledgeBaseId, {
+        page: 1,
+        pageSize: retrievalReindexPageSize,
+        ...(cursor === null ? {} : { cursor }),
+      });
+      const embeddings = await this.createEmbeddingBatch(page.items, provider);
+
+      await this.insertEmbeddingBatch(embeddings);
+      indexedEmbeddingCount += embeddings.length;
+      indexedPageCount += page.items.length;
+      cursor = page.nextCursor ?? null;
+    } while (cursor !== null);
 
     return {
-      indexedEdgeCount: repository.listEdges(knowledgeBaseId).length,
-      indexedEmbeddingCount: embeddings.length,
-      indexedPageCount: repository.listPages(knowledgeBaseId).length,
+      indexedEdgeCount: await this.countVisibleEdges(knowledgeBaseId),
+      indexedEmbeddingCount,
+      indexedPageCount,
+    };
+  }
+
+  private async createEmbeddingBatch(
+    pages: readonly WikiPageApiRecord[],
+    provider: RetrievalEmbeddingProvider,
+  ): Promise<RetrievalEmbeddingRecord[]> {
+    const records: RetrievalEmbeddingRecord[] = [];
+
+    for (const page of pages) {
+      const retrievalPage = this.toRetrievalPageRecord(page);
+      const units = createEmbeddingUnits(retrievalPage);
+      const embeddingResult = await provider.embed({
+        texts: units.map((unit) => unit.text),
+      });
+
+      units.forEach((unit, index) => {
+        const vector = embeddingResult.vectors[index] ?? [];
+
+        records.push({
+          id: `emb:${unit.objectType}:${unit.objectId}`,
+          knowledge_base_id: retrievalPage.knowledge_base_id,
+          page_id: retrievalPage.page_id,
+          page_version_id: retrievalPage.page_version_id,
+          object_type: unit.objectType,
+          object_id: unit.objectId,
+          text: unit.text,
+          model: provider.model,
+          dimensions: provider.dimensions,
+          vector,
+          metadata: {
+            title: retrievalPage.title,
+            type: retrievalPage.type,
+            ...(retrievalPage.system_page_key === null
+              ? {}
+              : { system_page_key: retrievalPage.system_page_key }),
+          },
+          owner_knowledge_base_id: retrievalPage.owner_knowledge_base_id ?? null,
+          visibility_origin: retrievalPage.visibility_origin ?? "canonical",
+          upstream_resource_id: retrievalPage.upstream_resource_id ?? null,
+          fork_tombstoned_at: retrievalPage.fork_tombstoned_at ?? null,
+        });
+      });
+    }
+
+    return records;
+  }
+
+  private toRetrievalPageRecord(page: WikiPageApiRecord): RetrievalPageRecord {
+    return {
+      knowledge_base_id: page.knowledge_base_id,
+      page_id: page.id,
+      page_version_id: page.current_version_id ?? page.id,
+      title: page.title,
+      type: page.type,
+      markdown: page.markdown,
+      frontmatter: page.frontmatter,
+      is_system_page: false,
+      system_page_key: null,
+      source_refs: normalizePageSourceRefs(page),
+      metadata: page.metadata,
+      visibility_origin: readVisibilityOrigin(page.visibility_origin),
+      owner_knowledge_base_id: page.owner_knowledge_base_id ?? null,
+      upstream_resource_id: page.upstream_resource_id ?? null,
+      fork_tombstoned_at: page.fork_tombstoned_at ?? null,
     };
   }
 
@@ -2500,52 +2585,163 @@ class PostgresWikiStore implements WikiStore {
     knowledgeBaseId: string,
     embeddings: readonly RetrievalEmbeddingRecord[],
   ): Promise<void> {
+    await this.deleteEmbeddingsForKnowledgeBase(knowledgeBaseId);
+    await this.insertEmbeddingBatch(embeddings);
+  }
+
+  private async deleteEmbeddingsForKnowledgeBase(knowledgeBaseId: string): Promise<void> {
     await sql`
       delete from page_embeddings
       where knowledge_base_id = ${knowledgeBaseId}
     `.execute(this.db);
+  }
 
-    for (const embedding of embeddings) {
-      const metadata = {
-        ...embedding.metadata,
-        text: embedding.text,
-      };
+  private async insertEmbeddingBatch(
+    embeddings: readonly RetrievalEmbeddingRecord[],
+  ): Promise<void> {
+    await writeIdempotentBatches({
+      batchSize: retrievalEmbeddingWriteBatchSize,
+      getIdempotencyKey: (embedding) => embedding.id,
+      items: embeddings,
+      writeBatch: async (batch) => {
+        for (const embedding of batch) {
+          const metadata = {
+            ...embedding.metadata,
+            text: embedding.text,
+          };
 
-      await sql`
-        insert into page_embeddings (
-          id,
-          knowledge_base_id,
-          page_id,
-          page_version_id,
-          object_type,
-          object_id,
-          model,
-          dimensions,
-          embedding,
-          metadata,
-          owner_knowledge_base_id,
-          visibility_origin,
-          upstream_resource_id,
-          fork_tombstoned_at
+          await sql`
+            insert into page_embeddings (
+              id,
+              knowledge_base_id,
+              page_id,
+              page_version_id,
+              object_type,
+              object_id,
+              model,
+              dimensions,
+              embedding,
+              metadata,
+              owner_knowledge_base_id,
+              visibility_origin,
+              upstream_resource_id,
+              fork_tombstoned_at
+            )
+            values (
+              ${embedding.id},
+              ${embedding.knowledge_base_id},
+              ${embedding.page_id},
+              ${embedding.page_version_id},
+              ${embedding.object_type},
+              ${embedding.object_id},
+              ${embedding.model},
+              ${embedding.dimensions},
+              ${formatPgVector(embedding.vector)}::vector,
+              ${JSON.stringify(metadata)}::jsonb,
+              ${embedding.owner_knowledge_base_id ?? null},
+              ${embedding.visibility_origin ?? "canonical"},
+              ${embedding.upstream_resource_id ?? null},
+              ${embedding.fork_tombstoned_at ?? null}
+            )
+            on conflict (id) do update set
+              knowledge_base_id = excluded.knowledge_base_id,
+              page_id = excluded.page_id,
+              page_version_id = excluded.page_version_id,
+              object_type = excluded.object_type,
+              object_id = excluded.object_id,
+              model = excluded.model,
+              dimensions = excluded.dimensions,
+              embedding = excluded.embedding,
+              metadata = excluded.metadata,
+              owner_knowledge_base_id = excluded.owner_knowledge_base_id,
+              visibility_origin = excluded.visibility_origin,
+              upstream_resource_id = excluded.upstream_resource_id,
+              fork_tombstoned_at = excluded.fork_tombstoned_at
+          `.execute(this.db);
+        }
+
+        return { written: batch.length };
+      },
+    });
+  }
+
+  private async countVisibleEdges(knowledgeBaseId: string): Promise<number> {
+    const scope = await this.getKnowledgeBaseScope(knowledgeBaseId);
+
+    if (scope.knowledgeBaseType === "fork" && scope.upstreamKnowledgeBaseId !== null) {
+      const result = await sql<{ total: string | number | bigint }>`
+        with fork_page_tombstones as (
+          select upstream_resource_id
+          from wiki_pages
+          where owner_knowledge_base_id = ${knowledgeBaseId}
+            and fork_tombstoned_at is not null
+            and upstream_resource_id is not null
+        ),
+        visible_pages as (
+          select wiki_pages.id
+          from wiki_pages
+          where wiki_pages.knowledge_base_id = ${scope.upstreamKnowledgeBaseId}
+            and wiki_pages.owner_knowledge_base_id is null
+            and wiki_pages.deleted_at is null
+            and wiki_pages.fork_tombstoned_at is null
+            and not exists (
+              select 1
+              from fork_page_tombstones
+              where fork_page_tombstones.upstream_resource_id = wiki_pages.id
+            )
+          union
+          select wiki_pages.id
+          from wiki_pages
+          where (wiki_pages.knowledge_base_id = ${knowledgeBaseId}
+              or wiki_pages.owner_knowledge_base_id = ${knowledgeBaseId})
+            and wiki_pages.deleted_at is null
+            and wiki_pages.fork_tombstoned_at is null
+        ),
+        fork_edge_tombstones as (
+          select upstream_resource_id
+          from wiki_edges
+          where owner_knowledge_base_id = ${knowledgeBaseId}
+            and fork_tombstoned_at is not null
+            and upstream_resource_id is not null
+        ),
+        visible_edges as (
+          select wiki_edges.id
+          from wiki_edges
+          where wiki_edges.knowledge_base_id = ${scope.upstreamKnowledgeBaseId}
+            and wiki_edges.owner_knowledge_base_id is null
+            and wiki_edges.fork_tombstoned_at is null
+            and exists (select 1 from visible_pages where visible_pages.id = wiki_edges.from_page_id)
+            and exists (select 1 from visible_pages where visible_pages.id = wiki_edges.to_page_id)
+            and not exists (
+              select 1
+              from fork_edge_tombstones
+              where fork_edge_tombstones.upstream_resource_id = wiki_edges.id
+            )
+          union
+          select wiki_edges.id
+          from wiki_edges
+          where (wiki_edges.knowledge_base_id = ${knowledgeBaseId}
+              or wiki_edges.owner_knowledge_base_id = ${knowledgeBaseId})
+            and wiki_edges.fork_tombstoned_at is null
+            and exists (select 1 from visible_pages where visible_pages.id = wiki_edges.from_page_id)
+            and exists (select 1 from visible_pages where visible_pages.id = wiki_edges.to_page_id)
         )
-        values (
-          ${embedding.id},
-          ${embedding.knowledge_base_id},
-          ${embedding.page_id},
-          ${embedding.page_version_id},
-          ${embedding.object_type},
-          ${embedding.object_id},
-          ${embedding.model},
-          ${embedding.dimensions},
-          ${formatPgVector(embedding.vector)}::vector,
-          ${JSON.stringify(metadata)}::jsonb,
-          ${embedding.owner_knowledge_base_id ?? null},
-          ${embedding.visibility_origin ?? "canonical"},
-          ${embedding.upstream_resource_id ?? null},
-          ${embedding.fork_tombstoned_at ?? null}
-        )
+        select count(*) as total
+        from visible_edges
       `.execute(this.db);
+
+      return readSqlCount(result.rows[0]?.total);
     }
+
+    const result = await sql<{ total: string | number | bigint }>`
+      select count(*) as total
+      from wiki_edges
+      where knowledge_base_id = ${knowledgeBaseId}
+        and owner_knowledge_base_id is null
+        and fork_tombstoned_at is null
+    `.execute(this.db);
+
+    return readSqlCount(result.rows[0]?.total);
   }
 
   private async requireChangeSet(changeSetId: string): Promise<ChangeSetRow> {

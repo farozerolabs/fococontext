@@ -218,6 +218,7 @@ export interface RuntimeConfigLimits {
   };
   webhookDelivery: WebhookDeliveryLimits;
   effectiveConcurrency: RuntimeConfigEffectiveConcurrency;
+  backgroundJobs: RuntimeBackgroundJobLimits;
   pressure: RuntimePressureLimits;
 }
 
@@ -274,6 +275,37 @@ export interface RuntimeConfigEffectiveConcurrency {
     visionCaptionImageConcurrency: number;
   };
 }
+
+export type RuntimeBackgroundJobWorkload =
+  | "reindex"
+  | "graphInsights"
+  | "knowledgeCheck"
+  | "sourceWatch"
+  | "ocr"
+  | "mediaCaption"
+  | "cleanup";
+
+export interface RuntimeBackgroundJobWorkloadLimits {
+  batchSize: number;
+  cursorWindowSize: number;
+  checkpointInterval: number;
+  retryBaseDelayMs: number;
+  concurrency: number;
+  source: RuntimeBackgroundJobWorkloadConfigSource;
+}
+
+export interface RuntimeBackgroundJobWorkloadConfigSource {
+  batchSize: string;
+  cursorWindowSize: string;
+  checkpointInterval: string;
+  retryBaseDelayMs: string;
+  concurrency: string;
+}
+
+export type RuntimeBackgroundJobLimits = Record<
+  RuntimeBackgroundJobWorkload,
+  RuntimeBackgroundJobWorkloadLimits
+>;
 
 export type DeletionCleanupRetryBackoff = "fixed" | "exponential";
 export type WebhookDeliveryRetryBackoff = "fixed" | "exponential";
@@ -385,6 +417,14 @@ const maxSourceEvidenceContextChars = 2000;
 const defaultSourceEvidenceBatchMaxItems = 20;
 const defaultSourceEvidenceBatchTotalOutputMaxChars = 40000;
 const defaultAdminSessionTtlSeconds = 7 * 24 * 60 * 60;
+const defaultBackgroundJobBatchSize = 100;
+const defaultBackgroundJobCursorWindowSize = 100;
+const defaultBackgroundJobCheckpointInterval = 1;
+const defaultBackgroundJobRetryBaseDelayMs = 1000;
+const backgroundJobMaxBatchSize = 5000;
+const backgroundJobMaxCursorWindowSize = 10_000;
+const backgroundJobMaxCheckpointInterval = 1000;
+const backgroundJobMaxRetryBaseDelayMs = 300_000;
 
 function readRequired(env: RuntimeEnv, key: (typeof requiredEnvKeys)[number]): string {
   return env[key]?.trim() ?? "";
@@ -491,6 +531,74 @@ function parseOptionalPositiveIntegerInRange(
   return parsed;
 }
 
+function parseOptionalPositiveIntegerWithSource(
+  env: RuntimeEnv,
+  key: string,
+  defaultValue: number,
+  invalid: string[],
+  fallbackSource = "default",
+): { value: number; source: string } {
+  const value = readOptional(env, key);
+
+  if (value === undefined) {
+    return {
+      value: defaultValue,
+      source: fallbackSource,
+    };
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    invalid.push(key);
+
+    return {
+      value: defaultValue,
+      source: fallbackSource,
+    };
+  }
+
+  return {
+    value: parsed,
+    source: key,
+  };
+}
+
+function parseOptionalPositiveIntegerInRangeWithSource(
+  env: RuntimeEnv,
+  key: string,
+  defaultValue: number,
+  min: number,
+  max: number,
+  invalid: string[],
+  fallbackSource = "default",
+): { value: number; source: string } {
+  const value = readOptional(env, key);
+
+  if (value === undefined) {
+    return {
+      value: defaultValue,
+      source: fallbackSource,
+    };
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+    invalid.push(key);
+
+    return {
+      value: defaultValue,
+      source: fallbackSource,
+    };
+  }
+
+  return {
+    value: parsed,
+    source: key,
+  };
+}
+
 function parseOptionalPositiveIntegerOrNull(
   env: RuntimeEnv,
   key: string,
@@ -589,6 +697,69 @@ function parseOptionalWebhookDeliveryRetryBackoff(
 
   invalid.push(key);
   return defaultValue;
+}
+
+function resolveBackgroundJobWorkloadLimits(input: {
+  env: RuntimeEnv;
+  invalid: string[];
+  prefix: string;
+  fallbackConcurrency: number;
+}): RuntimeBackgroundJobWorkloadLimits {
+  const batch = parseOptionalPositiveIntegerInRangeWithSource(
+    input.env,
+    `${input.prefix}_BATCH_SIZE`,
+    defaultBackgroundJobBatchSize,
+    1,
+    backgroundJobMaxBatchSize,
+    input.invalid,
+  );
+  const cursorWindow = parseOptionalPositiveIntegerInRangeWithSource(
+    input.env,
+    `${input.prefix}_CURSOR_WINDOW_SIZE`,
+    defaultBackgroundJobCursorWindowSize,
+    1,
+    backgroundJobMaxCursorWindowSize,
+    input.invalid,
+    batch.source === "default" ? "default" : batch.source,
+  );
+  const checkpointInterval = parseOptionalPositiveIntegerInRangeWithSource(
+    input.env,
+    `${input.prefix}_CHECKPOINT_INTERVAL`,
+    defaultBackgroundJobCheckpointInterval,
+    1,
+    backgroundJobMaxCheckpointInterval,
+    input.invalid,
+  );
+  const retryBaseDelay = parseOptionalPositiveIntegerInRangeWithSource(
+    input.env,
+    `${input.prefix}_RETRY_BASE_DELAY_MS`,
+    defaultBackgroundJobRetryBaseDelayMs,
+    1,
+    backgroundJobMaxRetryBaseDelayMs,
+    input.invalid,
+  );
+  const concurrency = parseOptionalPositiveIntegerWithSource(
+    input.env,
+    `${input.prefix}_CONCURRENCY`,
+    input.fallbackConcurrency,
+    input.invalid,
+    "FOCOCONTEXT_QUEUE_CONCURRENCY",
+  );
+
+  return {
+    batchSize: batch.value,
+    cursorWindowSize: cursorWindow.value,
+    checkpointInterval: checkpointInterval.value,
+    retryBaseDelayMs: retryBaseDelay.value,
+    concurrency: concurrency.value,
+    source: {
+      batchSize: batch.source,
+      cursorWindowSize: cursorWindow.source,
+      checkpointInterval: checkpointInterval.source,
+      retryBaseDelayMs: retryBaseDelay.source,
+      concurrency: concurrency.source,
+    },
+  };
 }
 
 function parseBoolean(env: RuntimeEnv, key: string, invalid: string[]): boolean {
@@ -1237,6 +1408,50 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
           ocrPageConcurrency,
           visionCaptionImageConcurrency,
         },
+      },
+      backgroundJobs: {
+        reindex: resolveBackgroundJobWorkloadLimits({
+          env,
+          invalid,
+          prefix: "BACKGROUND_REINDEX",
+          fallbackConcurrency: queueConcurrency,
+        }),
+        graphInsights: resolveBackgroundJobWorkloadLimits({
+          env,
+          invalid,
+          prefix: "BACKGROUND_GRAPH_INSIGHTS",
+          fallbackConcurrency: wikiMergeConcurrency,
+        }),
+        knowledgeCheck: resolveBackgroundJobWorkloadLimits({
+          env,
+          invalid,
+          prefix: "BACKGROUND_KNOWLEDGE_CHECK",
+          fallbackConcurrency: queueConcurrency,
+        }),
+        sourceWatch: resolveBackgroundJobWorkloadLimits({
+          env,
+          invalid,
+          prefix: "BACKGROUND_SOURCE_WATCH",
+          fallbackConcurrency: sourceWatchConcurrency,
+        }),
+        ocr: resolveBackgroundJobWorkloadLimits({
+          env,
+          invalid,
+          prefix: "BACKGROUND_OCR",
+          fallbackConcurrency: ocrConcurrency,
+        }),
+        mediaCaption: resolveBackgroundJobWorkloadLimits({
+          env,
+          invalid,
+          prefix: "BACKGROUND_MEDIA_CAPTION",
+          fallbackConcurrency: visionCaptionConcurrency,
+        }),
+        cleanup: resolveBackgroundJobWorkloadLimits({
+          env,
+          invalid,
+          prefix: "BACKGROUND_CLEANUP",
+          fallbackConcurrency: deletionCleanupConcurrency,
+        }),
       },
       pressure: {
         uploadDegradedThreshold: uploadLimits.pressureDegradedThreshold,

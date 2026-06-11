@@ -477,6 +477,16 @@ export const zhCNMessages = {
     emptyDescription:
       "入库、重试、OCR、编译、清理和图谱刷新开始后，任务会显示在这里。",
     metadata: "元数据",
+    backgroundOperation: {
+      failed: "失败数",
+      kind: "操作",
+      processedOnly: "已处理 {{processed}}",
+      processedTotal: "{{processed}}/{{total}}",
+      progress: "进度",
+      stage: "阶段",
+      status: "状态",
+      updated: "更新时间",
+    },
     ingestProgressSummary:
       "{{completed}}/{{total}} 个任务已完成 · 阶段平均进度 {{progress}}%",
     loadFailedDescription: "任务加载失败。请重试以重新请求当前页。",
@@ -490,6 +500,7 @@ export const zhCNMessages = {
     viewDetails: "详情",
     section: {
       artifacts: "产物",
+      backgroundOperations: "后台操作",
       caption: "图片说明",
       error: "错误",
       logs: "日志",

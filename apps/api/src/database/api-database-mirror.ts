@@ -2,11 +2,18 @@ import { sql, type Kysely } from "kysely";
 import {
   requireCleanupItemTenantProject,
   requireCleanupOperationTenantProject,
+  createPostgresBackgroundOperationCheckpointRepository,
   requireJobTenantProject,
   requireKnowledgeBaseTenantProject,
+  type BackgroundOperationCheckpointRecord,
+  type BackgroundOperationCheckpointTransitionInput,
+  type CompleteBackgroundOperationCheckpointInput,
+  type CreateBackgroundOperationCheckpointInput,
   requireWebhookTenantProject,
   type DatabaseSchema,
   type DefaultIdentitySeed,
+  type FailBackgroundOperationCheckpointInput,
+  type SaveBackgroundOperationCheckpointProgressInput,
 } from "@fococontext/db";
 
 import type {
@@ -28,6 +35,7 @@ import type {
 import type { WebhookDeliveryRecord, WebhookRecord } from "../webhooks/webhook.types.js";
 
 export const apiDatabaseMirrorToken = Symbol("apiDatabaseMirror");
+export { createNoopApiDatabaseMirror } from "./api-database-mirror.noop.js";
 
 export interface ApiDatabaseMirror {
   saveKnowledgeBase(record: KnowledgeBaseRecord): Promise<void>;
@@ -53,31 +61,21 @@ export interface ApiDatabaseMirror {
   saveWebhook(record: WebhookRecord): Promise<void>;
   saveWebhookDelivery(record: WebhookDeliveryRecord): Promise<void>;
   saveKnowledgeCheck(record: KnowledgeCheckRecord): Promise<void>;
-}
-
-export function createNoopApiDatabaseMirror(): ApiDatabaseMirror {
-  return {
-    async saveKnowledgeBase() {},
-    async updateKnowledgeBase() {},
-    async saveSourceDocument() {},
-    async updateSourceDocument() {},
-    async markSourceDocumentsDeletedForKnowledgeBase() {},
-    async saveUploadSession() {},
-    async updateUploadSession() {},
-    async saveDeletionCleanupOperation() {},
-    async updateDeletionCleanupOperation() {},
-    async saveDeletionCleanupItems() {},
-    async updateDeletionCleanupItem() {},
-    async saveJob() {},
-    async updateJob() {},
-    async appendJobEvent() {},
-    async saveSourceWatchRule() {},
-    async updateSourceWatchRule() {},
-    async saveScheduledImportJob() {},
-    async saveWebhook() {},
-    async saveWebhookDelivery() {},
-    async saveKnowledgeCheck() {},
-  };
+  createOrReuseBackgroundOperationCheckpoint(
+    input: CreateBackgroundOperationCheckpointInput,
+  ): Promise<BackgroundOperationCheckpointRecord>;
+  markBackgroundOperationCheckpointRunning(
+    input: BackgroundOperationCheckpointTransitionInput,
+  ): Promise<BackgroundOperationCheckpointRecord>;
+  saveBackgroundOperationCheckpointProgress(
+    input: SaveBackgroundOperationCheckpointProgressInput,
+  ): Promise<BackgroundOperationCheckpointRecord>;
+  completeBackgroundOperationCheckpoint(
+    input: CompleteBackgroundOperationCheckpointInput,
+  ): Promise<BackgroundOperationCheckpointRecord>;
+  failBackgroundOperationCheckpoint(
+    input: FailBackgroundOperationCheckpointInput,
+  ): Promise<BackgroundOperationCheckpointRecord>;
 }
 
 export function createPostgresApiDatabaseMirror(
@@ -88,10 +86,43 @@ export function createPostgresApiDatabaseMirror(
 }
 
 class PostgresApiDatabaseMirror implements ApiDatabaseMirror {
+  private readonly backgroundOperationCheckpoints =
+    createPostgresBackgroundOperationCheckpointRepository(this.db);
+
   constructor(
     private readonly db: Kysely<DatabaseSchema>,
     private readonly identity: DefaultIdentitySeed,
   ) {}
+
+  async createOrReuseBackgroundOperationCheckpoint(
+    input: CreateBackgroundOperationCheckpointInput,
+  ): Promise<BackgroundOperationCheckpointRecord> {
+    return this.backgroundOperationCheckpoints.createOrReuse(input);
+  }
+
+  async markBackgroundOperationCheckpointRunning(
+    input: BackgroundOperationCheckpointTransitionInput,
+  ): Promise<BackgroundOperationCheckpointRecord> {
+    return this.backgroundOperationCheckpoints.markRunning(input);
+  }
+
+  async saveBackgroundOperationCheckpointProgress(
+    input: SaveBackgroundOperationCheckpointProgressInput,
+  ): Promise<BackgroundOperationCheckpointRecord> {
+    return this.backgroundOperationCheckpoints.saveProgress(input);
+  }
+
+  async completeBackgroundOperationCheckpoint(
+    input: CompleteBackgroundOperationCheckpointInput,
+  ): Promise<BackgroundOperationCheckpointRecord> {
+    return this.backgroundOperationCheckpoints.markCompleted(input);
+  }
+
+  async failBackgroundOperationCheckpoint(
+    input: FailBackgroundOperationCheckpointInput,
+  ): Promise<BackgroundOperationCheckpointRecord> {
+    return this.backgroundOperationCheckpoints.markFailed(input);
+  }
 
   async saveKnowledgeBase(record: KnowledgeBaseRecord): Promise<void> {
     await sql`

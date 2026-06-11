@@ -64,6 +64,7 @@ export const resourceIdPrefixes = {
   datasetConfiguration: "kbcfg_",
   datasetConfigurationSnapshot: "kbcfgs_",
   cleanupOperation: "cleanup_",
+  backgroundOperation: "bgop_",
 } as const;
 
 export const webhookEventTypes = [

@@ -19,6 +19,8 @@ import type {
   BatchIngestJobStatusInput,
   BatchIngestJobStatusResponse,
   BatchIngestJobStatusResultResponse,
+  BackgroundOperationRecord,
+  BackgroundOperationResponse,
   JobDetailResponse,
   JobEventRecord,
   JobEventResponse,
@@ -80,9 +82,18 @@ export class JobService {
         const eventsByJobId = await this.operationalReadStore.listJobEventsByJobIds(
           jobs.map((job) => job.id),
         );
+        const operationsByJobId = await this.operationalReadStore.listBackgroundOperationsByJobIds(
+          jobs.map((job) => job.id),
+        );
 
         return {
-          items: jobs.map((job) => this.toJobDetailResponse(job, eventsByJobId.get(job.id) ?? [])),
+          items: jobs.map((job) =>
+            this.toJobDetailResponse(
+              job,
+              eventsByJobId.get(job.id) ?? [],
+              operationsByJobId.get(job.id) ?? [],
+            ),
+          ),
           page: input.page,
           pageSize: input.pageSize,
           total: dbResult.total,
@@ -99,7 +110,11 @@ export class JobService {
   async get(jobId: string, scope?: ApiResourceScope): Promise<JobDetailResponse> {
     const job = await this.reconcileSourceParseState(await this.requireJob(jobId, scope));
 
-    return this.toJobDetailResponse(job, await this.getJobEvents(job.id));
+    return this.toJobDetailResponse(
+      job,
+      await this.getJobEvents(job.id),
+      await this.getBackgroundOperations(job.id),
+    );
   }
 
   async batch(
@@ -155,6 +170,9 @@ export class JobService {
     const eventsByJobId = await this.operationalReadStore.listJobEventsByJobIds(
       resolved.flatMap((item) => (item.status === "resolved" ? [item.job.id] : [])),
     );
+    const operationsByJobId = await this.operationalReadStore.listBackgroundOperationsByJobIds(
+      resolved.flatMap((item) => (item.status === "resolved" ? [item.job.id] : [])),
+    );
     const items = resolved.map((item): BatchIngestJobStatusResultResponse => {
       if (item.status === "error") {
         return item;
@@ -164,7 +182,11 @@ export class JobService {
         index: item.index,
         job_id: item.job_id,
         status: "resolved",
-        job: this.toJobDetailResponse(item.job, eventsByJobId.get(item.job.id) ?? []),
+        job: this.toJobDetailResponse(
+          item.job,
+          eventsByJobId.get(item.job.id) ?? [],
+          operationsByJobId.get(item.job.id) ?? [],
+        ),
       };
     });
 
@@ -234,7 +256,11 @@ export class JobService {
     const job = await this.requireJob(jobId, scope);
 
     if (job.status === "canceled") {
-      return this.toJobDetailResponse(job, await this.getJobEvents(job.id));
+      return this.toJobDetailResponse(
+        job,
+        await this.getJobEvents(job.id),
+        await this.getBackgroundOperations(job.id),
+      );
     }
     if (job.status === "completed") {
       throw new ApiError("invalid_request", {
@@ -266,7 +292,11 @@ export class JobService {
     await this.databaseMirror.updateJob(updated);
     await this.databaseMirror.appendJobEvent(event);
 
-    return this.toJobDetailResponse(updated, await this.getJobEvents(updated.id));
+    return this.toJobDetailResponse(
+      updated,
+      await this.getJobEvents(updated.id),
+      await this.getBackgroundOperations(updated.id),
+    );
   }
 
   async retry(jobId: string, scope?: ApiResourceScope): Promise<JobDetailResponse> {
@@ -356,7 +386,11 @@ export class JobService {
       ...(scope === undefined ? {} : { scope }),
     });
 
-    return this.toJobDetailResponse(retried, await this.getJobEvents(retried.id));
+    return this.toJobDetailResponse(
+      retried,
+      await this.getJobEvents(retried.id),
+      await this.getBackgroundOperations(retried.id),
+    );
   }
 
   private async requireRetryDocument(
@@ -476,9 +510,11 @@ export class JobService {
   private toJobDetailResponse(
     job: JobRecord,
     events: readonly JobEventRecord[],
+    backgroundOperations: readonly BackgroundOperationRecord[] = [],
   ): JobDetailResponse {
     return {
       ...toJobResponse(job),
+      background_operations: backgroundOperations.map(toBackgroundOperationResponse),
       events: normalizeJobTimelineEvents(events).map(toJobEventResponse),
     };
   }
@@ -487,6 +523,16 @@ export class JobService {
     const eventsByJobId = await this.operationalReadStore.listJobEventsByJobIds([jobId]);
 
     return eventsByJobId.get(jobId) ?? [];
+  }
+
+  private async getBackgroundOperations(
+    jobId: string,
+  ): Promise<readonly BackgroundOperationRecord[]> {
+    const operationsByJobId = await this.operationalReadStore.listBackgroundOperationsByJobIds([
+      jobId,
+    ]);
+
+    return operationsByJobId.get(jobId) ?? [];
   }
 }
 
@@ -619,6 +665,31 @@ function toJobEventResponse(record: JobEventRecord): JobEventResponse {
     message: record.message,
     metadata: JSON.parse(JSON.stringify(record.metadata)) as Record<string, unknown>,
     created_at: record.createdAt,
+  };
+}
+
+function toBackgroundOperationResponse(
+  record: BackgroundOperationRecord,
+): BackgroundOperationResponse {
+  return {
+    id: record.id,
+    job_id: record.jobId,
+    knowledge_base_id: record.knowledgeBaseId,
+    operation_kind: record.operationKind,
+    stage: record.stage,
+    status: record.status,
+    cursor: JSON.parse(JSON.stringify(record.cursor)) as Record<string, unknown>,
+    processed_count: record.processedCount,
+    failed_count: record.failedCount,
+    total_count: record.totalCount,
+    last_item_id: record.lastItemId,
+    safe_error:
+      record.safeError === null
+        ? null
+        : (JSON.parse(JSON.stringify(record.safeError)) as Record<string, unknown>),
+    metadata: JSON.parse(JSON.stringify(record.metadata)) as Record<string, unknown>,
+    created_at: record.createdAt,
+    updated_at: record.updatedAt,
   };
 }
 

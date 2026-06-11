@@ -240,7 +240,7 @@ export class BullMqMediaCaptionWorker {
 
 export function createMediaCaptionWorkerOptions(config: RuntimeConfig) {
   return {
-    concurrency: config.limits.visionCaption.concurrency,
+    concurrency: config.limits.backgroundJobs.mediaCaption.concurrency,
     connection: {
       url: config.redis.url,
     },

@@ -227,7 +227,44 @@ export interface JobEventResponse {
   created_at: string;
 }
 
+export interface BackgroundOperationRecord {
+  id: string;
+  jobId: string | null;
+  knowledgeBaseId: string | null;
+  operationKind: string;
+  stage: string;
+  status: string;
+  cursor: Record<string, unknown>;
+  processedCount: number;
+  failedCount: number;
+  totalCount: number | null;
+  lastItemId: string | null;
+  safeError: Record<string, unknown> | null;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface BackgroundOperationResponse {
+  id: string;
+  job_id: string | null;
+  knowledge_base_id: string | null;
+  operation_kind: string;
+  stage: string;
+  status: string;
+  cursor: Record<string, unknown>;
+  processed_count: number;
+  failed_count: number;
+  total_count: number | null;
+  last_item_id: string | null;
+  safe_error: Record<string, unknown> | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface JobDetailResponse extends JobResponse {
+  background_operations: readonly BackgroundOperationResponse[];
   events: readonly JobEventResponse[];
 }
 

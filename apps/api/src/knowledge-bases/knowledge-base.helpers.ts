@@ -204,6 +204,7 @@ export function toJobDetailResponse(
         : (JSON.parse(JSON.stringify(record.error)) as Record<string, unknown>),
     created_at: record.createdAt,
     updated_at: record.updatedAt,
+    background_operations: [],
     events: events.map((event) => ({
       type: event.type,
       stage: event.stage,

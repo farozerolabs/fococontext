@@ -1,7 +1,7 @@
 import { Queue, Worker } from "bullmq";
 import { sql, type Kysely } from "kysely";
 import type { RuntimeConfig } from "@fococontext/core";
-import type { DatabaseSchema } from "@fococontext/db";
+import { writeIdempotentBatches, type DatabaseSchema } from "@fococontext/db";
 import {
   applyPdfOcrResults,
   isRetryableOcrProviderError,
@@ -197,7 +197,7 @@ export class BullMqSourceOcrWorker {
 
 export function createSourceOcrWorkerOptions(config: RuntimeConfig) {
   return {
-    concurrency: config.limits.ocr.concurrency,
+    concurrency: config.limits.backgroundJobs.ocr.concurrency,
     connection: {
       url: config.redis.url,
     },
@@ -661,7 +661,14 @@ export class SourceOcrProcessor {
 }
 
 export class PostgresSourceOcrRepository implements SourceOcrRepository {
-  constructor(private readonly db: Kysely<DatabaseSchema>) {}
+  private readonly writeBatchSize: number;
+
+  constructor(
+    private readonly db: Kysely<DatabaseSchema>,
+    options: { writeBatchSize?: number } = {},
+  ) {
+    this.writeBatchSize = Math.max(1, Math.floor(options.writeBatchSize ?? 100));
+  }
 
   async getParsedContentContext(
     parsedContentId: string,
@@ -711,166 +718,31 @@ export class PostgresSourceOcrRepository implements SourceOcrRepository {
       `.execute(this.db);
     }
 
-    for (const artifact of input.artifacts) {
-      await sql`
-        insert into ocr_artifacts (
-          id,
-          source_document_id,
-          parsed_content_id,
-          job_id,
-          page_number,
-          artifact_kind,
-          object_key,
-          mime_type,
-          size_bytes,
-          sha256,
-          metadata
-        )
-        values (
-          ${artifact.id},
-          ${input.documentId},
-          ${input.parsedContentId},
-          ${input.jobId},
-          ${artifact.pageNumber},
-          'rendered_page_image',
-          ${artifact.objectKey},
-          ${artifact.mimeType},
-          ${artifact.sizeBytes},
-          ${artifact.sha256},
-          '{}'::jsonb
-        )
-        on conflict (id) do update set
-          object_key = excluded.object_key,
-          mime_type = excluded.mime_type,
-          size_bytes = excluded.size_bytes,
-          sha256 = excluded.sha256,
-          metadata = excluded.metadata
-      `.execute(this.db);
-    }
+    await writeIdempotentBatches({
+      batchSize: this.writeBatchSize,
+      getIdempotencyKey: (artifact) => artifact.id,
+      items: input.artifacts,
+      writeBatch: async (artifacts) => {
+        for (const artifact of artifacts) {
+          await this.upsertOcrArtifact(input, artifact);
+        }
 
-    for (const page of input.pages) {
-      const pageStatusId = createOcrPageStatusId(input.documentId, page.pageNumber);
+        return { written: artifacts.length };
+      },
+    });
 
-      await sql`
-        insert into ocr_page_statuses (
-          id,
-          source_document_id,
-          parsed_content_id,
-          job_id,
-          page_number,
-          status,
-          reason,
-          provider_name,
-          engine,
-          model_version,
-          confidence_avg,
-          block_count,
-          attempt_count,
-          retryable,
-          error,
-          warnings,
-          metadata,
-          updated_at
-        )
-        values (
-          ${pageStatusId},
-          ${input.documentId},
-          ${input.parsedContentId},
-          ${input.jobId},
-          ${page.pageNumber},
-          ${page.status},
-          ${page.reason},
-          ${page.providerName},
-          ${page.engine},
-          ${page.modelVersion},
-          ${page.confidenceAvg},
-          ${page.blocks.length},
-          ${page.attemptCount},
-          ${page.retryable},
-          ${page.error === null ? null : JSON.stringify(page.error)}::jsonb,
-          ${JSON.stringify(page.warnings)}::jsonb,
-          ${JSON.stringify({ source_artifact_id: page.artifactId ?? null })}::jsonb,
-          ${input.completedAt}
-        )
-        on conflict (source_document_id, page_number) do update set
-          parsed_content_id = excluded.parsed_content_id,
-          job_id = excluded.job_id,
-          status = excluded.status,
-          reason = excluded.reason,
-          provider_name = excluded.provider_name,
-          engine = excluded.engine,
-          model_version = excluded.model_version,
-          confidence_avg = excluded.confidence_avg,
-          block_count = excluded.block_count,
-          attempt_count = excluded.attempt_count,
-          retryable = excluded.retryable,
-          error = excluded.error,
-          warnings = excluded.warnings,
-          metadata = excluded.metadata,
-          updated_at = excluded.updated_at
-      `.execute(this.db);
+    await writeIdempotentBatches({
+      batchSize: this.writeBatchSize,
+      getIdempotencyKey: (page) => String(page.pageNumber),
+      items: input.pages,
+      writeBatch: async (pages) => {
+        for (const page of pages) {
+          await this.upsertOcrPage(input, page);
+        }
 
-      for (const block of page.blocks) {
-        const blockId = createOcrBlockId(input.documentId, page.pageNumber, block.blockIndex);
-
-        await sql`
-          insert into ocr_blocks (
-            id,
-            ocr_page_status_id,
-            source_document_id,
-            parsed_content_id,
-            source_artifact_id,
-            page_number,
-            block_index,
-            text,
-            confidence,
-            bbox,
-            language,
-            provider_name,
-            engine,
-            model_version,
-            locator
-          )
-          values (
-            ${blockId},
-            ${pageStatusId},
-            ${input.documentId},
-            ${input.parsedContentId},
-            ${page.artifactId ?? null},
-            ${page.pageNumber},
-            ${block.blockIndex},
-            ${block.text},
-            ${block.confidence ?? null},
-            ${block.bbox === undefined ? null : JSON.stringify(block.bbox)}::jsonb,
-            ${block.language ?? null},
-            ${block.provider},
-            ${block.engine},
-            ${block.modelVersion ?? null},
-            ${JSON.stringify({
-              block_id: blockId,
-              block_index: block.blockIndex,
-              kind: "page",
-              origin: "ocr",
-              page_number: page.pageNumber,
-              source_artifact_id: page.artifactId ?? null,
-              value: String(page.pageNumber),
-            })}::jsonb
-          )
-          on conflict (source_document_id, page_number, block_index) do update set
-            ocr_page_status_id = excluded.ocr_page_status_id,
-            parsed_content_id = excluded.parsed_content_id,
-            source_artifact_id = excluded.source_artifact_id,
-            text = excluded.text,
-            confidence = excluded.confidence,
-            bbox = excluded.bbox,
-            language = excluded.language,
-            provider_name = excluded.provider_name,
-            engine = excluded.engine,
-            model_version = excluded.model_version,
-            locator = excluded.locator
-        `.execute(this.db);
-      }
-    }
+        return { written: pages.length };
+      },
+    });
 
     await sql`
       update parsed_contents
@@ -895,6 +767,173 @@ export class PostgresSourceOcrRepository implements SourceOcrRepository {
         updated_at = ${input.completedAt}
       where id = ${input.documentId}
     `.execute(this.db);
+  }
+
+  private async upsertOcrArtifact(
+    input: SourceOcrSaveResultInput,
+    artifact: SourceOcrArtifactWrite,
+  ): Promise<void> {
+    await sql`
+      insert into ocr_artifacts (
+        id,
+        source_document_id,
+        parsed_content_id,
+        job_id,
+        page_number,
+        artifact_kind,
+        object_key,
+        mime_type,
+        size_bytes,
+        sha256,
+        metadata
+      )
+      values (
+        ${artifact.id},
+        ${input.documentId},
+        ${input.parsedContentId},
+        ${input.jobId},
+        ${artifact.pageNumber},
+        'rendered_page_image',
+        ${artifact.objectKey},
+        ${artifact.mimeType},
+        ${artifact.sizeBytes},
+        ${artifact.sha256},
+        '{}'::jsonb
+      )
+      on conflict (id) do update set
+        object_key = excluded.object_key,
+        mime_type = excluded.mime_type,
+        size_bytes = excluded.size_bytes,
+        sha256 = excluded.sha256,
+        metadata = excluded.metadata
+    `.execute(this.db);
+  }
+
+  private async upsertOcrPage(
+    input: SourceOcrSaveResultInput,
+    page: SourceOcrPageWrite,
+  ): Promise<void> {
+    const pageStatusId = createOcrPageStatusId(input.documentId, page.pageNumber);
+
+    await sql`
+      insert into ocr_page_statuses (
+        id,
+        source_document_id,
+        parsed_content_id,
+        job_id,
+        page_number,
+        status,
+        reason,
+        provider_name,
+        engine,
+        model_version,
+        confidence_avg,
+        block_count,
+        attempt_count,
+        retryable,
+        error,
+        warnings,
+        metadata,
+        updated_at
+      )
+      values (
+        ${pageStatusId},
+        ${input.documentId},
+        ${input.parsedContentId},
+        ${input.jobId},
+        ${page.pageNumber},
+        ${page.status},
+        ${page.reason},
+        ${page.providerName},
+        ${page.engine},
+        ${page.modelVersion},
+        ${page.confidenceAvg},
+        ${page.blocks.length},
+        ${page.attemptCount},
+        ${page.retryable},
+        ${page.error === null ? null : JSON.stringify(page.error)}::jsonb,
+        ${JSON.stringify(page.warnings)}::jsonb,
+        ${JSON.stringify({ source_artifact_id: page.artifactId ?? null })}::jsonb,
+        ${input.completedAt}
+      )
+      on conflict (source_document_id, page_number) do update set
+        parsed_content_id = excluded.parsed_content_id,
+        job_id = excluded.job_id,
+        status = excluded.status,
+        reason = excluded.reason,
+        provider_name = excluded.provider_name,
+        engine = excluded.engine,
+        model_version = excluded.model_version,
+        confidence_avg = excluded.confidence_avg,
+        block_count = excluded.block_count,
+        attempt_count = excluded.attempt_count,
+        retryable = excluded.retryable,
+        error = excluded.error,
+        warnings = excluded.warnings,
+        metadata = excluded.metadata,
+        updated_at = excluded.updated_at
+    `.execute(this.db);
+
+    for (const block of page.blocks) {
+      const blockId = createOcrBlockId(input.documentId, page.pageNumber, block.blockIndex);
+
+      await sql`
+        insert into ocr_blocks (
+          id,
+          ocr_page_status_id,
+          source_document_id,
+          parsed_content_id,
+          source_artifact_id,
+          page_number,
+          block_index,
+          text,
+          confidence,
+          bbox,
+          language,
+          provider_name,
+          engine,
+          model_version,
+          locator
+        )
+        values (
+          ${blockId},
+          ${pageStatusId},
+          ${input.documentId},
+          ${input.parsedContentId},
+          ${page.artifactId ?? null},
+          ${page.pageNumber},
+          ${block.blockIndex},
+          ${block.text},
+          ${block.confidence ?? null},
+          ${block.bbox === undefined ? null : JSON.stringify(block.bbox)}::jsonb,
+          ${block.language ?? null},
+          ${block.provider},
+          ${block.engine},
+          ${block.modelVersion ?? null},
+          ${JSON.stringify({
+            block_id: blockId,
+            block_index: block.blockIndex,
+            kind: "page",
+            origin: "ocr",
+            page_number: page.pageNumber,
+            source_artifact_id: page.artifactId ?? null,
+            value: String(page.pageNumber),
+          })}::jsonb
+        )
+        on conflict (source_document_id, page_number, block_index) do update set
+          ocr_page_status_id = excluded.ocr_page_status_id,
+          parsed_content_id = excluded.parsed_content_id,
+          source_artifact_id = excluded.source_artifact_id,
+          text = excluded.text,
+          confidence = excluded.confidence,
+          bbox = excluded.bbox,
+          language = excluded.language,
+          provider_name = excluded.provider_name,
+          engine = excluded.engine,
+          model_version = excluded.model_version,
+          locator = excluded.locator
+      `.execute(this.db);
+    }
   }
 }
 

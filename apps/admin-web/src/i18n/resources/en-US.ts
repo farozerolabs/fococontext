@@ -498,6 +498,16 @@ export const enUSMessages = {
     emptyDescription:
       "Ingest, retry, OCR, compile, cleanup, and graph refresh jobs appear here after work starts.",
     metadata: "Metadata",
+    backgroundOperation: {
+      failed: "Failed",
+      kind: "Operation",
+      processedOnly: "{{processed}} processed",
+      processedTotal: "{{processed}}/{{total}}",
+      progress: "Progress",
+      stage: "Stage",
+      status: "Status",
+      updated: "Updated",
+    },
     ingestProgressSummary:
       "{{completed}}/{{total}} jobs completed · {{progress}}% stage-average progress",
     loadFailedDescription:
@@ -513,6 +523,7 @@ export const enUSMessages = {
     section: {
       artifacts: "Artifacts",
       caption: "Caption",
+      backgroundOperations: "Background operations",
       error: "Error",
       logs: "Logs",
       ocr: "OCR",

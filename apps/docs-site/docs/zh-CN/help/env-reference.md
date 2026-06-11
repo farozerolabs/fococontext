@@ -240,33 +240,40 @@ Rerank 使用全有或全无配置规则。所有 `RERANK_*` 都留空时禁用 
 
 ## 队列、编译和 Retrieve
 
-| 字段                                           | 说明                  | 建议值                                 |
-| ---------------------------------------------- | --------------------- | -------------------------------------- |
-| `FOCOCONTEXT_QUEUE_CONCURRENCY`                | 默认队列并发          | 默认 `2`                               |
-| `BATCH_IMPORT_CONCURRENCY`                     | 批量导入并发          | 默认 `2`                               |
-| `SOURCE_WATCH_SCAN_CONCURRENCY`                | Source Watch 扫描并发 | 默认 `2`                               |
-| `SOURCE_WATCH_SCHEDULER_ENABLED`               | 是否启用定时扫描      | 默认 `true`                            |
-| `SOURCE_WATCH_SCAN_INTERVAL_SECONDS`           | 定时扫描间隔          | 默认 `3600`                            |
-| `SOURCE_WATCH_SCAN_MAX_RETRIES`                | 扫描失败重试次数      | 默认 `2`                               |
-| `SOURCE_WATCH_SCAN_RETRY_BASE_DELAY_MS`        | 扫描重试基础延迟      | 默认 `1000`                            |
-| `WIKI_ANALYZE_CONCURRENCY`                     | 分析阶段并发          | 默认 `2`；受 Chat provider 限流影响    |
-| `WIKI_GENERATE_CONCURRENCY`                    | 生成阶段并发          | 默认 `2`                               |
-| `WIKI_MERGE_CONCURRENCY`                       | 合并阶段并发          | 默认 `2`                               |
-| `COMPILE_MAX_CONTEXT_CHARS`                    | 编译 prompt 字符预算  | 默认 `24000`；大文档可按模型上下文调高 |
-| `RETRIEVE_DEFAULT_TOP_K`                       | 默认候选数            | 默认 `10`                              |
-| `RETRIEVE_MAX_TOP_K`                           | 最大候选数            | 默认 `20`                              |
-| `RETRIEVE_DEFAULT_GRAPH_DEPTH`                 | 默认图谱深度          | 默认 `1`                               |
-| `RETRIEVE_MAX_GRAPH_DEPTH`                     | 最大图谱深度          | 默认 `3`                               |
-| `RETRIEVE_DEFAULT_GRAPH_LIMIT_PER_RESULT`      | 每结果默认图谱扩展数  | 默认 `5`                               |
-| `RETRIEVE_MAX_GRAPH_LIMIT_PER_RESULT`          | 每结果最大图谱扩展数  | 默认 `10`                              |
-| `RETRIEVE_DEFAULT_CONTEXT_BUDGET_TOKENS`       | 默认上下文预算        | 默认 `4000`                            |
-| `RETRIEVE_MAX_CONTEXT_BUDGET_TOKENS`           | 最大上下文预算        | 默认 `12000`                           |
-| `SOURCE_EVIDENCE_DEFAULT_MAX_CHARS`            | 默认资料证据文本上限  | 默认 `4000`                            |
-| `SOURCE_EVIDENCE_MAX_CHARS`                    | 最大资料证据文本上限  | 默认 `12000`                           |
-| `SOURCE_EVIDENCE_DEFAULT_CONTEXT_CHARS`        | 默认资料证据上下文    | 默认 `800`                             |
-| `SOURCE_EVIDENCE_MAX_CONTEXT_CHARS`            | 最大资料证据上下文    | 默认 `2000`                            |
-| `SOURCE_EVIDENCE_BATCH_MAX_ITEMS`              | 批量证据最大条数      | 默认 `20`                              |
-| `SOURCE_EVIDENCE_BATCH_TOTAL_OUTPUT_MAX_CHARS` | 批量证据总输出上限    | 默认 `40000`                           |
+| 字段                                           | 说明                  | 建议值                                                                      |
+| ---------------------------------------------- | --------------------- | --------------------------------------------------------------------------- |
+| `FOCOCONTEXT_QUEUE_CONCURRENCY`                | 默认队列并发          | 默认 `2`                                                                    |
+| `BATCH_IMPORT_CONCURRENCY`                     | 批量导入并发          | 默认 `2`                                                                    |
+| `SOURCE_WATCH_SCAN_CONCURRENCY`                | Source Watch 扫描并发 | 默认 `2`                                                                    |
+| `BACKGROUND_REINDEX_*`                         | 重建索引后台控制      | 批大小、游标窗口、checkpoint 间隔、重试延迟和并发                           |
+| `BACKGROUND_GRAPH_INSIGHTS_*`                  | 图谱洞察刷新控制      | 批大小、游标窗口、checkpoint 间隔、重试延迟和并发                           |
+| `BACKGROUND_KNOWLEDGE_CHECK_*`                 | Knowledge Check 控制  | 批大小、游标窗口、checkpoint 间隔、重试延迟和并发                           |
+| `BACKGROUND_SOURCE_WATCH_*`                    | Source Watch 后台控制 | 批大小、游标窗口、checkpoint 间隔、重试延迟和并发                           |
+| `BACKGROUND_OCR_*`                             | OCR 后台 worker 控制  | worker 批处理和 checkpoint；页级处理使用 `OCR_PAGE_CONCURRENCY`             |
+| `BACKGROUND_MEDIA_CAPTION_*`                   | 媒体 caption 后台控制 | worker 批处理和 checkpoint；图片调用使用 `VISION_CAPTION_IMAGE_CONCURRENCY` |
+| `BACKGROUND_CLEANUP_*`                         | 清理后台控制          | 批大小、游标窗口、checkpoint 间隔、重试延迟和并发                           |
+| `SOURCE_WATCH_SCHEDULER_ENABLED`               | 是否启用定时扫描      | 默认 `true`                                                                 |
+| `SOURCE_WATCH_SCAN_INTERVAL_SECONDS`           | 定时扫描间隔          | 默认 `3600`                                                                 |
+| `SOURCE_WATCH_SCAN_MAX_RETRIES`                | 扫描失败重试次数      | 默认 `2`                                                                    |
+| `SOURCE_WATCH_SCAN_RETRY_BASE_DELAY_MS`        | 扫描重试基础延迟      | 默认 `1000`                                                                 |
+| `WIKI_ANALYZE_CONCURRENCY`                     | 分析阶段并发          | 默认 `2`；受 Chat provider 限流影响                                         |
+| `WIKI_GENERATE_CONCURRENCY`                    | 生成阶段并发          | 默认 `2`                                                                    |
+| `WIKI_MERGE_CONCURRENCY`                       | 合并阶段并发          | 默认 `2`                                                                    |
+| `COMPILE_MAX_CONTEXT_CHARS`                    | 编译 prompt 字符预算  | 默认 `24000`；大文档可按模型上下文调高                                      |
+| `RETRIEVE_DEFAULT_TOP_K`                       | 默认候选数            | 默认 `10`                                                                   |
+| `RETRIEVE_MAX_TOP_K`                           | 最大候选数            | 默认 `20`                                                                   |
+| `RETRIEVE_DEFAULT_GRAPH_DEPTH`                 | 默认图谱深度          | 默认 `1`                                                                    |
+| `RETRIEVE_MAX_GRAPH_DEPTH`                     | 最大图谱深度          | 默认 `3`                                                                    |
+| `RETRIEVE_DEFAULT_GRAPH_LIMIT_PER_RESULT`      | 每结果默认图谱扩展数  | 默认 `5`                                                                    |
+| `RETRIEVE_MAX_GRAPH_LIMIT_PER_RESULT`          | 每结果最大图谱扩展数  | 默认 `10`                                                                   |
+| `RETRIEVE_DEFAULT_CONTEXT_BUDGET_TOKENS`       | 默认上下文预算        | 默认 `4000`                                                                 |
+| `RETRIEVE_MAX_CONTEXT_BUDGET_TOKENS`           | 最大上下文预算        | 默认 `12000`                                                                |
+| `SOURCE_EVIDENCE_DEFAULT_MAX_CHARS`            | 默认资料证据文本上限  | 默认 `4000`                                                                 |
+| `SOURCE_EVIDENCE_MAX_CHARS`                    | 最大资料证据文本上限  | 默认 `12000`                                                                |
+| `SOURCE_EVIDENCE_DEFAULT_CONTEXT_CHARS`        | 默认资料证据上下文    | 默认 `800`                                                                  |
+| `SOURCE_EVIDENCE_MAX_CONTEXT_CHARS`            | 最大资料证据上下文    | 默认 `2000`                                                                 |
+| `SOURCE_EVIDENCE_BATCH_MAX_ITEMS`              | 批量证据最大条数      | 默认 `20`                                                                   |
+| `SOURCE_EVIDENCE_BATCH_TOTAL_OUTPUT_MAX_CHARS` | 批量证据总输出上限    | 默认 `40000`                                                                |
 
 ## Webhook
 

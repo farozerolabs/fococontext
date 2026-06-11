@@ -20,10 +20,7 @@ import {
   type DeletionCleanupQueue,
 } from "../queues/deletion-cleanup.queue.js";
 import type { JobDetailResponse, JobEventRecord, JobRecord } from "../documents/document.types.js";
-import {
-  retrievalEmbeddingProviderToken,
-  type ApiRetrievalEmbeddingProvider,
-} from "../retrieve/retrieve.provider.js";
+import { reindexQueueToken, type ReindexQueue } from "../queues/reindex.queue.js";
 import { wikiStoreToken, type WikiPageApiRecord, type WikiStore } from "../wiki/wiki-store.js";
 import {
   findKnowledgeBaseTemplate,
@@ -36,7 +33,6 @@ import {
 } from "./knowledge-base.operational-read.js";
 import {
   cloneJsonObject,
-  createCompletedIndexJobEvent,
   createDatasetConfigurationRecord,
   createDatasetConfigurationValues,
   createInitialSystemPages,
@@ -89,6 +85,9 @@ import type {
 
 const defaultTemplate: KnowledgeBaseTemplate = "general";
 const defaultOutputLanguage: KnowledgeBaseOutputLanguage = "auto";
+const reindexJobType = "retrieval.reindex";
+const queuedReindexMessage = "Queued retrieval index rebuild.";
+const failedReindexMessage = "Retrieval index rebuild could not be queued.";
 
 @Injectable()
 export class KnowledgeBaseService {
@@ -96,11 +95,11 @@ export class KnowledgeBaseService {
     @Inject(apiDatabaseMirrorToken) private readonly databaseMirror: ApiDatabaseMirror,
     @Inject(operationalReadStoreToken) private readonly operationalReadStore: OperationalReadStore,
     @Inject(wikiStoreToken) private readonly wikiStore: WikiStore,
-    @Inject(retrievalEmbeddingProviderToken)
-    private readonly embeddingProvider: ApiRetrievalEmbeddingProvider,
     @Inject(runtimeConfigToken) private readonly runtimeConfig: RuntimeConfig,
     @Inject(deletionCleanupQueueToken)
     private readonly deletionCleanupQueue: DeletionCleanupQueue,
+    @Inject(reindexQueueToken)
+    private readonly reindexQueue: ReindexQueue,
   ) {}
 
   async create(
@@ -807,23 +806,20 @@ export class KnowledgeBaseService {
   ): Promise<JobDetailResponse> {
     const record = await this.requireActiveRecord(id, scope);
     const now = new Date().toISOString();
-    const indexStats = await this.wikiStore.rebuildRetrievalIndex(
-      record.id,
-      this.embeddingProvider,
-    );
     const job: JobRecord = {
       id: createResourceId("ingestJob"),
       knowledgeBaseId: record.id,
       documentId: null,
+      jobType: reindexJobType,
       stage: "indexing",
-      status: "completed",
-      progress: 100,
-      progressMessage: "Indexes rebuilt.",
+      status: "queued",
+      progress: 5,
+      progressMessage: queuedReindexMessage,
       contentHash: `reindex:${record.id}:${record.currentVersionId}`,
       idempotencyKey: null,
       deduped: false,
       lockedByKnowledgeBaseId: record.id,
-      inputSnapshotId: record.currentVersionId,
+      inputSnapshotId: record.currentVersionId ?? record.id,
       retryOfJobId: null,
       parsedContentId: null,
       changeSetId: null,
@@ -831,11 +827,41 @@ export class KnowledgeBaseService {
       createdAt: now,
       updatedAt: now,
     };
-    const event = createCompletedIndexJobEvent(job, indexStats);
+    const event = createReindexJobEvent(job, {
+      requested_knowledge_version_id: record.currentVersionId,
+    });
     const events = [event];
 
     await this.databaseMirror.saveJob(job);
     await this.databaseMirror.appendJobEvent(event);
+
+    try {
+      await this.reindexQueue.enqueueReindexJob({
+        job_id: job.id,
+        knowledge_base_id: record.id,
+        requested_knowledge_version_id: record.currentVersionId,
+      });
+    } catch (error) {
+      const failed: JobRecord = {
+        ...job,
+        status: "failed",
+        progressMessage: failedReindexMessage,
+        error: {
+          code: "retrieval_reindex_enqueue_failed",
+          message: error instanceof Error ? error.message : "Unknown queue enqueue error.",
+          retryable: true,
+        },
+        updatedAt: new Date().toISOString(),
+      };
+      const failedEvent = createReindexJobEvent(failed, {
+        requested_knowledge_version_id: record.currentVersionId,
+      });
+
+      await this.databaseMirror.updateJob(failed);
+      await this.databaseMirror.appendJobEvent(failedEvent);
+
+      return toJobDetailResponse(failed, [event, failedEvent]);
+    }
 
     return toJobDetailResponse(job, events);
   }
@@ -1112,4 +1138,20 @@ export class KnowledgeBaseService {
       (operation) => operation.targetType === "knowledge_base" && operation.targetId === id,
     );
   }
+}
+
+function createReindexJobEvent(job: JobRecord, metadata: Record<string, unknown>): JobEventRecord {
+  return {
+    jobId: job.id,
+    type: job.status === "failed" ? "job.failed" : "job.queued",
+    stage: job.stage,
+    status: job.status,
+    message: job.progressMessage,
+    metadata: {
+      ...metadata,
+      job_type: reindexJobType,
+      rebuild_kind: "retrieval_index",
+    },
+    createdAt: job.updatedAt,
+  };
 }

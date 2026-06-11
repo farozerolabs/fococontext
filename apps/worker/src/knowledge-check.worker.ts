@@ -3,8 +3,24 @@ import { randomUUID } from "node:crypto";
 import { Worker } from "bullmq";
 import { sql, type Kysely } from "kysely";
 import type { RuntimeConfig } from "@fococontext/core";
-import type { DatabaseSchema } from "@fococontext/db";
+import {
+  type BackgroundOperationCheckpointRepository,
+  type DatabaseSchema,
+  createDescendingStableIdTimeCursorPredicate,
+  createStableIdTimeCursor,
+  requireKnowledgeBaseTenantProject,
+  type StableIdTimeCursor,
+  type TenantProjectScope,
+} from "@fococontext/db";
 
+import {
+  createOrReuseKnowledgeCheckCheckpoint,
+  markKnowledgeCheckCheckpointCompleted,
+  markKnowledgeCheckCheckpointFailed,
+  markKnowledgeCheckCheckpointRunning,
+  readKnowledgeCheckCheckpointResumeState,
+  saveKnowledgeCheckCheckpointProgress,
+} from "./knowledge-check-checkpoint.js";
 import type { WorkerWebhookEventEmitter } from "./webhook-dispatch.worker.js";
 
 export const knowledgeCheckQueueName = "knowledge.check";
@@ -91,10 +107,7 @@ export interface WorkerKnowledgeCheckPage {
   updatedAt: string;
 }
 
-export interface WorkerKnowledgeCheckPageCursor {
-  id: string;
-  updatedAt: string;
-}
+export type WorkerKnowledgeCheckPageCursor = StableIdTimeCursor;
 
 export interface WorkerKnowledgeCheckPageBatch {
   items: WorkerKnowledgeCheckPage[];
@@ -150,6 +163,7 @@ export interface KnowledgeCheckStore {
   listDuplicateTitleFindings(
     check: WorkerKnowledgeCheckRecord,
   ): Promise<WorkerKnowledgeCheckFinding[]>;
+  resolveKnowledgeBaseScope(knowledgeBaseId: string): Promise<TenantProjectScope>;
 }
 
 export class BullMqKnowledgeCheckWorker {
@@ -170,7 +184,7 @@ export class BullMqKnowledgeCheckWorker {
 
 export function createKnowledgeCheckWorkerOptions(config: RuntimeConfig) {
   return {
-    concurrency: 1,
+    concurrency: config.limits.backgroundJobs.knowledgeCheck.concurrency,
     connection: {
       url: config.redis.url,
     },
@@ -182,6 +196,7 @@ export class KnowledgeCheckProcessor {
     private readonly store: KnowledgeCheckStore,
     private readonly options: {
       batchSize?: number;
+      checkpointRepository?: BackgroundOperationCheckpointRepository;
       now?: () => Date;
       webhookEvents?: WorkerWebhookEventEmitter;
     } = {},
@@ -204,20 +219,39 @@ export class KnowledgeCheckProcessor {
 
     try {
       const total = await this.store.countTargetPages(running);
-      const findings: WorkerKnowledgeCheckFinding[] = [
-        ...(running.checks.includes("duplicate_candidates")
-          ? await this.store.listDuplicateTitleFindings(running)
-          : []),
-      ];
-      let processed = 0;
-      let cursor: WorkerKnowledgeCheckPageCursor | null = null;
+      const checkpoint = await createOrReuseKnowledgeCheckCheckpoint({
+        check: running,
+        now: this.now(),
+        repository: this.options.checkpointRepository,
+        store: this.store,
+        total,
+      });
+      const resumeState = readKnowledgeCheckCheckpointResumeState(checkpoint);
+      await markKnowledgeCheckCheckpointRunning({
+        checkpoint,
+        now: this.now(),
+        repository: this.options.checkpointRepository,
+      });
+      let processed = resumeState.processed;
+      let cursor = resumeState.cursor;
+      const findings: WorkerKnowledgeCheckFinding[] =
+        processed > 0
+          ? [...running.findings]
+          : [
+              ...(running.checks.includes("duplicate_candidates")
+                ? await this.store.listDuplicateTitleFindings(running)
+                : []),
+            ];
 
-      do {
+      while (processed < total || cursor !== null) {
         const batch = await this.store.listTargetPages({
           check: running,
           cursor,
           limit: this.options.batchSize ?? knowledgeCheckBatchSize,
         });
+        if (batch.items.length === 0) {
+          break;
+        }
         const relatedSummaries = needsGraphData(running.checks)
           ? await this.store.listRelatedSummaries(
               running.knowledgeBaseId,
@@ -240,6 +274,17 @@ export class KnowledgeCheckProcessor {
           }),
         );
         processed += batch.items.length;
+        const lastPage = batch.items.at(-1);
+        await saveKnowledgeCheckCheckpointProgress({
+          checkpoint,
+          cursor: batch.nextCursor,
+          findingsCount: findings.length,
+          lastItemId: lastPage?.id ?? null,
+          now: this.now(),
+          processed,
+          repository: this.options.checkpointRepository,
+          total,
+        });
 
         await this.store.updateCheckProgress({
           check: running,
@@ -249,13 +294,22 @@ export class KnowledgeCheckProcessor {
         });
 
         cursor = batch.nextCursor;
-      } while (cursor !== null);
+      }
 
       const completed = await this.store.markCheckCompleted({
         check: running,
         findings,
         now: this.now(),
         semanticRun: createWorkerSemanticRun(running.checks, findings.length),
+      });
+      await markKnowledgeCheckCheckpointCompleted({
+        checkpoint,
+        findingsCount: completed.findings.length,
+        lastItemId: completed.findings.at(-1)?.page_id ?? null,
+        now: this.now(),
+        processed,
+        repository: this.options.checkpointRepository,
+        total,
       });
 
       await this.options.webhookEvents?.emit({
@@ -274,6 +328,12 @@ export class KnowledgeCheckProcessor {
 
       return completed;
     } catch (error) {
+      await markKnowledgeCheckCheckpointFailed({
+        check: running,
+        error,
+        now: this.now(),
+        repository: this.options.checkpointRepository,
+      });
       await this.store.markCheckFailed({
         check: running,
         error,
@@ -385,14 +445,11 @@ export class PostgresKnowledgeCheckStore implements KnowledgeCheckStore {
     input: ListKnowledgeCheckPagesInput,
   ): Promise<WorkerKnowledgeCheckPageBatch> {
     const limit = Math.max(1, input.limit);
-    const cursor = input.cursor;
-    const cursorPredicate =
-      cursor === null
-        ? sql`true`
-        : sql`(
-            updated_at < ${cursor.updatedAt}::timestamptz
-            or (updated_at = ${cursor.updatedAt}::timestamptz and id < ${cursor.id})
-          )`;
+    const cursorPredicate = createDescendingStableIdTimeCursorPredicate({
+      cursor: input.cursor,
+      idExpression: sql`id`,
+      timestampExpression: sql`updated_at`,
+    });
     const result = await sql<KnowledgeCheckPageRow>`
       with visible_pages as (
         ${createVisiblePagesSql(input.check.knowledgeBaseId)}
@@ -411,10 +468,10 @@ export class PostgresKnowledgeCheckStore implements KnowledgeCheckStore {
       items: rows.map(toWorkerKnowledgeCheckPage),
       nextCursor:
         result.rows.length > limit && last !== undefined
-          ? {
+          ? createStableIdTimeCursor({
               id: last.id,
-              updatedAt: normalizeTimestamp(last.updated_at),
-            }
+              timestamp: last.updated_at,
+            })
           : null,
     };
   }
@@ -563,6 +620,10 @@ export class PostgresKnowledgeCheckStore implements KnowledgeCheckStore {
         },
       }),
     );
+  }
+
+  async resolveKnowledgeBaseScope(knowledgeBaseId: string): Promise<TenantProjectScope> {
+    return requireKnowledgeBaseTenantProject(this.db, knowledgeBaseId);
   }
 
   private async saveCheck(record: WorkerKnowledgeCheckRecord): Promise<WorkerKnowledgeCheckRecord> {

@@ -453,6 +453,11 @@ Stage-specific values override it when present: `SOURCE_PARSE_CONCURRENCY`,
 `VISION_CAPTION_CONCURRENCY`, `WEBHOOK_DELIVERY_CONCURRENCY`, and
 `DELETION_CLEANUP_CONCURRENCY`.
 
+Large background workloads use `BACKGROUND_*` controls for batch size, cursor
+window size, checkpoint interval, retry pacing, and worker concurrency. OCR page
+work still uses `OCR_PAGE_CONCURRENCY`; image caption provider calls still use
+`VISION_CAPTION_IMAGE_CONCURRENCY`.
+
 `PARSER_CONCURRENCY` remains supported as the source parse fallback when
 `SOURCE_PARSE_CONCURRENCY` is unset. The Admin Console Settings page shows
 effective runtime values without exposing secrets.

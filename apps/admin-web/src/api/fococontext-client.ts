@@ -650,7 +650,26 @@ export interface JobEvent {
     | "job.canceled"
 }
 
+export interface BackgroundOperation {
+  created_at: string
+  cursor: Record<string, unknown>
+  failed_count: number
+  id: string
+  job_id: string | null
+  knowledge_base_id: string | null
+  last_item_id: string | null
+  metadata: Record<string, unknown>
+  operation_kind: string
+  processed_count: number
+  safe_error: Record<string, unknown> | null
+  stage: string
+  status: string
+  total_count: number | null
+  updated_at: string
+}
+
 export interface JobDetail extends Job {
+  background_operations: readonly BackgroundOperation[]
   events: readonly JobEvent[]
 }
 

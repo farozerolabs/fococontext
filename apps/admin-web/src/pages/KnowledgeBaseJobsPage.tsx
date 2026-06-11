@@ -6,6 +6,7 @@ import { useTranslation } from "react-i18next"
 import { useParams, useSearchParams } from "react-router"
 
 import {
+  type BackgroundOperation,
   type Job,
   type JobDetail,
   type JobEvent,
@@ -572,6 +573,7 @@ function JobDetailsDialog({
 
   const job = pickLatestJob(jobDetailQuery.data, item.job)
   const events = jobDetailQuery.data?.events ?? []
+  const backgroundOperations = jobDetailQuery.data?.background_operations ?? []
   const parsedContent = item.detail?.parsed_content ?? null
   const captionSummary = createCaptionStageSummary(events)
   const ocrSummary = createOcrStageSummary(events, parsedContent)
@@ -662,6 +664,17 @@ function JobDetailsDialog({
                         {job.progress_message}
                       </div>
                     </InspectorSection>
+                    {backgroundOperations.length === 0 ? null : (
+                      <InspectorSection
+                        title={t("job.section.backgroundOperations")}
+                      >
+                        <BackgroundOperationTable
+                          formatDate={formatDate}
+                          operations={backgroundOperations}
+                          t={t}
+                        />
+                      </InspectorSection>
+                    )}
                     {readErrorSummary(job.error) === null ? null : (
                       <InspectorSection title={t("job.section.error")}>
                         <div className="text-sm text-muted-foreground">
@@ -779,6 +792,59 @@ function JobDetailsDialog({
         </div>
       </DialogContent>
     </Dialog>
+  )
+}
+
+function BackgroundOperationTable({
+  formatDate,
+  operations,
+  t,
+}: {
+  formatDate: (value: string) => string
+  operations: readonly BackgroundOperation[]
+  t: TFunction
+}) {
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>{t("job.backgroundOperation.kind")}</TableHead>
+          <TableHead>{t("job.backgroundOperation.stage")}</TableHead>
+          <TableHead>{t("job.backgroundOperation.status")}</TableHead>
+          <TableHead className="text-right">
+            {t("job.backgroundOperation.progress")}
+          </TableHead>
+          <TableHead className="text-right">
+            {t("job.backgroundOperation.failed")}
+          </TableHead>
+          <TableHead>{t("job.backgroundOperation.updated")}</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {operations.map((operation) => (
+          <TableRow key={operation.id}>
+            <TableCell className="font-medium">
+              {operation.operation_kind}
+            </TableCell>
+            <TableCell>{operation.stage}</TableCell>
+            <TableCell>
+              <Badge variant="outline">{operation.status}</Badge>
+            </TableCell>
+            <TableCell className="text-right">
+              {formatBackgroundOperationProgress(operation, t)}
+            </TableCell>
+            <TableCell className="text-right">
+              {operation.failed_count}
+            </TableCell>
+            <TableCell>
+              <time dateTime={operation.updated_at}>
+                {formatDate(operation.updated_at)}
+              </time>
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
   )
 }
 
@@ -1173,6 +1239,22 @@ function mergeNumberArrays(
 
 function formatNullableNumber(value: number | null) {
   return value === null ? null : String(value)
+}
+
+function formatBackgroundOperationProgress(
+  operation: BackgroundOperation,
+  t: TFunction
+) {
+  if (operation.total_count === null) {
+    return t("job.backgroundOperation.processedOnly", {
+      processed: operation.processed_count,
+    })
+  }
+
+  return t("job.backgroundOperation.processedTotal", {
+    processed: operation.processed_count,
+    total: operation.total_count,
+  })
 }
 
 function getJobDisplayName(item: JobListItem, t: TFunction) {

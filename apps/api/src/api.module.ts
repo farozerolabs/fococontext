@@ -108,6 +108,11 @@ import {
   type GraphInsightsRefreshQueue,
 } from "./queues/graph-insights-refresh.queue.js";
 import {
+  createBullMqReindexQueue,
+  reindexQueueToken,
+  type ReindexQueue,
+} from "./queues/reindex.queue.js";
+import {
   createBullMqSourceOcrQueue,
   sourceOcrQueueToken,
   type SourceOcrQueue,
@@ -199,6 +204,7 @@ export interface ApiModuleOptions {
   deletionCleanupQueue?: DeletionCleanupQueue;
   knowledgeCheckQueue?: KnowledgeCheckQueue;
   graphInsightsRefreshQueue?: GraphInsightsRefreshQueue;
+  reindexQueue?: ReindexQueue;
   sourceOcrQueue?: SourceOcrQueue;
   webhookDispatchQueue?: WebhookDispatchQueue;
   sourceParseQueue?: SourceParseQueue;
@@ -367,6 +373,12 @@ export class ApiModule implements NestModule {
           useFactory: (queuePressureRecorder: RuntimeQueuePressureRecorder) =>
             options.graphInsightsRefreshQueue ??
             createBullMqGraphInsightsRefreshQueue(config, queuePressureRecorder),
+          inject: [runtimeQueuePressureRecorderToken],
+        },
+        {
+          provide: reindexQueueToken,
+          useFactory: (queuePressureRecorder: RuntimeQueuePressureRecorder) =>
+            options.reindexQueue ?? createBullMqReindexQueue(config, queuePressureRecorder),
           inject: [runtimeQueuePressureRecorderToken],
         },
         {

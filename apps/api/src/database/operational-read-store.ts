@@ -7,6 +7,7 @@ import type {
   JobRecord,
   JobStage,
   JobStatus,
+  BackgroundOperationRecord,
   MediaAssetRecord,
   ParsedContentRecord,
   SourceDocumentRecord,
@@ -281,6 +282,9 @@ export interface OperationalReadStore {
   listDueSourceWatchRules(now: string, limit: number): Promise<SourceWatchRuleRecord[]>;
   getJobById(jobId: string): Promise<JobRecord | null>;
   listJobsByIds(jobIds: readonly string[]): Promise<Map<string, JobRecord>>;
+  listBackgroundOperationsByJobIds(
+    jobIds: readonly string[],
+  ): Promise<Map<string, BackgroundOperationRecord[]>>;
   listScheduledImportJobsByRuleId(
     ruleId: string,
     input: Omit<PaginatedReadInput, "knowledgeBaseId">,
@@ -409,6 +413,9 @@ export function createNoopOperationalReadStore(): OperationalReadStore {
       return null;
     },
     async listJobsByIds() {
+      return new Map();
+    },
+    async listBackgroundOperationsByJobIds() {
       return new Map();
     },
     async listScheduledImportJobsByRuleId() {
@@ -1857,6 +1864,51 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     return jobs;
   }
 
+  async listBackgroundOperationsByJobIds(
+    jobIds: readonly string[],
+  ): Promise<Map<string, BackgroundOperationRecord[]>> {
+    const grouped = new Map<string, BackgroundOperationRecord[]>();
+
+    if (jobIds.length === 0) {
+      return grouped;
+    }
+
+    const result = await sql<BackgroundOperationRow>`
+      select
+        id,
+        job_id,
+        knowledge_base_id,
+        operation_kind,
+        stage,
+        status,
+        cursor,
+        processed_count,
+        failed_count,
+        total_count,
+        last_item_id,
+        safe_error,
+        metadata,
+        created_at,
+        updated_at
+      from background_operations
+      where job_id in (${sql.join(jobIds)})
+      order by updated_at desc, id desc
+    `.execute(this.db);
+
+    for (const row of result.rows) {
+      if (row.job_id === null) {
+        continue;
+      }
+
+      const operations = grouped.get(row.job_id) ?? [];
+
+      operations.push(toBackgroundOperationRecord(row));
+      grouped.set(row.job_id, operations);
+    }
+
+    return grouped;
+  }
+
   async listScheduledImportJobsByRuleId(
     ruleId: string,
     input: Omit<PaginatedReadInput, "knowledgeBaseId">,
@@ -2571,6 +2623,24 @@ interface JobRow {
   updated_at: unknown;
 }
 
+interface BackgroundOperationRow {
+  id: string;
+  job_id: string | null;
+  knowledge_base_id: string | null;
+  operation_kind: string;
+  stage: string;
+  status: string;
+  cursor: unknown;
+  processed_count: string | number | bigint;
+  failed_count: string | number | bigint;
+  total_count: string | number | bigint | null;
+  last_item_id: string | null;
+  safe_error: unknown;
+  metadata: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
 interface KnowledgeBaseRow {
   id: string;
   name: string;
@@ -3036,6 +3106,26 @@ function toJobRecord(row: JobRow): JobRecord {
     changeSetId: readString(result.change_set_id),
     error: row.error === null ? null : normalizeJsonObject(row.error),
     createdAt: normalizeTimestamp(row.queued_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toBackgroundOperationRecord(row: BackgroundOperationRow): BackgroundOperationRecord {
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    knowledgeBaseId: row.knowledge_base_id,
+    operationKind: row.operation_kind,
+    stage: row.stage,
+    status: row.status,
+    cursor: normalizeJsonObject(row.cursor),
+    processedCount: readCount(row.processed_count),
+    failedCount: readCount(row.failed_count),
+    totalCount: row.total_count === null ? null : readCount(row.total_count),
+    lastItemId: row.last_item_id,
+    safeError: row.safe_error === null ? null : normalizeJsonObject(row.safe_error),
+    metadata: normalizeJsonObject(row.metadata),
+    createdAt: normalizeTimestamp(row.created_at),
     updatedAt: normalizeTimestamp(row.updated_at),
   };
 }

@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import { Inject, Injectable } from "@nestjs/common";
 import { ApiError, createResourceId } from "@fococontext/contracts";
-import type { RuntimeConfig } from "@fococontext/core";
+import { createBackgroundOperationDedupeKey, type RuntimeConfig } from "@fococontext/core";
+import { backgroundOperationIdPrefix } from "@fococontext/db";
 import { rm } from "node:fs/promises";
 
 import { defaultApiResourceScope, type ApiResourceScope } from "../auth/api-key.guard.js";
@@ -16,7 +18,11 @@ import {
   sourceWatchScanCoordinatorToken,
   type SourceWatchScanCoordinator,
 } from "./source-watch.coordinator.js";
-import { sourceWatchScannerToken, type SourceWatchScanner } from "./source-watch.scanner.js";
+import {
+  sourceWatchScannerToken,
+  type SourceWatchScanner,
+  type SourceWatchScannerProgress,
+} from "./source-watch.scanner.js";
 import {
   assertDatasetSupportsSourceKind,
   assertSupportedRuntimeSourceKind,
@@ -326,12 +332,36 @@ export class SourceWatchService {
   ): Promise<SourceWatchScanEnvelope> {
     const startedAt = new Date().toISOString();
     const startedMs = Date.now();
+    const scheduledImportJobId = createResourceId("scheduledImportJob");
+    const checkpoint = await this.createSourceWatchCheckpoint({
+      record,
+      scheduledImportJobId,
+      startedAt,
+      triggerType,
+    });
 
     try {
-      const discovery = await this.scanner.scan(record);
+      await this.databaseMirror.markBackgroundOperationCheckpointRunning({
+        id: checkpoint.id,
+        now: new Date().toISOString(),
+        stage: "scanning",
+      });
+      const discovery = await this.scanner.scan(record, {
+        onProgress: (progress) => this.saveSourceWatchCheckpointProgress(checkpoint.id, progress),
+      });
       const now = new Date().toISOString();
       const newSources = await this.autoIngestSources(record, discovery.newSources, scope);
       const changedSources = await this.autoIngestSources(record, discovery.changedSources, scope);
+      await this.databaseMirror.saveBackgroundOperationCheckpointProgress({
+        id: checkpoint.id,
+        metadata: {
+          changed_count: changedSources.length,
+          new_count: newSources.length,
+        },
+        now: new Date().toISOString(),
+        processedCount: discovery.newSources.length + discovery.changedSources.length,
+        stage: "auto_ingest",
+      });
       const deleteCandidates = await mapWithConcurrency(
         discovery.deleteCandidates,
         this.config.limits.apiFanOut.sourceWatchConcurrency,
@@ -351,7 +381,7 @@ export class SourceWatchService {
         skipped: discovery.skipped.map(cloneSkippedSource),
       };
       const scheduledImportJob: ScheduledImportJobRecord = {
-        id: createResourceId("scheduledImportJob"),
+        id: scheduledImportJobId,
         sourceWatchRuleId: record.id,
         knowledgeBaseId: record.knowledgeBaseId,
         status: discovery.status,
@@ -378,6 +408,29 @@ export class SourceWatchService {
 
       await this.databaseMirror.saveScheduledImportJob(scheduledImportJob);
       await this.databaseMirror.updateSourceWatchRule(updatedRecord);
+      await this.databaseMirror.completeBackgroundOperationCheckpoint({
+        id: checkpoint.id,
+        metadata: {
+          changed_count: changedSources.length,
+          delete_candidate_count: deleteCandidates.length,
+          new_count: newSources.length,
+          scheduled_import_job_id: scheduledImportJob.id,
+          skipped_count: scanResult.skipped.length,
+          status: discovery.status,
+        },
+        now,
+        processedCount:
+          scanResult.new_sources.length +
+          scanResult.changed_sources.length +
+          scanResult.delete_candidates.length +
+          scanResult.skipped.length,
+        stage: "completed",
+        totalCount:
+          scanResult.new_sources.length +
+          scanResult.changed_sources.length +
+          scanResult.delete_candidates.length +
+          scanResult.skipped.length,
+      });
 
       return {
         scan: {
@@ -396,13 +449,69 @@ export class SourceWatchService {
       };
     } catch (error) {
       return this.recordFailedScan(record, {
+        checkpointId: checkpoint.id,
         error,
+        scheduledImportJobId,
         scheduledFor,
         startedAt,
         startedMs,
         triggerType,
       });
     }
+  }
+
+  private async createSourceWatchCheckpoint(input: {
+    record: SourceWatchRuleRecord;
+    scheduledImportJobId: string;
+    startedAt: string;
+    triggerType: SourceWatchScanTriggerType;
+  }) {
+    const scope =
+      (await this.operationalReadStore.getKnowledgeBaseResourceScope(
+        input.record.knowledgeBaseId,
+      )) ?? defaultApiResourceScope;
+    const operationId = createStableSourceWatchOperationId(
+      input.record.id,
+      input.scheduledImportJobId,
+    );
+
+    return this.databaseMirror.createOrReuseBackgroundOperationCheckpoint({
+      id: operationId,
+      tenantId: scope.tenantId,
+      projectId: scope.projectId,
+      knowledgeBaseId: input.record.knowledgeBaseId,
+      jobId: input.scheduledImportJobId,
+      operationKind: "source_watch_scan",
+      stage: "queued",
+      cursor: {},
+      lockKey: createBackgroundOperationDedupeKey({
+        operationId,
+        operationKind: "source_watch_scan",
+        scopeId: input.record.id,
+      }),
+      metadata: {
+        source_watch_rule_id: input.record.id,
+        source_watch_source_kind: input.record.sourceKind,
+        trigger_type: input.triggerType,
+      },
+      now: input.startedAt,
+      totalCount: null,
+    });
+  }
+
+  private async saveSourceWatchCheckpointProgress(
+    checkpointId: string,
+    progress: SourceWatchScannerProgress,
+  ): Promise<void> {
+    await this.databaseMirror.saveBackgroundOperationCheckpointProgress({
+      id: checkpointId,
+      ...(progress.cursor === undefined ? {} : { cursor: progress.cursor }),
+      ...(progress.metadata === undefined ? {} : { metadata: progress.metadata }),
+      now: new Date().toISOString(),
+      processedCount: progress.processedCount,
+      stage: progress.stage,
+      ...(progress.totalCount === undefined ? {} : { totalCount: progress.totalCount }),
+    });
   }
 
   private async createCoalescedScanResponse(
@@ -446,7 +555,9 @@ export class SourceWatchService {
   private async recordFailedScan(
     record: SourceWatchRuleRecord,
     input: {
+      checkpointId: string;
       error: unknown;
+      scheduledImportJobId: string;
       scheduledFor: string | null;
       startedAt: string;
       startedMs: number;
@@ -462,7 +573,7 @@ export class SourceWatchService {
     };
     const retryable = isRetryableSourceWatchError(input.error);
     const scheduledImportJob: ScheduledImportJobRecord = {
-      id: createResourceId("scheduledImportJob"),
+      id: input.scheduledImportJobId,
       sourceWatchRuleId: record.id,
       knowledgeBaseId: record.knowledgeBaseId,
       status: "failed",
@@ -491,6 +602,19 @@ export class SourceWatchService {
 
     await this.databaseMirror.saveScheduledImportJob(scheduledImportJob);
     await this.databaseMirror.updateSourceWatchRule(updatedRecord);
+    await this.databaseMirror.failBackgroundOperationCheckpoint({
+      id: input.checkpointId,
+      failedCount: 1,
+      metadata: {
+        retryable,
+        scheduled_import_job_id: scheduledImportJob.id,
+      },
+      now,
+      processedCount: 0,
+      safeError: toErrorRecord(input.error),
+      stage: "failed",
+      totalCount: null,
+    });
 
     return {
       scan: {
@@ -682,4 +806,13 @@ function createScheduledImportJobNotFoundError(jobId: string): ApiError {
       scheduled_import_job_id: jobId,
     },
   });
+}
+
+function createStableSourceWatchOperationId(ruleId: string, scheduledImportJobId: string): string {
+  const digest = createHash("sha256")
+    .update(`${ruleId}:${scheduledImportJobId}`)
+    .digest("hex")
+    .slice(0, 32);
+
+  return `${backgroundOperationIdPrefix}source_watch_${digest}`;
 }

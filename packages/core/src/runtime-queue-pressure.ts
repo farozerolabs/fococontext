@@ -2,6 +2,7 @@ export const runtimeQueueWorkKinds = [
   "upload",
   "source-parse",
   "wiki-compile",
+  "retrieval-reindex",
   "graph-refresh",
   "knowledge-check",
   "source-watch",

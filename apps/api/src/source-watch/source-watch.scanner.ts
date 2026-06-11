@@ -14,6 +14,11 @@ import {
 } from "@fococontext/storage";
 
 import type { SourceDocumentRecord } from "../documents/document.types.js";
+import {
+  compareDiscoveredSources,
+  groupDocumentsBySourcePath,
+  hasMatchingS3Fingerprint,
+} from "./source-watch-discovery-compare.js";
 import type {
   SourceWatchDiscoveredSource,
   SourceWatchRuleRecord,
@@ -25,7 +30,22 @@ export const sourceWatchScannerToken = Symbol("sourceWatchScanner");
 const execFileAsync = promisify(execFile);
 
 export interface SourceWatchScanner {
-  scan(rule: SourceWatchRuleRecord): Promise<SourceWatchScanDiscovery>;
+  scan(
+    rule: SourceWatchRuleRecord,
+    options?: SourceWatchScannerRuntimeOptions,
+  ): Promise<SourceWatchScanDiscovery>;
+}
+
+export interface SourceWatchScannerRuntimeOptions {
+  onProgress?: (progress: SourceWatchScannerProgress) => Promise<void>;
+}
+
+export interface SourceWatchScannerProgress {
+  cursor?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+  processedCount: number;
+  stage: "adapter_page" | "compare" | "completed";
+  totalCount?: number | null;
 }
 
 interface SourceWatchS3Object {
@@ -74,22 +94,22 @@ export function createDefaultSourceWatchScanner(
   options: SourceWatchScannerOptions = {},
 ): SourceWatchScanner {
   return {
-    async scan(rule) {
+    async scan(rule, runtimeOptions) {
       if (rule.status === "disabled") {
         return createDisabledDiscovery();
       }
 
       if (rule.sourceKind === "mounted_directory") {
-        return scanMountedDirectory(rule, options);
+        return scanMountedDirectory(rule, options, runtimeOptions);
       }
       if (rule.sourceKind === "url_list") {
-        return scanUrlList(rule, config, options);
+        return scanUrlList(rule, config, options, runtimeOptions);
       }
       if (rule.sourceKind === "s3_prefix") {
-        return scanS3Prefix(rule, config, options);
+        return scanS3Prefix(rule, config, options, runtimeOptions);
       }
       if (rule.sourceKind === "git_repo") {
-        return scanGitRepository(rule, config, options);
+        return scanGitRepository(rule, config, options, runtimeOptions);
       }
 
       return createDisabledDiscovery("source_watch_adapter_disabled");
@@ -108,6 +128,7 @@ export function createDisabledSourceWatchScanner(): SourceWatchScanner {
 async function scanMountedDirectory(
   rule: SourceWatchRuleRecord,
   options: SourceWatchScannerOptions,
+  runtimeOptions?: SourceWatchScannerRuntimeOptions,
 ): Promise<SourceWatchScanDiscovery> {
   const root = resolve(rule.location);
   const rootStatus = await stat(root).catch(() => null);
@@ -132,11 +153,30 @@ async function scanMountedDirectory(
 
   const skipped: SourceWatchSkippedSource[] = [];
   const scannedSources = await collectMountedDirectorySources(rule, root, skipped);
+  await runtimeOptions?.onProgress?.({
+    metadata: {
+      adapter: "mounted_directory",
+      skipped_count: skipped.length,
+    },
+    processedCount: scannedSources.length,
+    stage: "adapter_page",
+    totalCount: scannedSources.length,
+  });
   const existingSources = await listExistingSourceWatchDocuments(
     rule,
     options.existingDocumentProvider,
   );
   const comparison = compareDiscoveredSources(rule, existingSources, scannedSources);
+  await runtimeOptions?.onProgress?.({
+    metadata: {
+      changed_count: comparison.changedSources.length,
+      delete_candidate_count: comparison.deleteCandidates.length,
+      new_count: comparison.newSources.length,
+    },
+    processedCount: scannedSources.length,
+    stage: "compare",
+    totalCount: scannedSources.length,
+  });
 
   return {
     status: "completed",
@@ -154,6 +194,7 @@ async function scanUrlList(
   rule: SourceWatchRuleRecord,
   config: RuntimeConfig,
   options: SourceWatchScannerOptions,
+  runtimeOptions?: SourceWatchScannerRuntimeOptions,
 ): Promise<SourceWatchScanDiscovery> {
   const adapter = config.sourceWatch.adapters.urlList;
 
@@ -163,11 +204,30 @@ async function scanUrlList(
 
   const skipped: SourceWatchSkippedSource[] = [];
   const sources = collectUrlListSources(rule, adapter, skipped);
+  await runtimeOptions?.onProgress?.({
+    metadata: {
+      adapter: "url_list",
+      skipped_count: skipped.length,
+    },
+    processedCount: sources.length,
+    stage: "adapter_page",
+    totalCount: sources.length,
+  });
   const existingSources = await listExistingSourceWatchDocuments(
     rule,
     options.existingDocumentProvider,
   );
   const comparison = compareDiscoveredSources(rule, existingSources, sources);
+  await runtimeOptions?.onProgress?.({
+    metadata: {
+      changed_count: comparison.changedSources.length,
+      delete_candidate_count: comparison.deleteCandidates.length,
+      new_count: comparison.newSources.length,
+    },
+    processedCount: sources.length,
+    stage: "compare",
+    totalCount: sources.length,
+  });
 
   return {
     status: "completed",
@@ -264,6 +324,7 @@ async function scanS3Prefix(
   rule: SourceWatchRuleRecord,
   config: RuntimeConfig,
   options: SourceWatchScannerOptions,
+  runtimeOptions?: SourceWatchScannerRuntimeOptions,
 ): Promise<SourceWatchScanDiscovery> {
   const adapter = config.sourceWatch.adapters.s3Prefix;
 
@@ -447,9 +508,32 @@ async function scanS3Prefix(
     }
 
     continuationToken = page.IsTruncated === true ? page.NextContinuationToken : undefined;
+    await runtimeOptions?.onProgress?.({
+      cursor: {
+        continuation_token: continuationToken ?? null,
+      },
+      metadata: {
+        adapter: "s3_prefix",
+        page_item_count: page.Contents?.length ?? 0,
+        skipped_count: skipped.length,
+      },
+      processedCount: discovered.length,
+      stage: "adapter_page",
+      totalCount: null,
+    });
   } while (continuationToken !== undefined && discovered.length < adapter.maxItems);
 
   const comparison = compareDiscoveredSources(rule, existingSources, discovered);
+  await runtimeOptions?.onProgress?.({
+    metadata: {
+      changed_count: comparison.changedSources.length,
+      delete_candidate_count: comparison.deleteCandidates.length,
+      new_count: comparison.newSources.length,
+    },
+    processedCount: discovered.length,
+    stage: "compare",
+    totalCount: discovered.length,
+  });
 
   return {
     status: "completed",
@@ -467,6 +551,7 @@ async function scanGitRepository(
   rule: SourceWatchRuleRecord,
   config: RuntimeConfig,
   options: SourceWatchScannerOptions,
+  runtimeOptions?: SourceWatchScannerRuntimeOptions,
 ): Promise<SourceWatchScanDiscovery> {
   const adapter = config.sourceWatch.adapters.gitRepo;
 
@@ -505,11 +590,30 @@ async function scanGitRepository(
 
     const skipped: SourceWatchSkippedSource[] = [];
     const sources = await collectGitRepositorySources(rule, checkoutPath, adapter, skipped);
+    await runtimeOptions?.onProgress?.({
+      metadata: {
+        adapter: "git_repo",
+        skipped_count: skipped.length,
+      },
+      processedCount: sources.length,
+      stage: "adapter_page",
+      totalCount: sources.length,
+    });
     const existingSources = await listExistingSourceWatchDocuments(
       rule,
       options.existingDocumentProvider,
     );
     const comparison = compareDiscoveredSources(rule, existingSources, sources);
+    await runtimeOptions?.onProgress?.({
+      metadata: {
+        changed_count: comparison.changedSources.length,
+        delete_candidate_count: comparison.deleteCandidates.length,
+        new_count: comparison.newSources.length,
+      },
+      processedCount: sources.length,
+      stage: "compare",
+      totalCount: sources.length,
+    });
 
     return {
       status: "completed",
@@ -668,81 +772,6 @@ async function walkGitDirectory(
   }
 }
 
-function compareDiscoveredSources(
-  rule: SourceWatchRuleRecord,
-  existingSources: readonly SourceDocumentRecord[],
-  scannedSources: readonly SourceWatchDiscoveredSource[],
-): {
-  changedSources: SourceWatchDiscoveredSource[];
-  deleteCandidates: SourceWatchScanDiscovery["deleteCandidates"];
-  newSources: SourceWatchDiscoveredSource[];
-} {
-  const existingByPath = groupDocumentsBySourcePath(existingSources);
-  const scannedPaths = new Set(scannedSources.map((source) => source.source_path ?? source.name));
-  const newSources: SourceWatchDiscoveredSource[] = [];
-  const changedSources: SourceWatchDiscoveredSource[] = [];
-
-  for (const source of scannedSources) {
-    const sourcePath = source.source_path ?? source.name;
-    const existing = existingByPath.get(sourcePath) ?? [];
-
-    if (existing.length === 0) {
-      newSources.push(source);
-      continue;
-    }
-
-    if (
-      !existing.some(
-        (document) =>
-          documentMatchesSourceFingerprint(document, source) ||
-          document.contentHash === source.content_hash,
-      )
-    ) {
-      changedSources.push(source);
-    }
-  }
-
-  const deleteCandidates = [...existingByPath.entries()]
-    .filter(([sourcePath]) => !scannedPaths.has(sourcePath))
-    .flatMap(([sourcePath, documents]) => {
-      const latestDocument = documents[0];
-
-      if (latestDocument === undefined) {
-        return [];
-      }
-
-      return [
-        {
-          document_id: latestDocument.id,
-          source_path: sourcePath,
-          reason: "missing_from_source",
-          metadata: {
-            source_watch_rule_id: rule.id,
-            source_watch_source_kind: rule.sourceKind,
-          },
-        },
-      ];
-    });
-
-  return {
-    changedSources,
-    deleteCandidates,
-    newSources,
-  };
-}
-
-function documentMatchesSourceFingerprint(
-  document: SourceDocumentRecord,
-  source: SourceWatchDiscoveredSource,
-): boolean {
-  const sourceFingerprint = source.metadata?.source_watch_fingerprint;
-
-  return (
-    typeof sourceFingerprint === "string" &&
-    document.metadata.source_watch_fingerprint === sourceFingerprint
-  );
-}
-
 async function collectMountedDirectorySources(
   rule: SourceWatchRuleRecord,
   root: string,
@@ -854,36 +883,6 @@ async function listExistingSourceWatchDocuments(
   }
 
   return [];
-}
-
-function groupDocumentsBySourcePath(
-  documents: readonly SourceDocumentRecord[],
-): Map<string, SourceDocumentRecord[]> {
-  const grouped = new Map<string, SourceDocumentRecord[]>();
-
-  for (const document of documents) {
-    if (document.sourcePath === undefined) {
-      continue;
-    }
-
-    grouped.set(document.sourcePath, [...(grouped.get(document.sourcePath) ?? []), document]);
-  }
-
-  for (const [sourcePath, items] of grouped.entries()) {
-    grouped.set(
-      sourcePath,
-      items.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
-    );
-  }
-
-  return grouped;
-}
-
-function hasMatchingS3Fingerprint(
-  documents: readonly SourceDocumentRecord[],
-  fingerprint: string,
-): boolean {
-  return documents.some((document) => document.metadata.source_watch_fingerprint === fingerprint);
 }
 
 function createS3ObjectFingerprint(input: {

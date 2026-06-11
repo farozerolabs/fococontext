@@ -240,33 +240,40 @@ Rerank uses an all-or-none contract. Leave every `RERANK_*` value empty to disab
 
 ## Queues, Compile, and Retrieve
 
-| Field                                          | Description                        | Recommended Value                                     |
-| ---------------------------------------------- | ---------------------------------- | ----------------------------------------------------- |
-| `FOCOCONTEXT_QUEUE_CONCURRENCY`                | Default queue concurrency          | Default `2`                                           |
-| `BATCH_IMPORT_CONCURRENCY`                     | Batch import concurrency           | Default `2`                                           |
-| `SOURCE_WATCH_SCAN_CONCURRENCY`                | Source Watch scan concurrency      | Default `2`                                           |
-| `SOURCE_WATCH_SCHEDULER_ENABLED`               | Whether scheduled scans run        | Default `true`                                        |
-| `SOURCE_WATCH_SCAN_INTERVAL_SECONDS`           | Scan interval                      | Default `3600`                                        |
-| `SOURCE_WATCH_SCAN_MAX_RETRIES`                | Scan retry count                   | Default `2`                                           |
-| `SOURCE_WATCH_SCAN_RETRY_BASE_DELAY_MS`        | Base retry delay for scans         | Default `1000`                                        |
-| `WIKI_ANALYZE_CONCURRENCY`                     | Analysis stage concurrency         | Default `2`; constrained by Chat provider rate limits |
-| `WIKI_GENERATE_CONCURRENCY`                    | Generation stage concurrency       | Default `2`                                           |
-| `WIKI_MERGE_CONCURRENCY`                       | Merge stage concurrency            | Default `2`                                           |
-| `COMPILE_MAX_CONTEXT_CHARS`                    | Compile prompt character budget    | Default `24000`; tune by model context                |
-| `RETRIEVE_DEFAULT_TOP_K`                       | Default candidate count            | Default `10`                                          |
-| `RETRIEVE_MAX_TOP_K`                           | Max candidate count                | Default `20`                                          |
-| `RETRIEVE_DEFAULT_GRAPH_DEPTH`                 | Default graph depth                | Default `1`                                           |
-| `RETRIEVE_MAX_GRAPH_DEPTH`                     | Max graph depth                    | Default `3`                                           |
-| `RETRIEVE_DEFAULT_GRAPH_LIMIT_PER_RESULT`      | Default graph expansion per result | Default `5`                                           |
-| `RETRIEVE_MAX_GRAPH_LIMIT_PER_RESULT`          | Max graph expansion per result     | Default `10`                                          |
-| `RETRIEVE_DEFAULT_CONTEXT_BUDGET_TOKENS`       | Default context budget             | Default `4000`                                        |
-| `RETRIEVE_MAX_CONTEXT_BUDGET_TOKENS`           | Max context budget                 | Default `12000`                                       |
-| `SOURCE_EVIDENCE_DEFAULT_MAX_CHARS`            | Default source evidence text cap   | Default `4000`                                        |
-| `SOURCE_EVIDENCE_MAX_CHARS`                    | Max source evidence text cap       | Default `12000`                                       |
-| `SOURCE_EVIDENCE_DEFAULT_CONTEXT_CHARS`        | Default source evidence context    | Default `800`                                         |
-| `SOURCE_EVIDENCE_MAX_CONTEXT_CHARS`            | Max source evidence context        | Default `2000`                                        |
-| `SOURCE_EVIDENCE_BATCH_MAX_ITEMS`              | Max batch evidence items           | Default `20`                                          |
-| `SOURCE_EVIDENCE_BATCH_TOTAL_OUTPUT_MAX_CHARS` | Max batch evidence output          | Default `40000`                                       |
+| Field                                          | Description                        | Recommended Value                                                                    |
+| ---------------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------ |
+| `FOCOCONTEXT_QUEUE_CONCURRENCY`                | Default queue concurrency          | Default `2`                                                                          |
+| `BATCH_IMPORT_CONCURRENCY`                     | Batch import concurrency           | Default `2`                                                                          |
+| `SOURCE_WATCH_SCAN_CONCURRENCY`                | Source Watch scan concurrency      | Default `2`                                                                          |
+| `BACKGROUND_REINDEX_*`                         | Reindex batch/checkpoint controls  | Batch, cursor window, checkpoint interval, retry delay, and concurrency              |
+| `BACKGROUND_GRAPH_INSIGHTS_*`                  | Graph insight refresh controls     | Batch, cursor window, checkpoint interval, retry delay, and concurrency              |
+| `BACKGROUND_KNOWLEDGE_CHECK_*`                 | Knowledge Check controls           | Batch, cursor window, checkpoint interval, retry delay, and concurrency              |
+| `BACKGROUND_SOURCE_WATCH_*`                    | Source Watch background controls   | Batch, cursor window, checkpoint interval, retry delay, and concurrency              |
+| `BACKGROUND_OCR_*`                             | OCR background worker controls     | Worker batch/checkpoint controls; page work uses `OCR_PAGE_CONCURRENCY`              |
+| `BACKGROUND_MEDIA_CAPTION_*`                   | Media caption background controls  | Worker batch/checkpoint controls; image calls use `VISION_CAPTION_IMAGE_CONCURRENCY` |
+| `BACKGROUND_CLEANUP_*`                         | Cleanup background controls        | Batch, cursor window, checkpoint interval, retry delay, and concurrency              |
+| `SOURCE_WATCH_SCHEDULER_ENABLED`               | Whether scheduled scans run        | Default `true`                                                                       |
+| `SOURCE_WATCH_SCAN_INTERVAL_SECONDS`           | Scan interval                      | Default `3600`                                                                       |
+| `SOURCE_WATCH_SCAN_MAX_RETRIES`                | Scan retry count                   | Default `2`                                                                          |
+| `SOURCE_WATCH_SCAN_RETRY_BASE_DELAY_MS`        | Base retry delay for scans         | Default `1000`                                                                       |
+| `WIKI_ANALYZE_CONCURRENCY`                     | Analysis stage concurrency         | Default `2`; constrained by Chat provider rate limits                                |
+| `WIKI_GENERATE_CONCURRENCY`                    | Generation stage concurrency       | Default `2`                                                                          |
+| `WIKI_MERGE_CONCURRENCY`                       | Merge stage concurrency            | Default `2`                                                                          |
+| `COMPILE_MAX_CONTEXT_CHARS`                    | Compile prompt character budget    | Default `24000`; tune by model context                                               |
+| `RETRIEVE_DEFAULT_TOP_K`                       | Default candidate count            | Default `10`                                                                         |
+| `RETRIEVE_MAX_TOP_K`                           | Max candidate count                | Default `20`                                                                         |
+| `RETRIEVE_DEFAULT_GRAPH_DEPTH`                 | Default graph depth                | Default `1`                                                                          |
+| `RETRIEVE_MAX_GRAPH_DEPTH`                     | Max graph depth                    | Default `3`                                                                          |
+| `RETRIEVE_DEFAULT_GRAPH_LIMIT_PER_RESULT`      | Default graph expansion per result | Default `5`                                                                          |
+| `RETRIEVE_MAX_GRAPH_LIMIT_PER_RESULT`          | Max graph expansion per result     | Default `10`                                                                         |
+| `RETRIEVE_DEFAULT_CONTEXT_BUDGET_TOKENS`       | Default context budget             | Default `4000`                                                                       |
+| `RETRIEVE_MAX_CONTEXT_BUDGET_TOKENS`           | Max context budget                 | Default `12000`                                                                      |
+| `SOURCE_EVIDENCE_DEFAULT_MAX_CHARS`            | Default source evidence text cap   | Default `4000`                                                                       |
+| `SOURCE_EVIDENCE_MAX_CHARS`                    | Max source evidence text cap       | Default `12000`                                                                      |
+| `SOURCE_EVIDENCE_DEFAULT_CONTEXT_CHARS`        | Default source evidence context    | Default `800`                                                                        |
+| `SOURCE_EVIDENCE_MAX_CONTEXT_CHARS`            | Max source evidence context        | Default `2000`                                                                       |
+| `SOURCE_EVIDENCE_BATCH_MAX_ITEMS`              | Max batch evidence items           | Default `20`                                                                         |
+| `SOURCE_EVIDENCE_BATCH_TOTAL_OUTPUT_MAX_CHARS` | Max batch evidence output          | Default `40000`                                                                      |
 
 ## Webhooks
 
