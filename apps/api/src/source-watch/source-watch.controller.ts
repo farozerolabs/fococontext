@@ -30,7 +30,7 @@ export class KnowledgeBaseSourceWatchController {
     @Req() request: ApiKeyRequest,
   ) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.sourceWatchService.create(knowledgeBaseId, body, scope),
       createRequestId(),
@@ -44,7 +44,7 @@ export class KnowledgeBaseSourceWatchController {
     @Req() request: ApiKeyRequest,
   ) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     const result = await this.sourceWatchService.list(
       knowledgeBaseId,
       {

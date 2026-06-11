@@ -1,5 +1,7 @@
 import { Job, Queue } from "bullmq";
-import type { RuntimeConfig } from "@fococontext/core";
+import type { RuntimeConfig, RuntimeQueuePressureRecorder } from "@fococontext/core";
+
+import { recordQueuePressureBackpressure, recordQueuePressureQueued } from "./queue-pressure.js";
 
 export const sourceParseQueueToken = Symbol("sourceParseQueue");
 export const sourceParseQueueName = "source.parse";
@@ -62,7 +64,10 @@ export interface SourceParseQueue {
 export class BullMqSourceParseQueue implements SourceParseQueue {
   private readonly queue: Queue<SourceParseQueuePayload>;
 
-  constructor(config: RuntimeConfig) {
+  constructor(
+    config: RuntimeConfig,
+    private readonly queuePressureRecorder?: RuntimeQueuePressureRecorder,
+  ) {
     this.queue = new Queue<SourceParseQueuePayload>(sourceParseQueueName, {
       connection: {
         url: config.redis.url,
@@ -76,9 +81,23 @@ export class BullMqSourceParseQueue implements SourceParseQueue {
   }
 
   async enqueueSourceParseJob(payload: SourceParseQueuePayload): Promise<EnqueuedSourceParseJob> {
-    await this.queue.add(sourceParseJobName, payload, {
-      jobId: payload.job_id,
-    });
+    try {
+      await this.queue.add(sourceParseJobName, payload, {
+        jobId: payload.job_id,
+      });
+      await recordQueuePressureQueued({
+        recorder: this.queuePressureRecorder,
+        scopeId: payload.knowledge_base_id,
+        workKind: "source-parse",
+      });
+    } catch (error) {
+      await recordQueuePressureBackpressure({
+        recorder: this.queuePressureRecorder,
+        scopeId: payload.knowledge_base_id,
+        workKind: "source-parse",
+      });
+      throw error;
+    }
 
     return {
       queue_name: sourceParseQueueName,
@@ -110,8 +129,11 @@ export class BullMqSourceParseQueue implements SourceParseQueue {
   }
 }
 
-export function createBullMqSourceParseQueue(config: RuntimeConfig): SourceParseQueue {
-  return new BullMqSourceParseQueue(config);
+export function createBullMqSourceParseQueue(
+  config: RuntimeConfig,
+  queuePressureRecorder?: RuntimeQueuePressureRecorder,
+): SourceParseQueue {
+  return new BullMqSourceParseQueue(config, queuePressureRecorder);
 }
 
 function normalizeBullMqState(

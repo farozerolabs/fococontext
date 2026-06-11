@@ -3,7 +3,7 @@ import { ApiError, createResourceId } from "@fococontext/contracts";
 import { requireKnowledgeBaseTenantProject, type DatabaseSchema } from "@fococontext/db";
 import {
   EmbeddingIndexService,
-  createInMemoryRetrievalRepository,
+  createRequestLocalRetrievalRepository,
   type GraphInsightsResponse,
   type GraphInsightStatus,
   type RetrievalEmbeddingObjectType,
@@ -342,7 +342,9 @@ export function createNoopWikiStore(): WikiStore {
       };
     },
     async loadRetrievalRepository() {
-      return createInMemoryRetrievalRepository();
+      throw new ApiError("retrieve_index_not_ready", {
+        messageKey: "api.error.retrieve_index_not_ready",
+      });
     },
     async rebuildRetrievalIndex() {
       return {
@@ -799,19 +801,6 @@ class PostgresWikiStore implements WikiStore {
     const baseVersionId = await this.currentKnowledgeVersionId(current.knowledge_base_id);
     const now = new Date().toISOString();
 
-    await this.createAppliedChangeSet({
-      id: changeSetId,
-      knowledgeBaseId: current.knowledge_base_id,
-      baseVersionId,
-      targetVersionId: knowledgeVersionId,
-      title: input.summary ?? `Update ${title}`,
-      description: "Update Wiki Page through API.",
-      diff: {
-        before: { title: current.title, markdown: current.markdown },
-        after: { title, markdown },
-      },
-      now,
-    });
     await this.insertPageVersion({
       id: pageVersionId,
       pageId,
@@ -831,6 +820,19 @@ class PostgresWikiStore implements WikiStore {
       summary: input.summary ?? `Updated ${title}.`,
       changeSetId,
       createdBy: "api",
+      now,
+    });
+    await this.createAppliedChangeSet({
+      id: changeSetId,
+      knowledgeBaseId: current.knowledge_base_id,
+      baseVersionId,
+      targetVersionId: knowledgeVersionId,
+      title: input.summary ?? `Update ${title}`,
+      description: "Update Wiki Page through API.",
+      diff: {
+        before: { title: current.title, markdown: current.markdown },
+        after: { title, markdown },
+      },
       now,
     });
     const visibility = await this.createWriteVisibilityMetadata(current.knowledge_base_id);
@@ -1770,6 +1772,15 @@ class PostgresWikiStore implements WikiStore {
       throw new ApiError("version_not_found");
     }
 
+    await this.insertKnowledgeVersion({
+      id: knowledgeVersionId,
+      knowledgeBaseId,
+      versionNumber,
+      summary: input.reason ?? "Knowledge Base rollback.",
+      changeSetId,
+      createdBy: "api",
+      now,
+    });
     await this.createAppliedChangeSet({
       id: changeSetId,
       knowledgeBaseId,
@@ -1778,15 +1789,6 @@ class PostgresWikiStore implements WikiStore {
       title: "Roll back Knowledge Base",
       description: input.reason ?? "Rollback requested through API.",
       diff: { target_version_id: targetVersionId },
-      now,
-    });
-    await this.insertKnowledgeVersion({
-      id: knowledgeVersionId,
-      knowledgeBaseId,
-      versionNumber,
-      summary: input.reason ?? "Knowledge Base rollback.",
-      changeSetId,
-      createdBy: "api",
       now,
     });
     const visibility = await this.createWriteVisibilityMetadata(knowledgeBaseId);
@@ -1855,16 +1857,6 @@ class PostgresWikiStore implements WikiStore {
       throw new ApiError("version_not_found");
     }
 
-    await this.createAppliedChangeSet({
-      id: changeSetId,
-      knowledgeBaseId: current.knowledge_base_id,
-      baseVersionId,
-      targetVersionId: knowledgeVersionId,
-      title: `Roll back ${target.title}`,
-      description: input.reason ?? "Page rollback requested through API.",
-      diff: { target_page_version_id: targetPageVersionId },
-      now,
-    });
     await this.insertPageVersion({
       id: pageVersionId,
       pageId,
@@ -1884,6 +1876,16 @@ class PostgresWikiStore implements WikiStore {
       summary: input.reason ?? `Rolled back ${target.title}.`,
       changeSetId,
       createdBy: "api",
+      now,
+    });
+    await this.createAppliedChangeSet({
+      id: changeSetId,
+      knowledgeBaseId: current.knowledge_base_id,
+      baseVersionId,
+      targetVersionId: knowledgeVersionId,
+      title: `Roll back ${target.title}`,
+      description: input.reason ?? "Page rollback requested through API.",
+      diff: { target_page_version_id: targetPageVersionId },
       now,
     });
     const visibility = await this.createWriteVisibilityMetadata(current.knowledge_base_id);
@@ -1965,6 +1967,16 @@ class PostgresWikiStore implements WikiStore {
       conflicts: [...input.conflicts],
     };
 
+    await this.insertKnowledgeVersion({
+      id: knowledgeVersionId,
+      knowledgeBaseId: input.forkId,
+      versionNumber: knowledgeVersionNumber,
+      summary: "Synced fork from upstream.",
+      changeSetId,
+      createdBy: "api",
+      now,
+    });
+
     await sql`
       insert into change_sets (
         id,
@@ -2008,16 +2020,6 @@ class PostgresWikiStore implements WikiStore {
       )
     `.execute(this.db);
 
-    await this.insertKnowledgeVersion({
-      id: knowledgeVersionId,
-      knowledgeBaseId: input.forkId,
-      versionNumber: knowledgeVersionNumber,
-      summary: "Synced fork from upstream.",
-      changeSetId,
-      createdBy: "api",
-      now,
-    });
-
     for (const [index, conflict] of input.conflicts.entries()) {
       const objectId =
         typeof conflict.fork_page_id === "string" ? conflict.fork_page_id : `${input.forkId}:sync`;
@@ -2060,7 +2062,7 @@ class PostgresWikiStore implements WikiStore {
   }
 
   async loadRetrievalRepository(knowledgeBaseId: string): Promise<RetrievalRepository> {
-    const repository = createInMemoryRetrievalRepository();
+    const repository = createRequestLocalRetrievalRepository();
     const scope = await this.getKnowledgeBaseScope(knowledgeBaseId);
     const pages = await this.listPages(knowledgeBaseId);
     const edges = await this.listEdges(knowledgeBaseId);

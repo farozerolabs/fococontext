@@ -1,28 +1,37 @@
 import { DynamicModule, MiddlewareConsumer, Module, NestModule } from "@nestjs/common";
-import type { RuntimeConfig } from "@fococontext/core";
+import {
+  ProductionRuntimeConfigurationError,
+  requireProductionDependency,
+  type RuntimeCache,
+  type RuntimeConfig,
+  type RuntimeQueuePressureRecorder,
+} from "@fococontext/core";
 import type { DefaultIdentitySeed } from "@fococontext/db";
 import {
   createOpenAICompatibleChatProvider,
   resolveModelProviderProfiles,
   type ChatProvider,
 } from "@fococontext/llm";
-import { APP_GUARD } from "@nestjs/core";
+import { APP_GUARD, APP_INTERCEPTOR } from "@nestjs/core";
 import {
-  createInMemoryRetrievalRepository,
   type RetrievalEmbeddingProvider,
-  type RetrievalRepository,
   type RetrievalRerankProvider,
 } from "@fococontext/retrieval";
 import {
   createInstrumentedObjectStorageAdapter,
   createS3ObjectStorageAdapter,
-  defaultObjectStorageOperationRecorder,
+  type ObjectStorageOperationRecorder,
   type ObjectStorageAdapter,
 } from "@fococontext/storage";
 
 import { ApiKeyBoundaryController } from "./api-keys/api-key-boundary.controller.js";
 import { AdminAuthController } from "./auth/admin-auth.controller.js";
-import { AdminAuthService } from "./auth/admin-auth.service.js";
+import {
+  AdminAuthService,
+  adminSessionStoreToken,
+  createRedisAdminSessionStore,
+  type AdminSessionStore,
+} from "./auth/admin-auth.service.js";
 import { AdminSessionMiddleware } from "./auth/admin-session.middleware.js";
 import {
   adminSessionApiScopeToken,
@@ -34,24 +43,12 @@ import {
   type ApiKeyResolver,
   type StaticApiKeyRecord,
 } from "./auth/api-key.guard.js";
+import { apiDatabaseMirrorToken, type ApiDatabaseMirror } from "./database/api-database-mirror.js";
 import {
-  apiDatabaseMirrorToken,
-  createNoopApiDatabaseMirror,
-  type ApiDatabaseMirror,
-} from "./database/api-database-mirror.js";
-import {
-  apiDatabaseHydratorToken,
-  createNoopApiDatabaseHydrator,
-  type ApiDatabaseHydrator,
-  type ApiDatabaseHydratorRepositories,
-} from "./database/api-database-hydrator.js";
-import {
-  createNoopOperationalReadStore,
   operationalReadStoreToken,
   type OperationalReadStore,
 } from "./database/operational-read-store.js";
 import { DeletionCleanupController } from "./deletion-cleanup/deletion-cleanup.controller.js";
-import { DeletionCleanupRepository } from "./deletion-cleanup/deletion-cleanup.repository.js";
 import { DeletionCleanupManifestCollector } from "./deletion-cleanup/deletion-cleanup.manifest.js";
 import { DeletionCleanupService } from "./deletion-cleanup/deletion-cleanup.service.js";
 import {
@@ -60,7 +57,6 @@ import {
   MediaAssetController,
   SourceEvidenceController,
 } from "./documents/document.controller.js";
-import { DocumentRepository } from "./documents/document.repository.js";
 import { DocumentService } from "./documents/document.service.js";
 import { UploadAdmissionService } from "./documents/upload-admission.service.js";
 import {
@@ -75,7 +71,6 @@ import {
   KnowledgeBaseKnowledgeCheckController,
   KnowledgeCheckController,
 } from "./knowledge-checks/knowledge-check.controller.js";
-import { KnowledgeCheckRepository } from "./knowledge-checks/knowledge-check.repository.js";
 import {
   knowledgeCheckChatProviderToken,
   KnowledgeCheckService,
@@ -85,7 +80,6 @@ import {
   ForkController,
   KnowledgeBaseController,
 } from "./knowledge-bases/knowledge-base.controller.js";
-import { KnowledgeBaseRepository } from "./knowledge-bases/knowledge-base.repository.js";
 import { KnowledgeBaseService } from "./knowledge-bases/knowledge-base.service.js";
 import { objectStorageToken } from "./object-storage.provider.js";
 import {
@@ -109,6 +103,11 @@ import {
   type KnowledgeCheckQueue,
 } from "./queues/knowledge-check.queue.js";
 import {
+  createBullMqGraphInsightsRefreshQueue,
+  graphInsightsRefreshQueueToken,
+  type GraphInsightsRefreshQueue,
+} from "./queues/graph-insights-refresh.queue.js";
+import {
   createBullMqSourceOcrQueue,
   sourceOcrQueueToken,
   type SourceOcrQueue,
@@ -121,17 +120,44 @@ import {
 import { ForkSubmissionController } from "./fork-submissions/fork-submission.controller.js";
 import { ForkSubmissionService } from "./fork-submissions/fork-submission.service.js";
 import { GraphController } from "./retrieve/graph.controller.js";
+import { GraphInsightsRefreshService } from "./retrieve/graph-insights-refresh.service.js";
 import { RetrieveController } from "./retrieve/retrieve.controller.js";
+import {
+  createRedisRetrievalQualityMetricsStore,
+  retrievalQualityMetricsStoreToken,
+  type RetrievalQualityMetricsStore,
+} from "./retrieve/retrieve-quality-metrics.js";
 import {
   boundedRetrievalRepositoryToken,
   createOpenAICompatibleRetrievalEmbeddingProvider,
   createOpenAICompatibleRetrievalRerankProvider,
   retrievalEmbeddingProviderToken,
-  retrievalRepositoryToken,
   retrievalRerankProviderToken,
   type ApiBoundedRetrievalRepository,
 } from "./retrieve/retrieve.provider.js";
 import { RetrieveService } from "./retrieve/retrieve.service.js";
+import {
+  createRedisRuntimeCache,
+  createRedisRuntimeCacheMetricsStore,
+  runtimeCacheToken,
+  runtimeCacheMetricsStoreToken,
+  type RuntimeCacheMetricsStore,
+} from "./runtime/redis-runtime-cache.js";
+import {
+  createRedisObjectStorageOperationRecorder,
+  objectStorageOperationRecorderToken,
+  type RedisObjectStorageOperationRecorder,
+} from "./runtime/redis-object-storage-operation-recorder.js";
+import {
+  createRedisRuntimeQueuePressureRecorder,
+  runtimeQueuePressureRecorderToken,
+} from "./runtime/redis-runtime-queue-pressure.js";
+import {
+  createRedisRuntimeApiMetricsStore,
+  RuntimeApiMetricsInterceptor,
+  runtimeApiMetricsStoreToken,
+  type RuntimeApiMetricsStore,
+} from "./runtime/runtime-api-metrics.js";
 import { runtimeConfigToken } from "./runtime-config.provider.js";
 import {
   KnowledgeBaseSourceWatchController,
@@ -143,7 +169,6 @@ import {
   sourceWatchScanCoordinatorToken,
   type SourceWatchScanCoordinator,
 } from "./source-watch/source-watch.coordinator.js";
-import { SourceWatchRuleRepository } from "./source-watch/source-watch.repository.js";
 import { SourceWatchSchedulerService } from "./source-watch/source-watch-scheduler.service.js";
 import {
   createDefaultSourceWatchScanner,
@@ -154,10 +179,8 @@ import { SourceWatchService } from "./source-watch/source-watch.service.js";
 import { SystemStatusController } from "./system/system-status.controller.js";
 import { SystemStatusService } from "./system/system-status.service.js";
 import { WebhookController } from "./webhooks/webhook.controller.js";
-import { WebhookRepository } from "./webhooks/webhook.repository.js";
 import { WebhookService } from "./webhooks/webhook.service.js";
 import { WikiDraftController } from "./wiki-drafts/wiki-draft.controller.js";
-import { WikiDraftRepository } from "./wiki-drafts/wiki-draft.repository.js";
 import { WikiDraftService } from "./wiki-drafts/wiki-draft.service.js";
 import {
   ChangeSetController,
@@ -168,32 +191,36 @@ import {
   KnowledgeBaseVersionController,
   WikiPageController,
 } from "./wiki/wiki.controller.js";
-import { createNoopWikiStore, type WikiStore, wikiStoreToken } from "./wiki/wiki-store.js";
+import { type WikiStore, wikiStoreToken } from "./wiki/wiki-store.js";
 
 export interface ApiModuleOptions {
   objectStorage?: ObjectStorageAdapter;
   mediaCaptionQueue?: MediaCaptionQueue;
   deletionCleanupQueue?: DeletionCleanupQueue;
   knowledgeCheckQueue?: KnowledgeCheckQueue;
+  graphInsightsRefreshQueue?: GraphInsightsRefreshQueue;
   sourceOcrQueue?: SourceOcrQueue;
   webhookDispatchQueue?: WebhookDispatchQueue;
   sourceParseQueue?: SourceParseQueue;
   sourceWatchScanCoordinator?: SourceWatchScanCoordinator;
   sourceWatchScanner?: SourceWatchScanner;
-  retrievalRepository?: RetrievalRepository;
   boundedRetrievalRepository?: ApiBoundedRetrievalRepository;
   retrievalEmbeddingProvider?: RetrievalEmbeddingProvider;
   retrievalRerankProvider?: RetrievalRerankProvider;
   knowledgeCheckChatProvider?: ChatProvider;
   apiDatabaseMirror?: ApiDatabaseMirror;
-  apiDatabaseHydratorFactory?: (
-    repositories: ApiDatabaseHydratorRepositories,
-  ) => ApiDatabaseHydrator;
   operationalReadStore?: OperationalReadStore;
   defaultIdentity?: DefaultIdentitySeed;
   wikiStore?: WikiStore;
   apiKeyResolver?: ApiKeyResolver;
   apiKeyScopes?: StaticApiKeyRecord[];
+  adminSessionStore?: AdminSessionStore;
+  objectStorageOperationRecorder?: RedisObjectStorageOperationRecorder;
+  runtimeCache?: RuntimeCache;
+  runtimeCacheMetricsStore?: RuntimeCacheMetricsStore;
+  runtimeApiMetricsStore?: RuntimeApiMetricsStore;
+  runtimeQueuePressureRecorder?: RuntimeQueuePressureRecorder;
+  retrievalQualityMetricsStore?: RetrievalQualityMetricsStore;
 }
 
 @Module({})
@@ -271,53 +298,110 @@ export class ApiModule implements NestModule {
           ),
         },
         {
+          provide: adminSessionStoreToken,
+          useValue: options.adminSessionStore ?? createRedisAdminSessionStore(config),
+        },
+        {
+          provide: runtimeApiMetricsStoreToken,
+          useValue: options.runtimeApiMetricsStore ?? createRedisRuntimeApiMetricsStore(config),
+        },
+        {
+          provide: runtimeCacheToken,
+          useValue: options.runtimeCache ?? createRedisRuntimeCache(config),
+        },
+        {
+          provide: runtimeCacheMetricsStoreToken,
+          useValue: options.runtimeCacheMetricsStore ?? createRedisRuntimeCacheMetricsStore(config),
+        },
+        {
+          provide: objectStorageOperationRecorderToken,
+          useValue:
+            options.objectStorageOperationRecorder ??
+            createRedisObjectStorageOperationRecorder(config),
+        },
+        {
+          provide: retrievalQualityMetricsStoreToken,
+          useValue:
+            options.retrievalQualityMetricsStore ?? createRedisRetrievalQualityMetricsStore(config),
+        },
+        {
+          provide: runtimeQueuePressureRecorderToken,
+          useValue:
+            options.runtimeQueuePressureRecorder ?? createRedisRuntimeQueuePressureRecorder(config),
+        },
+        {
           provide: objectStorageToken,
-          useValue: createApiObjectStorage(config, options.objectStorage),
+          useFactory: (recorder: ObjectStorageOperationRecorder) =>
+            createApiObjectStorage(config, options.objectStorage, recorder),
+          inject: [objectStorageOperationRecorderToken],
         },
         {
           provide: sourceParseQueueToken,
-          useValue: options.sourceParseQueue ?? createBullMqSourceParseQueue(config),
+          useFactory: (queuePressureRecorder: RuntimeQueuePressureRecorder) =>
+            options.sourceParseQueue ?? createBullMqSourceParseQueue(config, queuePressureRecorder),
+          inject: [runtimeQueuePressureRecorderToken],
         },
         {
           provide: mediaCaptionQueueToken,
-          useValue: options.mediaCaptionQueue ?? createBullMqMediaCaptionQueue(config),
+          useFactory: (queuePressureRecorder: RuntimeQueuePressureRecorder) =>
+            options.mediaCaptionQueue ??
+            createBullMqMediaCaptionQueue(config, queuePressureRecorder),
+          inject: [runtimeQueuePressureRecorderToken],
         },
         {
           provide: deletionCleanupQueueToken,
-          useValue: options.deletionCleanupQueue ?? createBullMqDeletionCleanupQueue(config),
+          useFactory: (queuePressureRecorder: RuntimeQueuePressureRecorder) =>
+            options.deletionCleanupQueue ??
+            createBullMqDeletionCleanupQueue(config, queuePressureRecorder),
+          inject: [runtimeQueuePressureRecorderToken],
         },
         {
           provide: knowledgeCheckQueueToken,
-          useValue: options.knowledgeCheckQueue ?? createBullMqKnowledgeCheckQueue(config),
+          useFactory: (queuePressureRecorder: RuntimeQueuePressureRecorder) =>
+            options.knowledgeCheckQueue ??
+            createBullMqKnowledgeCheckQueue(config, queuePressureRecorder),
+          inject: [runtimeQueuePressureRecorderToken],
+        },
+        {
+          provide: graphInsightsRefreshQueueToken,
+          useFactory: (queuePressureRecorder: RuntimeQueuePressureRecorder) =>
+            options.graphInsightsRefreshQueue ??
+            createBullMqGraphInsightsRefreshQueue(config, queuePressureRecorder),
+          inject: [runtimeQueuePressureRecorderToken],
         },
         {
           provide: sourceOcrQueueToken,
-          useValue: options.sourceOcrQueue ?? createBullMqSourceOcrQueue(config),
+          useFactory: (queuePressureRecorder: RuntimeQueuePressureRecorder) =>
+            options.sourceOcrQueue ?? createBullMqSourceOcrQueue(config, queuePressureRecorder),
+          inject: [runtimeQueuePressureRecorderToken],
         },
         {
           provide: webhookDispatchQueueToken,
-          useValue: options.webhookDispatchQueue ?? createBullMqWebhookDispatchQueue(config),
+          useFactory: (queuePressureRecorder: RuntimeQueuePressureRecorder) =>
+            options.webhookDispatchQueue ??
+            createBullMqWebhookDispatchQueue(config, queuePressureRecorder),
+          inject: [runtimeQueuePressureRecorderToken],
         },
         {
           provide: apiDatabaseMirrorToken,
-          useValue: options.apiDatabaseMirror ?? createNoopApiDatabaseMirror(),
+          useValue: requireProductionDependency("apiDatabaseMirror", options.apiDatabaseMirror),
         },
         {
           provide: operationalReadStoreToken,
-          useValue: options.operationalReadStore ?? createNoopOperationalReadStore(),
+          useValue: requireOperationalReadStore(options.operationalReadStore),
         },
         {
           provide: wikiStoreToken,
-          useValue: options.wikiStore ?? createNoopWikiStore(),
+          useValue: requireProductionDependency("wikiStore", options.wikiStore),
         },
         {
           provide: sourceWatchScannerToken,
           useFactory: (
-            documentRepository: DocumentRepository,
             operationalReadStore: OperationalReadStore,
+            objectStorageOperationRecorder: ObjectStorageOperationRecorder,
           ) =>
             options.sourceWatchScanner ??
-            createDefaultSourceWatchScanner(documentRepository, config, {
+            createDefaultSourceWatchScanner(config, {
               existingDocumentProvider: {
                 listExistingDocuments: (rule) =>
                   operationalReadStore.listSourceWatchDocuments({
@@ -325,8 +409,9 @@ export class ApiModule implements NestModule {
                     sourceWatchRuleId: rule.id,
                   }),
               },
+              operationRecorder: objectStorageOperationRecorder,
             }),
-          inject: [DocumentRepository, operationalReadStoreToken],
+          inject: [operationalReadStoreToken, objectStorageOperationRecorderToken],
         },
         {
           provide: sourceWatchScanCoordinatorToken,
@@ -334,12 +419,11 @@ export class ApiModule implements NestModule {
             options.sourceWatchScanCoordinator ?? createRedisSourceWatchScanCoordinator(config),
         },
         {
-          provide: retrievalRepositoryToken,
-          useValue: options.retrievalRepository ?? createInMemoryRetrievalRepository(),
-        },
-        {
           provide: boundedRetrievalRepositoryToken,
-          useValue: options.boundedRetrievalRepository,
+          useValue: requireProductionDependency(
+            "boundedRetrievalRepository",
+            options.boundedRetrievalRepository,
+          ),
         },
         {
           provide: retrievalEmbeddingProviderToken,
@@ -363,73 +447,62 @@ export class ApiModule implements NestModule {
         },
         AdminAuthService,
         AdminSessionMiddleware,
-        KnowledgeBaseRepository,
         KnowledgeBaseService,
-        DocumentRepository,
         UploadAdmissionService,
-        DeletionCleanupRepository,
         DeletionCleanupManifestCollector,
-        {
-          provide: apiDatabaseHydratorToken,
-          useFactory: (
-            knowledgeBaseRepository: KnowledgeBaseRepository,
-            documentRepository: DocumentRepository,
-            deletionCleanupRepository: DeletionCleanupRepository,
-            sourceWatchRuleRepository: SourceWatchRuleRepository,
-            webhookRepository: WebhookRepository,
-            knowledgeCheckRepository: KnowledgeCheckRepository,
-          ) =>
-            options.apiDatabaseHydratorFactory?.({
-              knowledgeBaseRepository,
-              documentRepository,
-              deletionCleanupRepository,
-              sourceWatchRuleRepository,
-              webhookRepository,
-              knowledgeCheckRepository,
-            }) ?? createNoopApiDatabaseHydrator(),
-          inject: [
-            KnowledgeBaseRepository,
-            DocumentRepository,
-            DeletionCleanupRepository,
-            SourceWatchRuleRepository,
-            WebhookRepository,
-            KnowledgeCheckRepository,
-          ],
-        },
         DocumentService,
         DeletionCleanupService,
         JobService,
         BatchImportService,
-        WikiDraftRepository,
         WikiDraftService,
-        KnowledgeCheckRepository,
         KnowledgeCheckService,
+        GraphInsightsRefreshService,
         ForkSubmissionService,
-        SourceWatchRuleRepository,
         SourceWatchSchedulerService,
         SourceWatchService,
-        WebhookRepository,
         WebhookService,
         RetrieveService,
         {
           provide: SystemStatusService,
           useFactory: (
-            deletionCleanupRepository: DeletionCleanupRepository,
             uploadAdmissionService: UploadAdmissionService,
-            documentRepository: DocumentRepository,
+            operationalReadStore: OperationalReadStore,
+            runtimeApiMetricsStore: RuntimeApiMetricsStore,
+            runtimeCacheMetricsStore: RuntimeCacheMetricsStore,
+            objectStorageOperationRecorder: RedisObjectStorageOperationRecorder,
+            retrievalQualityMetricsStore: RetrievalQualityMetricsStore,
+            runtimeQueuePressureRecorder: RuntimeQueuePressureRecorder,
           ) =>
             new SystemStatusService(
               config,
               options.defaultIdentity,
-              deletionCleanupRepository,
               uploadAdmissionService,
-              documentRepository,
+              operationalReadStore,
+              runtimeApiMetricsStore,
+              runtimeCacheMetricsStore,
+              objectStorageOperationRecorder,
+              retrievalQualityMetricsStore,
+              runtimeQueuePressureRecorder,
             ),
-          inject: [DeletionCleanupRepository, UploadAdmissionService, DocumentRepository],
+          inject: [
+            UploadAdmissionService,
+            operationalReadStoreToken,
+            runtimeApiMetricsStoreToken,
+            runtimeCacheMetricsStoreToken,
+            objectStorageOperationRecorderToken,
+            retrievalQualityMetricsStoreToken,
+            runtimeQueuePressureRecorderToken,
+          ],
         },
         {
           provide: APP_GUARD,
           useClass: ApiKeyGuard,
+        },
+        {
+          provide: APP_INTERCEPTOR,
+          useFactory: (runtimeApiMetricsStore: RuntimeApiMetricsStore) =>
+            new RuntimeApiMetricsInterceptor(runtimeApiMetricsStore),
+          inject: [runtimeApiMetricsStoreToken],
         },
       ],
     };
@@ -440,14 +513,32 @@ export class ApiModule implements NestModule {
   }
 }
 
+function requireOperationalReadStore(
+  operationalReadStore: OperationalReadStore | undefined,
+): OperationalReadStore {
+  const store = requireProductionDependency("operationalReadStore", operationalReadStore);
+  if (!store.supportsOperationalReads) {
+    throw new ProductionRuntimeConfigurationError({
+      apiErrorCode: "durable_backend_unavailable",
+      message: "Production runtime dependency is missing or invalid: operationalReadStore.",
+      details: {
+        invalid: ["operationalReadStore"],
+      },
+    });
+  }
+
+  return store;
+}
+
 function createApiObjectStorage(
   config: RuntimeConfig,
   objectStorage: ObjectStorageAdapter | undefined,
+  recorder: ObjectStorageOperationRecorder,
 ): ObjectStorageAdapter {
   const instrumentation = {
     caller: "api.object_storage",
     enabled: config.limits.objectStorageOperations.metricsEnabled,
-    recorder: defaultObjectStorageOperationRecorder,
+    recorder,
     scope: "system" as const,
   };
 

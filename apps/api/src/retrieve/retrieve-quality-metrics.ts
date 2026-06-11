@@ -3,6 +3,8 @@ import type {
   RetrieveEvidenceSufficiency,
   RetrieveResponse,
 } from "@fococontext/retrieval";
+import { RedisConnection } from "bullmq";
+import type { RuntimeConfig } from "@fococontext/core";
 
 type RetrieveQualityRerankStatus =
   | "disabled"
@@ -62,14 +64,31 @@ export interface RetrieveQualityMetricSummary {
   windowSeconds: number;
 }
 
-const retrievalQualityMetricRecords: RetrieveQualityMetricRecord[] = [];
 const defaultWindowSeconds = 300;
 const maxRecords = 1000;
+const retrievalQualityMetricsKey = "fococontext:retrieval-quality-metrics";
+const retrievalQualityMetricsTtlSeconds = 24 * 60 * 60;
 
-export function recordRetrievalQualityMetric(input: {
+export interface RetrievalQualityMetricsStore {
+  readonly backend: "redis";
+  close?(): Promise<void>;
+  record(record: RetrieveQualityMetricRecord): Promise<void>;
+  reset?(): Promise<void>;
+  snapshot(windowSeconds?: number, nowMs?: number): Promise<RetrieveQualityMetricSummary>;
+}
+
+export const retrievalQualityMetricsStoreToken = Symbol("retrievalQualityMetricsStore");
+
+export function createRedisRetrievalQualityMetricsStore(
+  config: RuntimeConfig,
+): RetrievalQualityMetricsStore {
+  return new RedisRetrievalQualityMetricsStore(config);
+}
+
+export function createRetrievalQualityMetricRecord(input: {
   latencyMs: number;
   response: RetrieveResponse;
-}): void {
+}): RetrieveQualityMetricRecord {
   const response = input.response;
   const traceStageNames = response.trace?.stages.map((stage) => stage.name) ?? [];
   const rerankStageOutput = response.trace?.stages.find((stage) => stage.name === "rerank")?.output;
@@ -86,7 +105,7 @@ export function recordRetrievalQualityMetric(input: {
   const duplicateControl = readRecord(readRecord(rankFusionOutput?.diagnostics).duplicate_control);
   const warningCodes = [...new Set(response.warnings)];
 
-  retrievalQualityMetricRecords.push({
+  return {
     timestampMs: Date.now(),
     mode: response.mode,
     resultCount: response.results.length,
@@ -116,19 +135,16 @@ export function recordRetrievalQualityMetric(input: {
     evidenceSufficiency: response.answerability.evidence_sufficiency,
     answerabilityReasonCodes: response.answerability.reason_codes,
     traceStageNames,
-  });
-
-  if (retrievalQualityMetricRecords.length > maxRecords) {
-    retrievalQualityMetricRecords.splice(0, retrievalQualityMetricRecords.length - maxRecords);
-  }
+  };
 }
 
-export function snapshotRetrievalQualityMetrics(
+export function summarizeRetrievalQualityMetrics(
+  records: readonly RetrieveQualityMetricRecord[],
   windowSeconds = defaultWindowSeconds,
   nowMs = Date.now(),
 ): RetrieveQualityMetricSummary {
   const cutoffMs = nowMs - windowSeconds * 1000;
-  const records = retrievalQualityMetricRecords.filter((record) => record.timestampMs >= cutoffMs);
+  const windowRecords = records.filter((record) => record.timestampMs >= cutoffMs);
   const summary: RetrieveQualityMetricSummary = {
     answerabilityReasonCounts: {},
     answerabilityStatusCounts: {
@@ -169,11 +185,11 @@ export function snapshotRetrievalQualityMetrics(
     },
     traceStageCounts: {},
     warningCounts: {},
-    total: records.length,
+    total: windowRecords.length,
     windowSeconds,
   };
 
-  for (const record of records) {
+  for (const record of windowRecords) {
     increment(summary.modeCounts, record.mode);
     increment(summary.latencyBuckets, record.latencyBucket);
     increment(summary.resultCountBuckets, toResultCountBucket(record.resultCount));
@@ -237,8 +253,107 @@ export function snapshotRetrievalQualityMetrics(
   return summary;
 }
 
-export function resetRetrievalQualityMetrics(): void {
-  retrievalQualityMetricRecords.splice(0, retrievalQualityMetricRecords.length);
+class RedisRetrievalQualityMetricsStore implements RetrievalQualityMetricsStore {
+  readonly backend = "redis";
+
+  private readonly connection: RedisConnection;
+
+  constructor(config: RuntimeConfig) {
+    this.connection = new RedisConnection({
+      url: config.redis.url,
+    });
+  }
+
+  async record(record: RetrieveQualityMetricRecord): Promise<void> {
+    const client = await this.connection.client;
+
+    await client.runCommand("rpush", [retrievalQualityMetricsKey, JSON.stringify(record)]);
+    await client.runCommand("ltrim", [retrievalQualityMetricsKey, String(-maxRecords), "-1"]);
+    await client.runCommand("expire", [
+      retrievalQualityMetricsKey,
+      String(retrievalQualityMetricsTtlSeconds),
+    ]);
+  }
+
+  async snapshot(
+    windowSeconds = defaultWindowSeconds,
+    nowMs = Date.now(),
+  ): Promise<RetrieveQualityMetricSummary> {
+    const client = await this.connection.client;
+    const values = await client.runCommand("lrange", [retrievalQualityMetricsKey, "0", "-1"]);
+
+    return summarizeRetrievalQualityMetrics(
+      readRetrievalQualityMetricRecords(values),
+      windowSeconds,
+      nowMs,
+    );
+  }
+
+  async reset(): Promise<void> {
+    const client = await this.connection.client;
+
+    await client.runCommand("del", [retrievalQualityMetricsKey]);
+  }
+
+  async close(): Promise<void> {
+    await this.connection.close();
+  }
+}
+
+function readRetrievalQualityMetricRecords(value: unknown): RetrieveQualityMetricRecord[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((item) => {
+    if (typeof item !== "string") {
+      return [];
+    }
+
+    try {
+      const parsed = JSON.parse(item) as Partial<RetrieveQualityMetricRecord>;
+
+      if (
+        typeof parsed.timestampMs !== "number" ||
+        typeof parsed.mode !== "string" ||
+        typeof parsed.resultCount !== "number" ||
+        typeof parsed.latencyMs !== "number" ||
+        typeof parsed.latencyBucket !== "string" ||
+        parsed.answerabilityStatus === undefined ||
+        parsed.evidenceSufficiency === undefined
+      ) {
+        return [];
+      }
+
+      return [
+        {
+          timestampMs: parsed.timestampMs,
+          mode: parsed.mode,
+          resultCount: parsed.resultCount,
+          warningCodes: readStringList(parsed.warningCodes),
+          rerankStatus: readRerankStatus(parsed.rerankStatus),
+          latencyMs: parsed.latencyMs,
+          latencyBucket: parsed.latencyBucket,
+          duplicateCandidatesPruned: readNonNegativeInteger(parsed.duplicateCandidatesPruned),
+          contextBudgetExceeded: readNonNegativeInteger(parsed.contextBudgetExceeded),
+          duplicateContextPruned: readNonNegativeInteger(parsed.duplicateContextPruned),
+          citationUnresolved: readNonNegativeInteger(parsed.citationUnresolved),
+          graphExpansionLimited: readNonNegativeInteger(parsed.graphExpansionLimited),
+          fallbackEvidenceRequested: readNonNegativeInteger(parsed.fallbackEvidenceRequested),
+          answerabilityStatus: readAnswerabilityStatus(parsed.answerabilityStatus),
+          answerabilityConfidenceBucket:
+            typeof parsed.answerabilityConfidenceBucket === "string"
+              ? parsed.answerabilityConfidenceBucket
+              : "unknown",
+          evidenceSufficiency: readEvidenceSufficiency(parsed.evidenceSufficiency),
+          answerabilityReasonCodes: readStringList(parsed.answerabilityReasonCodes),
+          traceStageNames: readStringList(parsed.traceStageNames),
+        },
+      ];
+    } catch {
+      return [];
+    }
+  });
 }
 
 function countUnresolvedCitations(response: RetrieveResponse): number {
@@ -261,6 +376,28 @@ function readRerankStatus(value: unknown): RetrieveQualityRerankStatus {
   }
 
   return "unknown";
+}
+
+function readAnswerabilityStatus(value: unknown): RetrieveAnswerabilityStatus {
+  if (value === "answerable" || value === "not_answerable" || value === "partial") {
+    return value;
+  }
+
+  return "partial";
+}
+
+function readEvidenceSufficiency(value: unknown): RetrieveEvidenceSufficiency {
+  if (value === "insufficient" || value === "partial" || value === "sufficient") {
+    return value;
+  }
+
+  return "partial";
+}
+
+function readStringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
 }
 
 function readRecord(value: unknown): Record<string, unknown> {

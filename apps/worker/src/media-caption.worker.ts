@@ -142,7 +142,9 @@ export interface VisionCaptionProvider {
 export interface MediaCaptionProcessorConfig {
   concurrency: number;
   contextChars: number;
+  maxImageBytes: number;
   maxImagesPerDocument: number;
+  maxMarkdownBytes: number;
   maxOutputTokens: number;
   model: string;
   previewMaxChars?: number;
@@ -293,7 +295,18 @@ export class MediaCaptionProcessor {
       };
     }
 
-    const normalizedMarkdown = await this.readObjectText(payload.normalized_markdown_object_key);
+    const normalizedMarkdownRead = await this.readObjectTextWithinLimit(
+      payload.normalized_markdown_object_key,
+      this.config.maxMarkdownBytes,
+    );
+
+    if (normalizedMarkdownRead.kind === "fatal") {
+      await this.markCaptioningFailed(payload, normalizedMarkdownRead.error);
+
+      return this.createFailedResult(payload);
+    }
+
+    const normalizedMarkdown = normalizedMarkdownRead.text;
     const resolvedPrompt = resolveDatasetPromptTemplateFromSnapshot({
       purpose: "vision_caption",
       datasetConfigurationSnapshot: payload.dataset_configuration_snapshot,
@@ -571,7 +584,20 @@ export class MediaCaptionProcessor {
     usage?: ModelCallUsage;
   }> {
     const image = await this.objectStorage.getObject({ key: asset.object_key });
-    const imageBytes = await readBody(image.body);
+    const imageRead = await readBodyWithinLimit(
+      image.body,
+      image.contentLength,
+      this.config.maxImageBytes,
+      asset.object_key,
+    );
+
+    if (imageRead.kind === "fatal") {
+      throw new Error(
+        `Vision caption image read limit exceeded: ${imageRead.actualBytes}/${imageRead.limitBytes}.`,
+      );
+    }
+
+    const imageBytes = imageRead.content;
     const context = sliceMarkdownImageContext(normalizedMarkdown, {
       contextChars: this.config.contextChars,
       objectKey: asset.object_key,
@@ -799,11 +825,31 @@ export class MediaCaptionProcessor {
     return guard;
   }
 
-  private async readObjectText(key: string): Promise<string> {
+  private async readObjectTextWithinLimit(
+    key: string,
+    maxBytes: number,
+  ): Promise<
+    { kind: "success"; text: string } | { kind: "fatal"; error: Record<string, unknown> }
+  > {
     const object = await this.objectStorage.getObject({ key });
-    const body = await readBody(object.body);
+    const body = await readBodyWithinLimit(object.body, object.contentLength, maxBytes, key);
 
-    return body.toString("utf8");
+    if (body.kind === "fatal") {
+      return {
+        kind: "fatal",
+        error: {
+          code: "media_caption_markdown_limit_exceeded",
+          object_key: key,
+          actual_bytes: body.actualBytes,
+          limit_bytes: body.limitBytes,
+        },
+      };
+    }
+
+    return {
+      kind: "success",
+      text: body.content.toString("utf8"),
+    };
   }
 
   private createCompletedResult(
@@ -843,6 +889,27 @@ export class MediaCaptionProcessor {
       provider_call_count: 0,
       captioned_markdown_object_key: null,
     };
+  }
+
+  private createFailedResult(payload: MediaCaptionPayload): MediaCaptionProcessorResult {
+    return this.createStoppedResult(payload);
+  }
+
+  private async markCaptioningFailed(
+    payload: MediaCaptionPayload,
+    error: Record<string, unknown>,
+  ): Promise<void> {
+    await this.jobProgress?.updateJobProgress({
+      jobId: payload.job_id,
+      knowledgeBaseId: payload.knowledge_base_id,
+      inputSnapshotId: payload.input_snapshot_id,
+      stage: "captioning",
+      status: "failed",
+      progress: 100,
+      message: "Media captioning failed.",
+      parsedContentId: payload.parsed_content_id,
+      error,
+    });
   }
 
   private async recordVisionCaptionModelCall(
@@ -1281,14 +1348,47 @@ function toUsage(value: unknown): ModelCallUsage | undefined {
   return Object.keys(usage).length === 0 ? undefined : usage;
 }
 
-async function readBody(body: unknown): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-
-  for await (const chunk of body as AsyncIterable<Buffer | string>) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+async function readBodyWithinLimit(
+  body: unknown,
+  contentLength: number | undefined,
+  maxBytes: number,
+  objectKey: string,
+): Promise<
+  | { kind: "success"; content: Buffer }
+  | { kind: "fatal"; objectKey: string; actualBytes: number; limitBytes: number }
+> {
+  if (contentLength !== undefined && contentLength > maxBytes) {
+    return {
+      kind: "fatal",
+      objectKey,
+      actualBytes: contentLength,
+      limitBytes: maxBytes,
+    };
   }
 
-  return Buffer.concat(chunks);
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+
+  for await (const chunk of body as AsyncIterable<Buffer | string>) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.byteLength;
+
+    if (totalBytes > maxBytes) {
+      return {
+        kind: "fatal",
+        objectKey,
+        actualBytes: totalBytes,
+        limitBytes: maxBytes,
+      };
+    }
+
+    chunks.push(buffer);
+  }
+
+  return {
+    kind: "success",
+    content: Buffer.concat(chunks, totalBytes),
+  };
 }
 
 type AsyncLimiter = <T>(task: () => Promise<T>) => Promise<T>;

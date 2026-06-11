@@ -408,6 +408,26 @@ export interface ParserLimitContext {
   mimeType: string;
 }
 
+export function createParserLimitError(
+  limitName: ParserLimitName,
+  actual: number,
+  limit: number,
+  context: ParserLimitContext,
+): ParserFatalError {
+  return {
+    kind: "parser_limit_exceeded",
+    parserName: context.parserName,
+    parserVersion: context.parserVersion,
+    fileExtension: normalizeExtension(context.fileName),
+    mimeType: normalizeMimeType(context.mimeType),
+    message: `Parser limit exceeded: ${limitName}.`,
+    retryable: false,
+    limitName,
+    actual,
+    limit,
+  };
+}
+
 export interface ZipExpansionSummary {
   entryCount: number;
   totalExpandedBytes: number;
@@ -481,18 +501,12 @@ export function createDefaultParserRegistry(): ParserRegistry {
   return registry;
 }
 
-export function createInMemoryParserCache(): ParserCache {
-  const records = new Map<string, ParsedContent>();
-
+export function createNoopParserCache(): ParserCache {
   return {
-    async get(key) {
-      const record = records.get(createParserCacheKey(key));
-
-      return record === undefined ? undefined : cloneParsedContent(record);
+    async get() {
+      return undefined;
     },
-    async set(key, value) {
-      records.set(createParserCacheKey(key), cloneParsedContent(value));
-    },
+    async set() {},
   };
 }
 
@@ -1228,7 +1242,7 @@ export async function parseWithLimits(
   if (contentSize > limits.maxFileSizeBytes) {
     return {
       kind: "fatal",
-      error: createLimitError("file_size", contentSize, limits.maxFileSizeBytes, context),
+      error: createParserLimitError("file_size", contentSize, limits.maxFileSizeBytes, context),
     };
   }
 
@@ -1538,6 +1552,11 @@ const defaultParsers: readonly DocumentParser[] = [
     name: "ts-json",
     mimeTypes: ["application/json"],
     extensions: [".json"],
+  }),
+  createTextParser({
+    name: "ts-jsonl",
+    mimeTypes: ["application/jsonl", "application/ndjson", "application/x-ndjson"],
+    extensions: [".jsonl", ".ndjson"],
   }),
   createTextParser({
     name: "ts-yaml",
@@ -2820,10 +2839,6 @@ function createParserCacheMetadata(
     parser_name: key.parserName,
     parser_version: key.parserVersion,
   };
-}
-
-function createParserCacheKey(key: ParserCacheKey): string {
-  return `${key.parserName}:${key.parserVersion}:${key.contentHash}`;
 }
 
 function cloneParsedContent(value: ParsedContent): ParsedContent {

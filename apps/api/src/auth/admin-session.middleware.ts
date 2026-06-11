@@ -21,19 +21,27 @@ export type AdminSessionRequest = FastifyRequest & {
 export class AdminSessionMiddleware implements NestMiddleware {
   constructor(private readonly authService: AdminAuthService) {}
 
-  use(request: AdminSessionCarrier, _reply: FastifyReply, next: () => void): void {
-    const token = parseCookieHeader(request.headers.cookie)[adminSessionCookieName];
+  async use(
+    request: AdminSessionCarrier,
+    _reply: FastifyReply,
+    next: (error?: unknown) => void,
+  ): Promise<void> {
+    try {
+      const token = parseCookieHeader(request.headers.cookie)[adminSessionCookieName];
 
-    if (token !== undefined) {
-      const session = this.authService.getSession(token);
+      if (token !== undefined) {
+        const session = await this.authService.getSession(token);
 
-      if (session !== undefined) {
-        request.adminSession = session;
-        request.adminSessionToken = token;
+        if (session !== undefined) {
+          request.adminSession = session;
+          request.adminSessionToken = token;
+        }
       }
-    }
 
-    next();
+      next();
+    } catch (error) {
+      next(error);
+    }
   }
 }
 

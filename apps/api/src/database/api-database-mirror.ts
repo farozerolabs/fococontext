@@ -34,6 +34,10 @@ export interface ApiDatabaseMirror {
   updateKnowledgeBase(record: KnowledgeBaseRecord): Promise<void>;
   saveSourceDocument(record: SourceDocumentRecord): Promise<void>;
   updateSourceDocument(record: SourceDocumentRecord): Promise<void>;
+  markSourceDocumentsDeletedForKnowledgeBase(
+    knowledgeBaseId: string,
+    deletedAt: string,
+  ): Promise<void>;
   saveUploadSession(record: UploadSessionRecord): Promise<void>;
   updateUploadSession(record: UploadSessionRecord): Promise<void>;
   saveDeletionCleanupOperation(record: DeletionCleanupOperationRecord): Promise<void>;
@@ -57,6 +61,7 @@ export function createNoopApiDatabaseMirror(): ApiDatabaseMirror {
     async updateKnowledgeBase() {},
     async saveSourceDocument() {},
     async updateSourceDocument() {},
+    async markSourceDocumentsDeletedForKnowledgeBase() {},
     async saveUploadSession() {},
     async updateUploadSession() {},
     async saveDeletionCleanupOperation() {},
@@ -545,6 +550,21 @@ class PostgresApiDatabaseMirror implements ApiDatabaseMirror {
 
   async updateSourceDocument(record: SourceDocumentRecord): Promise<void> {
     await this.saveSourceDocument(record);
+  }
+
+  async markSourceDocumentsDeletedForKnowledgeBase(
+    knowledgeBaseId: string,
+    deletedAt: string,
+  ): Promise<void> {
+    await sql`
+      update source_documents
+      set status = 'deleted',
+          deleted_at = coalesce(deleted_at, ${deletedAt}),
+          updated_at = ${deletedAt}
+      where knowledge_base_id = ${knowledgeBaseId}
+        and deleted_at is null
+        and status <> 'deleted'
+    `.execute(this.db);
   }
 
   async saveUploadSession(record: UploadSessionRecord): Promise<void> {

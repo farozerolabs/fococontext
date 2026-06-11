@@ -724,10 +724,6 @@ export class WikiPagePersistenceService {
   }
 }
 
-export function createInMemoryWikiPageRepository(): WikiPageRepository {
-  return new InMemoryWikiPageRepository();
-}
-
 export class WikiRelationshipPersistenceService {
   private readonly repository: WikiRelationshipRepository;
   private readonly idFactory: (scope: WikiRelationshipIdScope) => string;
@@ -778,10 +774,6 @@ export class WikiRelationshipPersistenceService {
   }
 }
 
-export function createInMemoryWikiRelationshipRepository(): WikiRelationshipRepository {
-  return new InMemoryWikiRelationshipRepository();
-}
-
 export class ChangeSetPersistenceService {
   private readonly repository: ChangeSetRepository;
   private readonly idFactory: (scope: ChangeSetIdScope) => string;
@@ -792,7 +784,10 @@ export class ChangeSetPersistenceService {
     this.repository = repository;
     this.idFactory = options.idFactory ?? createChangeSetResourceId;
     this.now = options.now ?? createTimestamp;
-    this.applyLock = options.applyLock ?? createInMemoryChangeSetApplyLock();
+    if (options.applyLock === undefined) {
+      throw new Error("Change Set apply lock is required.");
+    }
+    this.applyLock = options.applyLock;
   }
 
   createChangeSet(input: CreateChangeSetInput): ChangeSetRecord {
@@ -880,14 +875,6 @@ export class ChangeSetPersistenceService {
 
     return changeSet;
   }
-}
-
-export function createInMemoryChangeSetRepository(): ChangeSetRepository {
-  return new InMemoryChangeSetRepository();
-}
-
-export function createInMemoryChangeSetApplyLock(): ChangeSetApplyLock {
-  return new InMemoryChangeSetApplyLock();
 }
 
 export class KnowledgeVersionApplicationService {
@@ -996,10 +983,6 @@ export class KnowledgeVersionApplicationService {
 
     return result.version;
   }
-}
-
-export function createInMemoryKnowledgeVersionRepository(): KnowledgeVersionRepository {
-  return new InMemoryKnowledgeVersionRepository();
 }
 
 export class PageMergeService {
@@ -1122,10 +1105,6 @@ export class PageMergeService {
   }
 }
 
-export function createInMemoryPageMergeRepository(): PageMergeRepository {
-  return new InMemoryPageMergeRepository();
-}
-
 export class DedupService {
   private readonly repository: DedupRepository;
   private readonly idFactory: (scope: DedupIdScope) => string;
@@ -1231,10 +1210,6 @@ export class DedupService {
   getDuplicateDecision(decisionId: string): DuplicateDecisionRecord | undefined {
     return this.repository.findDuplicateDecisionById(decisionId);
   }
-}
-
-export function createInMemoryDedupRepository(): DedupRepository {
-  return new InMemoryDedupRepository();
 }
 
 export class ParsedContentIngestService {
@@ -1671,14 +1646,6 @@ export class RollbackService {
   }
 }
 
-export function createInMemoryRollbackRepository(): RollbackRepository {
-  return new InMemoryRollbackRepository();
-}
-
-export function createInMemoryIndexUpdateQueue(): IndexUpdateQueue {
-  return new InMemoryIndexUpdateQueue();
-}
-
 function createVersionSnapshot(input: {
   id: string;
   page: WikiPageCurrentState;
@@ -1708,258 +1675,6 @@ function createVersionSnapshot(input: {
     created_at: input.createdAt,
     created_by: input.createdBy,
   };
-}
-
-class InMemoryWikiPageRepository implements WikiPageRepository {
-  private readonly pages = new Map<string, WikiPageCurrentState>();
-  private readonly versions = new Map<string, WikiPageVersionSnapshot>();
-  private readonly versionIdsByPage = new Map<string, string[]>();
-  private readonly systemPageIdsByKey = new Map<string, string>();
-
-  savePage(page: WikiPageCurrentState): void {
-    this.pages.set(page.id, clonePage(page));
-
-    if (page.system_page_key !== undefined) {
-      this.systemPageIdsByKey.set(createSystemPageStorageKey(page), page.id);
-    }
-  }
-
-  savePageVersion(version: WikiPageVersionSnapshot): void {
-    this.versions.set(version.id, clonePageVersion(version));
-
-    const versionIds = this.versionIdsByPage.get(version.page_id) ?? [];
-
-    if (!versionIds.includes(version.id)) {
-      versionIds.push(version.id);
-      this.versionIdsByPage.set(version.page_id, versionIds);
-    }
-  }
-
-  findPageById(pageId: string): WikiPageCurrentState | undefined {
-    const page = this.pages.get(pageId);
-
-    return page === undefined ? undefined : clonePage(page);
-  }
-
-  findSystemPageByKey(
-    knowledgeBaseId: string,
-    systemPageKey: SystemPageKey,
-  ): WikiPageCurrentState | undefined {
-    const pageId = this.systemPageIdsByKey.get(
-      createSystemPageLookupKey(knowledgeBaseId, systemPageKey),
-    );
-
-    return pageId === undefined ? undefined : this.findPageById(pageId);
-  }
-
-  findPageVersionById(pageVersionId: string): WikiPageVersionSnapshot | undefined {
-    const version = this.versions.get(pageVersionId);
-
-    return version === undefined ? undefined : clonePageVersion(version);
-  }
-
-  listPageVersions(pageId: string): WikiPageVersionSnapshot[] {
-    return (this.versionIdsByPage.get(pageId) ?? [])
-      .map((versionId) => this.versions.get(versionId))
-      .filter((version): version is WikiPageVersionSnapshot => version !== undefined)
-      .map(clonePageVersion);
-  }
-}
-
-class InMemoryWikiRelationshipRepository implements WikiRelationshipRepository {
-  private readonly edges = new Map<string, WikiRelationshipEdgeRecord>();
-  private readonly edgeSources = new Map<string, WikiRelationshipEdgeSourceRecord[]>();
-  private readonly edgeIdsByPage = new Map<string, string[]>();
-
-  saveEdge(edge: WikiRelationshipEdgeRecord): void {
-    this.edges.set(edge.id, cloneEdge(edge));
-    this.indexEdgeForPage(edge.from_page_id, edge.id);
-    this.indexEdgeForPage(edge.to_page_id, edge.id);
-  }
-
-  saveEdgeSources(edgeId: string, sources: readonly WikiRelationshipEdgeSourceRecord[]): void {
-    this.edgeSources.set(edgeId, sources.map(cloneEdgeSource));
-  }
-
-  findEdgeById(edgeId: string): WikiRelationshipEdgeRecord | undefined {
-    const edge = this.edges.get(edgeId);
-
-    return edge === undefined ? undefined : cloneEdge(edge);
-  }
-
-  listEdgesForPage(pageId: string): WikiRelationshipEdgeRecord[] {
-    return (this.edgeIdsByPage.get(pageId) ?? [])
-      .map((edgeId) => this.edges.get(edgeId))
-      .filter((edge): edge is WikiRelationshipEdgeRecord => edge !== undefined)
-      .map(cloneEdge);
-  }
-
-  listEdgeSources(edgeId: string): WikiRelationshipEdgeSourceRecord[] {
-    return (this.edgeSources.get(edgeId) ?? []).map(cloneEdgeSource);
-  }
-
-  private indexEdgeForPage(pageId: string, edgeId: string): void {
-    const edgeIds = this.edgeIdsByPage.get(pageId) ?? [];
-
-    if (!edgeIds.includes(edgeId)) {
-      edgeIds.push(edgeId);
-      this.edgeIdsByPage.set(pageId, edgeIds);
-    }
-  }
-}
-
-class InMemoryChangeSetRepository implements ChangeSetRepository {
-  private readonly changeSets = new Map<string, ChangeSetRecord>();
-  private readonly itemsByChangeSet = new Map<string, ChangeSetItemRecord[]>();
-
-  saveChangeSet(changeSet: ChangeSetRecord): void {
-    this.changeSets.set(changeSet.id, cloneChangeSet(changeSet));
-  }
-
-  saveChangeSetItems(changeSetId: string, items: readonly ChangeSetItemRecord[]): void {
-    this.itemsByChangeSet.set(changeSetId, items.map(cloneChangeSetItem));
-  }
-
-  findChangeSetById(changeSetId: string): ChangeSetRecord | undefined {
-    const changeSet = this.changeSets.get(changeSetId);
-
-    return changeSet === undefined ? undefined : cloneChangeSet(changeSet);
-  }
-
-  listChangeSetItems(changeSetId: string): ChangeSetItemRecord[] {
-    return (this.itemsByChangeSet.get(changeSetId) ?? []).map(cloneChangeSetItem);
-  }
-}
-
-class InMemoryChangeSetApplyLock implements ChangeSetApplyLock {
-  private readonly lockedKnowledgeBaseIds = new Set<string>();
-
-  runWithKnowledgeBaseApplyLock<TResult>(
-    knowledgeBaseId: string,
-    operation: () => TResult,
-  ): TResult {
-    if (this.lockedKnowledgeBaseIds.has(knowledgeBaseId)) {
-      throw new Error(
-        `Change Set apply lock is already held for Knowledge Base ${knowledgeBaseId}.`,
-      );
-    }
-
-    this.lockedKnowledgeBaseIds.add(knowledgeBaseId);
-
-    try {
-      return operation();
-    } finally {
-      this.lockedKnowledgeBaseIds.delete(knowledgeBaseId);
-    }
-  }
-}
-
-class InMemoryKnowledgeVersionRepository implements KnowledgeVersionRepository {
-  private readonly knowledgeVersions = new Map<string, KnowledgeVersionRecord>();
-
-  saveKnowledgeVersion(knowledgeVersion: KnowledgeVersionRecord): void {
-    this.knowledgeVersions.set(knowledgeVersion.id, cloneKnowledgeVersion(knowledgeVersion));
-  }
-
-  findKnowledgeVersionById(knowledgeVersionId: string): KnowledgeVersionRecord | undefined {
-    const knowledgeVersion = this.knowledgeVersions.get(knowledgeVersionId);
-
-    return knowledgeVersion === undefined ? undefined : cloneKnowledgeVersion(knowledgeVersion);
-  }
-}
-
-class InMemoryPageMergeRepository implements PageMergeRepository {
-  private readonly pageMergeRecords = new Map<string, PageMergeRecord>();
-
-  savePageMergeRecord(record: PageMergeRecord): void {
-    this.pageMergeRecords.set(record.id, clonePageMergeRecord(record));
-  }
-
-  findPageMergeRecordById(pageMergeRecordId: string): PageMergeRecord | undefined {
-    const record = this.pageMergeRecords.get(pageMergeRecordId);
-
-    return record === undefined ? undefined : clonePageMergeRecord(record);
-  }
-}
-
-class InMemoryDedupRepository implements DedupRepository {
-  private readonly duplicateCandidates = new Map<string, DuplicateCandidateRecord>();
-  private readonly duplicateDecisions = new Map<string, DuplicateDecisionRecord>();
-  private readonly candidateIdsByPagePair = new Map<string, string>();
-
-  saveDuplicateCandidate(record: DuplicateCandidateRecord): void {
-    this.duplicateCandidates.set(record.id, cloneDuplicateCandidate(record));
-    this.candidateIdsByPagePair.set(createDuplicateCandidatePairKey(record), record.id);
-  }
-
-  findDuplicateCandidateById(candidateId: string): DuplicateCandidateRecord | undefined {
-    const record = this.duplicateCandidates.get(candidateId);
-
-    return record === undefined ? undefined : cloneDuplicateCandidate(record);
-  }
-
-  findDuplicateCandidateByPagePair(
-    knowledgeBaseId: string,
-    leftPageId: string,
-    rightPageId: string,
-  ): DuplicateCandidateRecord | undefined {
-    const candidateId = this.candidateIdsByPagePair.get(
-      createDuplicatePagePairLookupKey(knowledgeBaseId, leftPageId, rightPageId),
-    );
-
-    return candidateId === undefined ? undefined : this.findDuplicateCandidateById(candidateId);
-  }
-
-  saveDuplicateDecision(record: DuplicateDecisionRecord): void {
-    this.duplicateDecisions.set(record.id, cloneDuplicateDecision(record));
-  }
-
-  findDuplicateDecisionById(decisionId: string): DuplicateDecisionRecord | undefined {
-    const record = this.duplicateDecisions.get(decisionId);
-
-    return record === undefined ? undefined : cloneDuplicateDecision(record);
-  }
-}
-
-class InMemoryRollbackRepository implements RollbackRepository {
-  private readonly rollbackRecords = new Map<string, RollbackRecord>();
-
-  saveRollbackRecord(record: RollbackRecord): void {
-    this.rollbackRecords.set(record.id, cloneRollbackRecord(record));
-  }
-
-  findRollbackRecordById(rollbackRecordId: string): RollbackRecord | undefined {
-    const record = this.rollbackRecords.get(rollbackRecordId);
-
-    return record === undefined ? undefined : cloneRollbackRecord(record);
-  }
-}
-
-class InMemoryIndexUpdateQueue implements IndexUpdateQueue {
-  readonly jobs: IndexUpdateJob[] = [];
-
-  enqueueIndexUpdate(input: Omit<IndexUpdateJob, "job_id">): IndexUpdateJob {
-    const job: IndexUpdateJob = {
-      job_id: `index_update_${input.knowledge_version_id}`,
-      ...input,
-    };
-
-    this.jobs.push({ ...job });
-
-    return { ...job };
-  }
-}
-
-function createSystemPageStorageKey(page: WikiPageCurrentState): string {
-  if (page.system_page_key === undefined) {
-    throw new Error(`Wiki Page is not a System Page: ${page.id}`);
-  }
-
-  return createSystemPageLookupKey(page.knowledge_base_id, page.system_page_key);
-}
-
-function createSystemPageLookupKey(knowledgeBaseId: string, systemPageKey: SystemPageKey): string {
-  return `${knowledgeBaseId}:${systemPageKey}`;
 }
 
 function createWikiPageResourceId(scope: WikiPageIdScope): string {
@@ -2159,24 +1874,6 @@ function normalizeDuplicateTerm(value: string): string {
   return value.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-function createDuplicateCandidatePairKey(record: DuplicateCandidateRecord): string {
-  return createDuplicatePagePairLookupKey(
-    record.knowledge_base_id,
-    record.left_page_id,
-    record.right_page_id,
-  );
-}
-
-function createDuplicatePagePairLookupKey(
-  knowledgeBaseId: string,
-  leftPageId: string,
-  rightPageId: string,
-): string {
-  const [firstPageId, secondPageId] = [leftPageId, rightPageId].sort();
-
-  return `${knowledgeBaseId}:${firstPageId}:${secondPageId}`;
-}
-
 function clonePage(page: WikiPageCurrentState): WikiPageCurrentState {
   return {
     ...page,
@@ -2240,23 +1937,6 @@ function cloneEdge(edge: WikiRelationshipEdgeRecord): WikiRelationshipEdgeRecord
   };
 }
 
-function cloneEdgeSource(
-  source: WikiRelationshipEdgeSourceRecord,
-): WikiRelationshipEdgeSourceRecord {
-  return source.note === undefined
-    ? {
-        edge_id: source.edge_id,
-        document_id: source.document_id,
-        locator: source.locator,
-      }
-    : {
-        edge_id: source.edge_id,
-        document_id: source.document_id,
-        locator: source.locator,
-        note: source.note,
-      };
-}
-
 function createChangeSetItem(
   changeSetId: string,
   index: number,
@@ -2274,13 +1954,6 @@ function createChangeSetItem(
 
 function cloneChangeSet(changeSet: ChangeSetRecord): ChangeSetRecord {
   return cloneJson(changeSet);
-}
-
-function cloneChangeSetItem(item: ChangeSetItemRecord): ChangeSetItemRecord {
-  return {
-    ...item,
-    diff: cloneJson(item.diff),
-  };
 }
 
 function cloneJson<T>(value: T): T {

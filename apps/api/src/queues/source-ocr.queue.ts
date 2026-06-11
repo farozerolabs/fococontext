@@ -1,5 +1,7 @@
 import { Queue } from "bullmq";
-import type { RuntimeConfig } from "@fococontext/core";
+import type { RuntimeConfig, RuntimeQueuePressureRecorder } from "@fococontext/core";
+
+import { recordQueuePressureBackpressure, recordQueuePressureQueued } from "./queue-pressure.js";
 
 export const sourceOcrQueueToken = Symbol("sourceOcrQueue");
 export const sourceOcrQueueName = "source.ocr";
@@ -49,7 +51,10 @@ export class BullMqSourceOcrQueue implements SourceOcrQueue {
   readonly minTextCharsPerPage: number;
   private readonly queue: Queue<SourceOcrQueuePayload>;
 
-  constructor(config: RuntimeConfig) {
+  constructor(
+    config: RuntimeConfig,
+    private readonly queuePressureRecorder?: RuntimeQueuePressureRecorder,
+  ) {
     this.enabled = config.ocr.enabled && config.ocr.serviceBaseUrl !== undefined;
     this.maxPagesPerDocument = config.limits.ocr.maxPagesPerDocument;
     this.minTextCharsPerPage = config.limits.ocr.minTextCharsPerPage;
@@ -74,9 +79,23 @@ export class BullMqSourceOcrQueue implements SourceOcrQueue {
       throw new Error("source.ocr queue is disabled.");
     }
 
-    await this.queue.add(sourceOcrJobName, payload, {
-      jobId: `${payload.job_id}-ocr-${payload.parsed_content_id}`,
-    });
+    try {
+      await this.queue.add(sourceOcrJobName, payload, {
+        jobId: `${payload.job_id}-ocr-${payload.parsed_content_id}`,
+      });
+      await recordQueuePressureQueued({
+        recorder: this.queuePressureRecorder,
+        scopeId: payload.knowledge_base_id,
+        workKind: "source-parse",
+      });
+    } catch (error) {
+      await recordQueuePressureBackpressure({
+        recorder: this.queuePressureRecorder,
+        scopeId: payload.knowledge_base_id,
+        workKind: "source-parse",
+      });
+      throw error;
+    }
 
     return {
       queue_name: sourceOcrQueueName,
@@ -90,6 +109,9 @@ export class BullMqSourceOcrQueue implements SourceOcrQueue {
   }
 }
 
-export function createBullMqSourceOcrQueue(config: RuntimeConfig): SourceOcrQueue {
-  return new BullMqSourceOcrQueue(config);
+export function createBullMqSourceOcrQueue(
+  config: RuntimeConfig,
+  queuePressureRecorder?: RuntimeQueuePressureRecorder,
+): SourceOcrQueue {
+  return new BullMqSourceOcrQueue(config, queuePressureRecorder);
 }

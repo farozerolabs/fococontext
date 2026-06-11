@@ -1,15 +1,16 @@
 import { Inject, Injectable, Optional } from "@nestjs/common";
 import { ApiError } from "@fococontext/contracts";
-import type { RuntimeConfig } from "@fococontext/core";
+import type { RuntimeCache, RuntimeConfig } from "@fococontext/core";
 import {
   BoundedGraphQueryService,
   BoundedRetrieveExpandEngine,
   RetrieveEngine,
-  RetrieveExpandEngine,
-  GraphQueryService,
+  createRequestLocalRetrievalRepository,
   type GraphQueryInput,
   type GraphInsightsResponse,
   type GraphInsightStatus,
+  type GraphQueryResponse,
+  type ExpandableGraphNode,
   type RetrieveExpandInput,
   type RetrieveInput,
   type RetrieveResponse,
@@ -17,31 +18,38 @@ import {
   type RetrievalRepository,
 } from "@fococontext/retrieval";
 
+import {
+  operationalReadStoreToken,
+  type OperationalReadStore,
+} from "../database/operational-read-store.js";
 import { DocumentService } from "../documents/document.service.js";
 import type {
   SourceEvidenceBatchItemResultResponse,
   SourceEvidenceBatchResponse,
 } from "../documents/document.types.js";
-import { KnowledgeBaseService } from "../knowledge-bases/knowledge-base.service.js";
-import { wikiStoreToken, type WikiStore } from "../wiki/wiki-store.js";
+import type { KnowledgeBaseResponse } from "../knowledge-bases/knowledge-base.types.js";
+import { wikiStoreToken, type WikiPageApiRecord, type WikiStore } from "../wiki/wiki-store.js";
 import {
   boundedRetrievalRepositoryToken,
   retrievalEmbeddingProviderToken,
-  retrievalRepositoryToken,
   retrievalRerankProviderToken,
   type ApiRetrievalEmbeddingProvider,
-  type ApiRetrievalRepository,
   type ApiRetrievalRerankProvider,
 } from "./retrieve.provider.js";
 import { runtimeConfigToken } from "../runtime-config.provider.js";
-import type { ApiResourceScope } from "../auth/api-key.guard.js";
-import { recordRetrievalQualityMetric } from "./retrieve-quality-metrics.js";
+import { runtimeCacheToken } from "../runtime/redis-runtime-cache.js";
+import { defaultApiResourceScope, type ApiResourceScope } from "../auth/api-key.guard.js";
+import {
+  createRetrievalQualityMetricRecord,
+  retrievalQualityMetricsStoreToken,
+  type RetrievalQualityMetricsStore,
+} from "./retrieve-quality-metrics.js";
 
 @Injectable()
 export class RetrieveService {
   constructor(
-    private readonly knowledgeBaseService: KnowledgeBaseService,
-    @Inject(retrievalRepositoryToken) private readonly repository: ApiRetrievalRepository,
+    @Inject(operationalReadStoreToken)
+    private readonly operationalReadStore: OperationalReadStore,
     @Inject(wikiStoreToken) private readonly wikiStore: WikiStore,
     @Inject(retrievalEmbeddingProviderToken)
     private readonly embeddingProvider: ApiRetrievalEmbeddingProvider,
@@ -53,6 +61,12 @@ export class RetrieveService {
     @Optional()
     @Inject(boundedRetrievalRepositoryToken)
     private readonly boundedRetrievalRepository?: BoundedRetrievalRepository,
+    @Optional()
+    @Inject(retrievalQualityMetricsStoreToken)
+    private readonly retrievalQualityMetricsStore?: RetrievalQualityMetricsStore,
+    @Optional()
+    @Inject(runtimeCacheToken)
+    private readonly runtimeCache?: RuntimeCache,
   ) {}
 
   async retrieve(
@@ -60,29 +74,19 @@ export class RetrieveService {
     input: Omit<RetrieveInput, "knowledge_base_id">,
     scope?: ApiResourceScope,
   ) {
-    const knowledgeBase = this.knowledgeBaseService.get(knowledgeBaseId, scope);
+    const knowledgeBase = await this.getReadableKnowledgeBase(knowledgeBaseId, scope);
 
     validateRetrieveAnswerabilityOptions(input);
+    await this.ensureIndexedPagesAvailable(knowledgeBaseId);
 
+    const boundedRepository = this.requireBoundedRetrievalRepository();
     const engineOptions = {
       ...(this.rerankProvider === undefined ? {} : { rerankProvider: this.rerankProvider }),
-      ...(this.boundedRetrievalRepository === undefined
-        ? {}
-        : { boundedRepository: this.boundedRetrievalRepository }),
+      boundedRepository,
       limits: createRetrievalLimits(this.runtimeConfig),
     };
-    const repository = await this.resolveRetrievalRepository(knowledgeBaseId);
-
+    const repository = createRequestLocalRetrievalRepository();
     ensureRetrievalRepositoryScope(repository, knowledgeBase);
-
-    if (repository.listPages(knowledgeBaseId).length === 0) {
-      throw new ApiError("retrieve_index_not_ready", {
-        messageKey: "api.error.retrieve_index_not_ready",
-        details: {
-          knowledge_base_id: knowledgeBaseId,
-        },
-      });
-    }
 
     const engine = new RetrieveEngine(repository, this.embeddingProvider, engineOptions);
     const startedAt = Date.now();
@@ -90,10 +94,12 @@ export class RetrieveService {
       ...applyDatasetRetrievePreferences(knowledgeBase.retrieval, input),
       knowledge_base_id: knowledgeBaseId,
     });
-    recordRetrievalQualityMetric({
-      latencyMs: Date.now() - startedAt,
-      response,
-    });
+    await this.retrievalQualityMetricsStore?.record(
+      createRetrievalQualityMetricRecord({
+        latencyMs: Date.now() - startedAt,
+        response,
+      }),
+    );
 
     if (response.trace !== null) {
       await this.wikiStore.saveRetrievalTrace(response.trace);
@@ -109,7 +115,7 @@ export class RetrieveService {
     input: Omit<RetrieveExpandInput, "knowledge_base_id">,
     scope?: ApiResourceScope,
   ) {
-    const knowledgeBase = this.knowledgeBaseService.get(knowledgeBaseId, scope);
+    const knowledgeBase = await this.getReadableKnowledgeBase(knowledgeBaseId, scope);
     const retrievalPreferences = createDatasetRetrievePreferences(knowledgeBase.retrieval);
     const expandInput: RetrieveExpandInput = {
       ...input,
@@ -127,16 +133,9 @@ export class RetrieveService {
       expandInput.depth = retrievalPreferences.graph_depth;
     }
 
-    const repository = await this.resolveRetrievalRepository(knowledgeBaseId);
-
-    ensureRetrievalRepositoryScope(repository, knowledgeBase);
-
-    const response =
-      this.boundedRetrievalRepository === undefined
-        ? new RetrieveExpandEngine(repository).expand(expandInput)
-        : await new BoundedRetrieveExpandEngine(this.boundedRetrievalRepository).expand(
-            expandInput,
-          );
+    const response = await new BoundedRetrieveExpandEngine(
+      this.requireBoundedRetrievalRepository(),
+    ).expand(expandInput);
 
     return this.attachResolvedEvidence(knowledgeBaseId, response, input, scope);
   }
@@ -146,30 +145,25 @@ export class RetrieveService {
     input: Omit<GraphQueryInput, "knowledge_base_id">,
     scope?: ApiResourceScope,
   ) {
-    const knowledgeBase = this.knowledgeBaseService.get(knowledgeBaseId, scope);
-    const repository = await this.resolveRetrievalRepository(knowledgeBaseId);
+    await this.getReadableKnowledgeBase(knowledgeBaseId, scope);
+    const graph = await new BoundedGraphQueryService(
+      this.requireBoundedRetrievalRepository(),
+    ).query({
+      ...input,
+      knowledge_base_id: knowledgeBaseId,
+    });
 
-    ensureRetrievalRepositoryScope(repository, knowledgeBase);
-
-    const graph =
-      this.boundedRetrievalRepository === undefined
-        ? new GraphQueryService(repository).query({
-            ...input,
-            knowledge_base_id: knowledgeBaseId,
-          })
-        : await new BoundedGraphQueryService(this.boundedRetrievalRepository).query({
-            ...input,
-            knowledge_base_id: knowledgeBaseId,
-          });
-
-    return this.attachGraphReadiness(knowledgeBaseId, graph);
+    return this.attachGraphReadiness(
+      knowledgeBaseId,
+      await this.attachSeedPageGraphNode(knowledgeBaseId, input, graph),
+    );
   }
 
   async graphInsights(knowledgeBaseId: string, scope?: ApiResourceScope) {
-    this.knowledgeBaseService.get(knowledgeBaseId, scope);
+    await this.getReadableKnowledgeBase(knowledgeBaseId, scope);
     const [status, materializedInsights] = await Promise.all([
-      this.wikiStore.getGraphInsightStatus(knowledgeBaseId),
-      this.wikiStore.getGraphInsightsSnapshot(knowledgeBaseId),
+      this.getCachedGraphInsightStatus(knowledgeBaseId),
+      this.getCachedGraphInsightsSnapshot(knowledgeBaseId),
     ]);
 
     return materializedInsights === null
@@ -177,10 +171,109 @@ export class RetrieveService {
       : { ...materializedInsights, status };
   }
 
-  private async resolveRetrievalRepository(knowledgeBaseId: string): Promise<RetrievalRepository> {
-    const repository = await this.wikiStore.loadRetrievalRepository(knowledgeBaseId);
+  private async getReadableKnowledgeBase(
+    knowledgeBaseId: string,
+    scope: ApiResourceScope = defaultApiResourceScope,
+  ): Promise<KnowledgeBaseResponse> {
+    const knowledgeBase = await this.operationalReadStore.getKnowledgeBaseById(
+      scope,
+      knowledgeBaseId,
+    );
 
-    return repository.listPages(knowledgeBaseId).length > 0 ? repository : this.repository;
+    if (knowledgeBase === null) {
+      throw new ApiError("knowledge_base_not_found", {
+        messageKey: "api.error.knowledge_base_not_found",
+        details: {
+          knowledge_base_id: knowledgeBaseId,
+        },
+      });
+    }
+
+    return knowledgeBase;
+  }
+
+  private requireBoundedRetrievalRepository(): BoundedRetrievalRepository {
+    if (this.boundedRetrievalRepository === undefined) {
+      throw new ApiError("bounded_retrieval_unavailable", {
+        messageKey: "api.error.bounded_retrieval_unavailable",
+        details: {
+          backend: "bounded_retrieval_repository",
+        },
+      });
+    }
+
+    return this.boundedRetrievalRepository;
+  }
+
+  private async attachSeedPageGraphNode(
+    knowledgeBaseId: string,
+    input: Omit<GraphQueryInput, "knowledge_base_id">,
+    graph: GraphQueryResponse,
+  ): Promise<GraphQueryResponse> {
+    if (input.page_id === undefined) {
+      if (graph.nodes.length > 0) {
+        return graph;
+      }
+
+      const pages = await this.wikiStore.listPages(knowledgeBaseId);
+
+      return {
+        ...graph,
+        nodes: pages
+          .filter((page) => input.page_type === undefined || page.type === input.page_type)
+          .filter(
+            (page) =>
+              input.version_id === undefined || page.current_version_id === input.version_id,
+          )
+          .map(toSeedGraphNode),
+      };
+    }
+
+    if (graph.nodes.some((node) => node.page_id === input.page_id)) {
+      return graph;
+    }
+
+    const page = await this.findWikiPage(input.page_id);
+
+    if (
+      page === null ||
+      page.knowledge_base_id !== knowledgeBaseId ||
+      (input.page_type !== undefined && page.type !== input.page_type) ||
+      (input.version_id !== undefined && page.current_version_id !== input.version_id)
+    ) {
+      return graph;
+    }
+
+    return {
+      ...graph,
+      nodes: [...graph.nodes, toSeedGraphNode(page)],
+    };
+  }
+
+  private async findWikiPage(pageId: string): Promise<WikiPageApiRecord | null> {
+    try {
+      return await this.wikiStore.getPage(pageId);
+    } catch {
+      return null;
+    }
+  }
+
+  private async ensureIndexedPagesAvailable(knowledgeBaseId: string): Promise<void> {
+    const pages = await this.wikiStore.listPagesPaginated(knowledgeBaseId, {
+      page: 1,
+      pageSize: 1,
+    });
+
+    if (pages.total > 0 || pages.items.length > 0) {
+      return;
+    }
+
+    throw new ApiError("retrieve_index_not_ready", {
+      messageKey: "api.error.retrieve_index_not_ready",
+      details: {
+        knowledge_base_id: knowledgeBaseId,
+      },
+    });
   }
 
   private async attachResolvedEvidence<TResponse extends object>(
@@ -230,7 +323,7 @@ export class RetrieveService {
     knowledgeBaseId: string,
     response: TResponse,
   ): Promise<TResponse & { graph_readiness: GraphInsightStatus }> {
-    const graphReadiness = await this.wikiStore.getGraphInsightStatus(knowledgeBaseId);
+    const graphReadiness = await this.getCachedGraphInsightStatus(knowledgeBaseId);
     const warning = toGraphReadinessWarning(graphReadiness.state);
     const warnings =
       warning === null ? response.warnings : [...new Set([...(response.warnings ?? []), warning])];
@@ -240,6 +333,56 @@ export class RetrieveService {
       graph_readiness: graphReadiness,
       ...(warnings === undefined ? {} : { warnings }),
     };
+  }
+
+  private async getCachedGraphInsightStatus(knowledgeBaseId: string): Promise<GraphInsightStatus> {
+    const cacheKey = {
+      resourceKind: "graph-readiness" as const,
+      scopeId: knowledgeBaseId,
+      variant: "status",
+    };
+    const cached = await this.runtimeCache?.get<GraphInsightStatus>(cacheKey);
+
+    if (cached !== undefined && cached !== null) {
+      return cached;
+    }
+
+    const status = await this.wikiStore.getGraphInsightStatus(knowledgeBaseId);
+
+    if (!isActiveGraphInsightStatus(status)) {
+      await this.runtimeCache?.set({
+        ...cacheKey,
+        value: status,
+      });
+    }
+
+    return status;
+  }
+
+  private async getCachedGraphInsightsSnapshot(
+    knowledgeBaseId: string,
+  ): Promise<GraphInsightsResponse | null> {
+    const cacheKey = {
+      resourceKind: "graph-readiness" as const,
+      scopeId: knowledgeBaseId,
+      variant: "insights",
+    };
+    const cached = await this.runtimeCache?.get<GraphInsightsResponse>(cacheKey);
+
+    if (cached !== undefined && cached !== null) {
+      return cached;
+    }
+
+    const snapshot = await this.wikiStore.getGraphInsightsSnapshot(knowledgeBaseId);
+
+    if (snapshot !== null) {
+      await this.runtimeCache?.set({
+        ...cacheKey,
+        value: snapshot,
+      });
+    }
+
+    return snapshot;
   }
 }
 
@@ -766,6 +909,10 @@ function createDatasetRetrievePreferences(
   return applyDatasetRetrievePreferences(retrieval, {});
 }
 
+function isActiveGraphInsightStatus(status: GraphInsightStatus): boolean {
+  return status.state === "queued" || status.state === "updating";
+}
+
 function createEmptyGraphInsightsResponse(
   knowledgeBaseId: string,
   status: GraphInsightStatus,
@@ -797,6 +944,19 @@ function createEmptyGraphInsightsResponse(
     knowledge_gaps: [],
     communities: [],
     surprising_connections: [],
+  };
+}
+
+function toSeedGraphNode(page: WikiPageApiRecord): ExpandableGraphNode {
+  return {
+    page_id: page.id,
+    page_version_id: page.current_version_id ?? page.id,
+    source_refs: JSON.parse(
+      JSON.stringify(page.source_refs ?? []),
+    ) as unknown as ExpandableGraphNode["source_refs"],
+    title: page.title,
+    type: page.type,
+    visibility_origin: page.visibility_origin ?? "canonical",
   };
 }
 

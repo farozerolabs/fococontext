@@ -41,11 +41,6 @@ export interface ObjectStorageOperationRecorder {
   reset(): void;
 }
 
-export interface ObjectStorageOperationRecorderOptions {
-  maxRecords?: number;
-  now?: () => Date;
-}
-
 export interface ObjectStorageInstrumentationOptions {
   caller?: string;
   enabled?: boolean;
@@ -158,48 +153,21 @@ export interface ObjectStorageAdapter {
   getDiagnostics(): Promise<ObjectStorageDiagnostics>;
 }
 
-export class InMemoryObjectStorageOperationRecorder implements ObjectStorageOperationRecorder {
-  private readonly maxRecords: number;
-  private readonly now: () => Date;
-  private records: ObjectStorageOperationRecord[] = [];
-
-  constructor(options: ObjectStorageOperationRecorderOptions = {}) {
-    this.maxRecords = options.maxRecords ?? 10_000;
-    this.now = options.now ?? (() => new Date());
+export class NullObjectStorageOperationRecorder implements ObjectStorageOperationRecorder {
+  record(_record: ObjectStorageOperationRecord): void {
+    void _record;
   }
 
-  record(record: ObjectStorageOperationRecord): void {
-    this.records.push({ ...record });
+  snapshot(_windowSeconds?: number): ObjectStorageOperationRecord[] {
+    void _windowSeconds;
 
-    if (this.records.length > this.maxRecords) {
-      this.records = this.records.slice(this.records.length - this.maxRecords);
-    }
+    return [];
   }
 
-  snapshot(windowSeconds?: number): ObjectStorageOperationRecord[] {
-    if (windowSeconds === undefined) {
-      return this.records.map((record) => ({ ...record }));
-    }
-
-    const cutoff = this.now().getTime() - windowSeconds * 1000;
-
-    return this.records
-      .filter((record) => new Date(record.at).getTime() >= cutoff)
-      .map((record) => ({ ...record }));
-  }
-
-  reset(): void {
-    this.records = [];
-  }
+  reset(): void {}
 }
 
-export const defaultObjectStorageOperationRecorder = new InMemoryObjectStorageOperationRecorder();
-
-export function createInMemoryObjectStorageOperationRecorder(
-  options: ObjectStorageOperationRecorderOptions = {},
-): InMemoryObjectStorageOperationRecorder {
-  return new InMemoryObjectStorageOperationRecorder(options);
-}
+export const defaultObjectStorageOperationRecorder = new NullObjectStorageOperationRecorder();
 
 export function classifyObjectStorageOperation(operation: string): ObjectStorageOperationClass {
   if (classAOperations.has(operation)) {

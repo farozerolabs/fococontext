@@ -23,7 +23,7 @@ export class ForkSubmissionController {
   ) {
     const scope = requireApiKeyScope(request);
 
-    this.knowledgeBaseService.assertReadableKnowledgeBase(forkId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(forkId, scope);
     return createSuccessEnvelope(
       await this.forkSubmissionService.create(forkId, body, idempotencyKey, scope),
       createRequestId(),

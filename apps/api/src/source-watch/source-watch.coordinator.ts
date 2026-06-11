@@ -1,5 +1,4 @@
 import {
-  InMemoryRuntimeLock,
   normalizeTtlMs,
   type RuntimeConfig,
   type RuntimeLock,
@@ -18,10 +17,6 @@ export interface SourceWatchScanCoordinatorRunInput<T> {
   ruleId: string;
   onConflict: () => Promise<T> | T;
   run: () => Promise<T>;
-}
-
-export function createInMemorySourceWatchScanCoordinator(): SourceWatchScanCoordinator {
-  return new RuntimeLockSourceWatchScanCoordinator(new InMemoryRuntimeLock());
 }
 
 export function createRedisSourceWatchScanCoordinator(

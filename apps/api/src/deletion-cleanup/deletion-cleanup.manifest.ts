@@ -5,7 +5,6 @@ import type {
   DeletionCleanupItemType,
   DeletionCleanupOperationRecord,
 } from "./deletion-cleanup.types.js";
-import { DocumentRepository } from "../documents/document.repository.js";
 import type {
   JobEventRecord,
   JobRecord,
@@ -25,16 +24,6 @@ export interface CollectManifestInput {
   now: string;
   maxAttempts: number;
   retainedUntil: string | null;
-}
-
-export interface CollectKnowledgeBaseManifestInput extends CollectManifestInput {
-  knowledgeBaseId: string;
-  knowledgeBaseType?: "canonical" | "fork";
-}
-
-export interface CollectSourceDocumentManifestInput extends CollectManifestInput {
-  knowledgeBaseId: string;
-  documentId: string;
 }
 
 export interface CollectSourceDocumentManifestRecordsInput extends CollectManifestInput {
@@ -115,85 +104,6 @@ export function collectSourceDocumentManifestFromRecords(
 
 @Injectable()
 export class DeletionCleanupManifestCollector {
-  constructor(private readonly documentRepository: DocumentRepository) {}
-
-  collectKnowledgeBaseManifest(
-    input: CollectKnowledgeBaseManifestInput,
-  ): DeletionCleanupManifestResult {
-    const documents = this.documentRepository.listDocuments(input.knowledgeBaseId);
-    const entries = documents.flatMap((document) => this.collectDocumentEntries(document));
-    const documentRowRefs = documents.flatMap((document) => this.collectDocumentRowRefs(document));
-    const rowRefs: DatabaseRowRef[] = [
-      { tableName: "knowledge_bases", resourceId: input.knowledgeBaseId },
-      ...documentRowRefs,
-      ...this.collectKnowledgeBaseJobRowRefs(input.knowledgeBaseId, documentRowRefs),
-      ...(input.knowledgeBaseType === "fork"
-        ? createForkOwnedScopedRowRefs(input.knowledgeBaseId)
-        : []),
-    ];
-
-    return createManifestResult({
-      input,
-      targetType: "knowledge_base",
-      targetId: input.knowledgeBaseId,
-      knowledgeBaseId: input.knowledgeBaseId,
-      objectEntries: uniqueObjectEntries(entries).map((entry) => ({
-        ...entry,
-        status: "pending",
-      })),
-      rowRefs,
-    });
-  }
-
-  collectSourceDocumentManifest(
-    input: CollectSourceDocumentManifestInput,
-  ): DeletionCleanupManifestResult {
-    const document = this.documentRepository.findDocumentById(input.documentId);
-
-    if (document === undefined) {
-      return createManifestResult({
-        input,
-        targetType: "source_document",
-        targetId: input.documentId,
-        knowledgeBaseId: input.knowledgeBaseId,
-        objectEntries: [],
-        rowRefs: [],
-      });
-    }
-
-    if (document.knowledgeBaseId !== input.knowledgeBaseId) {
-      return createManifestResult({
-        input,
-        targetType: "source_document",
-        targetId: input.documentId,
-        knowledgeBaseId: input.knowledgeBaseId,
-        objectEntries: [],
-        rowRefs: [],
-      });
-    }
-
-    const jobs = this.documentRepository
-      .listJobs(document.knowledgeBaseId)
-      .filter((job) => job.documentId === document.id);
-    const jobEventsByJobId = new Map(
-      jobs.map((job) => [job.id, this.documentRepository.listJobEvents(job.id)]),
-    );
-
-    return collectSourceDocumentManifestFromRecords({
-      operationId: input.operationId,
-      now: input.now,
-      maxAttempts: input.maxAttempts,
-      retainedUntil: input.retainedUntil,
-      knowledgeBaseId: input.knowledgeBaseId,
-      document,
-      parsedContent: this.documentRepository.findParsedContentByDocumentId(document.id) ?? null,
-      mediaAssets: this.documentRepository.listMediaAssetsByDocumentId(document.id),
-      jobs,
-      jobEventsByJobId,
-      activeObjectKeys: this.collectActiveObjectKeysForOtherSources(document),
-    });
-  }
-
   collectUploadSessionManifest(
     input: CollectUploadSessionManifestInput,
   ): DeletionCleanupManifestResult {
@@ -212,69 +122,6 @@ export class DeletionCleanupManifestCollector {
       ],
       rowRefs: [],
     });
-  }
-
-  private collectDocumentEntries(document: SourceDocumentRecord): ObjectEntry[] {
-    return collectDocumentEntriesFromRecords({
-      document,
-      parsedContent: this.documentRepository.findParsedContentByDocumentId(document.id) ?? null,
-      mediaAssets: this.documentRepository.listMediaAssetsByDocumentId(document.id),
-    });
-  }
-
-  private collectDocumentRowRefs(document: SourceDocumentRecord): DatabaseRowRef[] {
-    const parsedContent = this.documentRepository.findParsedContentByDocumentId(document.id);
-    const mediaAssets = this.documentRepository.listMediaAssetsByDocumentId(document.id);
-    const jobs = this.documentRepository
-      .listJobs(document.knowledgeBaseId)
-      .filter((job) => job.documentId === document.id);
-    const jobEventsByJobId = new Map(
-      jobs.map((job) => [job.id, this.documentRepository.listJobEvents(job.id)]),
-    );
-
-    return collectDocumentRowRefsFromRecords({
-      document,
-      parsedContent: parsedContent ?? null,
-      mediaAssets,
-      jobs,
-      jobEventsByJobId,
-    });
-  }
-
-  private collectKnowledgeBaseJobRowRefs(
-    knowledgeBaseId: string,
-    existingRows: readonly DatabaseRowRef[],
-  ): DatabaseRowRef[] {
-    const existingJobIds = new Set(
-      existingRows.flatMap((row) => (row.tableName === "jobs" ? [row.resourceId] : [])),
-    );
-    const jobs = this.documentRepository
-      .listJobs(knowledgeBaseId)
-      .filter((job) => !existingJobIds.has(job.id));
-    const jobEvents = jobs.flatMap((job) =>
-      this.documentRepository.listJobEvents(job.id).map((event) => ({ job, event })),
-    );
-
-    return [
-      ...jobs.map((job) => ({ tableName: "jobs", resourceId: job.id })),
-      ...jobEvents.map(({ job, event }) => ({
-        tableName: "job_events",
-        resourceId: createJobEventResourceId(job, event),
-      })),
-    ];
-  }
-
-  private collectActiveObjectKeysForOtherSources(document: SourceDocumentRecord): Set<string> {
-    const activeDocuments = this.documentRepository
-      .listDocuments(document.knowledgeBaseId)
-      .filter((candidate) => candidate.id !== document.id)
-      .filter((candidate) => candidate.status !== "deleted");
-
-    return new Set(
-      activeDocuments.flatMap((candidate) =>
-        this.collectDocumentEntries(candidate).map((entry) => entry.objectKey),
-      ),
-    );
   }
 }
 
@@ -515,14 +362,6 @@ function createCleanupItem(input: {
   };
 }
 
-function createForkOwnedScopedRowRefs(knowledgeBaseId: string): DatabaseRowRef[] {
-  return forkOwnedOverlayTables.map((tableName) => ({
-    tableName,
-    resourceId: knowledgeBaseId,
-    scope: "owner_knowledge_base_id" as const,
-  }));
-}
-
 function countCleanupItems(items: readonly DeletionCleanupItemRecord[]) {
   return {
     totalItemCount: items.length,
@@ -536,34 +375,6 @@ function countCleanupItems(items: readonly DeletionCleanupItemRecord[]) {
     databaseRowCount: items.filter((item) => item.itemType === "database_row").length,
   };
 }
-
-const forkOwnedOverlayTables = [
-  "source_documents",
-  "parsed_contents",
-  "media_assets",
-  "ocr_page_statuses",
-  "ocr_blocks",
-  "ocr_artifacts",
-  "media_caption_cache",
-  "wiki_pages",
-  "wiki_page_versions",
-  "system_pages",
-  "wiki_edges",
-  "wiki_edge_sources",
-  "wiki_analysis_results",
-  "wiki_draft_candidates",
-  "compile_stage_executions",
-  "knowledge_versions",
-  "change_sets",
-  "change_set_items",
-  "rollback_records",
-  "page_merge_records",
-  "knowledge_checks",
-  "duplicate_decisions",
-  "delete_impact_previews",
-  "page_embeddings",
-  "retrieval_traces",
-] as const;
 
 const knownObjectKeyFields = new Set([
   "object_key",

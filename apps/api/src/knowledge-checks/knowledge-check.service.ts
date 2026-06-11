@@ -15,13 +15,12 @@ import {
   type StructuredOutputMode,
 } from "@fococontext/llm";
 
-import {
-  apiDatabaseHydratorToken,
-  type ApiDatabaseHydrator,
-} from "../database/api-database-hydrator.js";
 import { apiDatabaseMirrorToken, type ApiDatabaseMirror } from "../database/api-database-mirror.js";
-import type { ApiResourceScope } from "../auth/api-key.guard.js";
-import { KnowledgeBaseService } from "../knowledge-bases/knowledge-base.service.js";
+import { defaultApiResourceScope, type ApiResourceScope } from "../auth/api-key.guard.js";
+import {
+  operationalReadStoreToken,
+  type OperationalReadStore,
+} from "../database/operational-read-store.js";
 import type { KnowledgeBaseResponse } from "../knowledge-bases/knowledge-base.types.js";
 import { WebhookService } from "../webhooks/webhook.service.js";
 import { wikiStoreToken, type WikiPageApiRecord, type WikiStore } from "../wiki/wiki-store.js";
@@ -29,7 +28,6 @@ import {
   knowledgeCheckQueueToken,
   type KnowledgeCheckQueue,
 } from "../queues/knowledge-check.queue.js";
-import { KnowledgeCheckRepository } from "./knowledge-check.repository.js";
 import {
   knowledgeCheckTypes,
   type CreateKnowledgeCheckInput,
@@ -52,10 +50,8 @@ export const knowledgeCheckChatProviderToken = Symbol("knowledgeCheckChatProvide
 @Injectable()
 export class KnowledgeCheckService {
   constructor(
-    private readonly knowledgeBaseService: KnowledgeBaseService,
-    private readonly repository: KnowledgeCheckRepository,
     @Inject(apiDatabaseMirrorToken) private readonly databaseMirror: ApiDatabaseMirror,
-    @Inject(apiDatabaseHydratorToken) private readonly databaseHydrator: ApiDatabaseHydrator,
+    @Inject(operationalReadStoreToken) private readonly operationalReadStore: OperationalReadStore,
     @Inject(wikiStoreToken) private readonly wikiStore: WikiStore,
     @Inject(knowledgeCheckQueueToken) private readonly knowledgeCheckQueue: KnowledgeCheckQueue,
     @Inject(knowledgeCheckChatProviderToken) private readonly chatProvider: ChatProvider,
@@ -67,12 +63,22 @@ export class KnowledgeCheckService {
     input: CreateKnowledgeCheckInput,
     scope?: ApiResourceScope,
   ): Promise<KnowledgeCheckResponse> {
-    await this.databaseHydrator.refresh();
-    const knowledgeBase = this.knowledgeBaseService.get(knowledgeBaseId, scope);
-    const datasetConfiguration = this.knowledgeBaseService.getDatasetConfiguration(
-      knowledgeBaseId,
-      scope,
-    );
+    const scopedRead = scope ?? defaultApiResourceScope;
+    const [knowledgeBase, datasetConfiguration] = await Promise.all([
+      this.operationalReadStore.getKnowledgeBaseById(scopedRead, knowledgeBaseId),
+      this.operationalReadStore.getDatasetConfigurationByKnowledgeBaseId(
+        scopedRead,
+        knowledgeBaseId,
+      ),
+    ]);
+
+    if (knowledgeBase === null) {
+      throw new ApiError("knowledge_base_not_found");
+    }
+    if (datasetConfiguration === null) {
+      throw new ApiError("internal_error");
+    }
+
     const knowledgeCheckConfig = normalizeRecord(datasetConfiguration.values.knowledge_check);
     const checks = readChecks(input.checks, knowledgeCheckConfig);
     const pageIds = readPageIds(input.page_ids);
@@ -141,16 +147,15 @@ export class KnowledgeCheckService {
       createdAt: now,
       updatedAt: now,
     };
-    const created = this.repository.create(record);
-    await this.databaseMirror.saveKnowledgeCheck(created);
+    await this.databaseMirror.saveKnowledgeCheck(record);
     await this.webhookService.emit({
       eventType: "knowledge_check.completed",
       knowledgeBaseId: knowledgeBase.id,
       payload: {
-        check_id: created.id,
-        finding_count: created.findings.length,
-        semantic_status: created.semanticRun.status,
-        status: created.status,
+        check_id: record.id,
+        finding_count: record.findings.length,
+        semantic_status: record.semanticRun.status,
+        status: record.status,
       },
       requestTrace: {
         event_source: "knowledge_check.create",
@@ -158,28 +163,33 @@ export class KnowledgeCheckService {
       ...(scope === undefined ? {} : { scope }),
     });
 
-    return toKnowledgeCheckResponse(created);
+    return toKnowledgeCheckResponse(record);
   }
 
   async get(checkId: string, scope?: ApiResourceScope): Promise<KnowledgeCheckResponse> {
-    await this.databaseHydrator.refresh();
-    const record = this.repository.findById(checkId);
+    const record = await this.operationalReadStore.getKnowledgeCheckById(checkId);
 
-    if (record === undefined) {
+    if (record === undefined || record === null) {
       throw createKnowledgeCheckNotFoundError();
     }
 
-    try {
-      this.knowledgeBaseService.assertReadableKnowledgeBase(record.knowledgeBaseId, scope);
-    } catch (error) {
-      if (error instanceof ApiError && error.code === "knowledge_base_not_found") {
-        throw createKnowledgeCheckNotFoundError();
-      }
-
-      throw error;
-    }
+    await this.assertReadableKnowledgeBase(record.knowledgeBaseId, scope);
 
     return toKnowledgeCheckResponse(record);
+  }
+
+  private async assertReadableKnowledgeBase(
+    knowledgeBaseId: string,
+    scope?: ApiResourceScope,
+  ): Promise<void> {
+    const knowledgeBase = await this.operationalReadStore.getKnowledgeBaseById(
+      scope ?? defaultApiResourceScope,
+      knowledgeBaseId,
+    );
+
+    if (knowledgeBase === null) {
+      throw createKnowledgeCheckNotFoundError();
+    }
   }
 
   private async enqueueKnowledgeCheck(input: {
@@ -213,16 +223,15 @@ export class KnowledgeCheckService {
       createdAt: now,
       updatedAt: now,
     };
-    const created = this.repository.create(record);
-    await this.databaseMirror.saveKnowledgeCheck(created);
+    await this.databaseMirror.saveKnowledgeCheck(record);
 
     try {
       await this.knowledgeCheckQueue.enqueueKnowledgeCheckJob({
-        check_id: created.id,
+        check_id: record.id,
       });
     } catch (error) {
       const failed: KnowledgeCheckRecord = {
-        ...created,
+        ...record,
         status: "failed",
         progress: 100,
         semanticRun: {
@@ -238,12 +247,11 @@ export class KnowledgeCheckService {
         updatedAt: new Date().toISOString(),
       };
 
-      this.repository.create(failed);
       await this.databaseMirror.saveKnowledgeCheck(failed);
       throw error;
     }
 
-    return toKnowledgeCheckResponse(created);
+    return toKnowledgeCheckResponse(record);
   }
 }
 

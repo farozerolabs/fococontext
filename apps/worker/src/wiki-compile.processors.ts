@@ -23,7 +23,7 @@ import {
 } from "@fococontext/llm";
 import {
   GraphQueryService,
-  createInMemoryRetrievalRepository,
+  createRequestLocalRetrievalRepository,
   type GraphInsightsResponse,
   type RetrievalRelationType,
   type RetrievalVisibilityOrigin,
@@ -92,6 +92,7 @@ export interface WikiAnalyzeProcessorServiceOptions {
   generateQueue: WikiGenerateQueue;
   jobProgress?: WorkerJobProgressWriter;
   jobGuard?: WorkerJobStateGuard;
+  maxParsedMarkdownBytes?: number;
   objectStorage: ObjectStorageAdapter;
   promptLimits: CompilePromptLimits;
   idFactory?: (scope: string) => string;
@@ -779,6 +780,7 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
   private readonly generateQueue: WikiGenerateQueue;
   private readonly jobProgress: WorkerJobProgressWriter | undefined;
   private readonly jobGuard: WorkerJobStateGuard | undefined;
+  private readonly maxParsedMarkdownBytes: number;
   private readonly objectStorage: ObjectStorageAdapter;
   private readonly promptLimits: CompilePromptLimits;
   private readonly idFactory: (scope: string) => string;
@@ -791,6 +793,7 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
     this.generateQueue = options.generateQueue;
     this.jobProgress = options.jobProgress;
     this.jobGuard = options.jobGuard;
+    this.maxParsedMarkdownBytes = options.maxParsedMarkdownBytes ?? Number.MAX_SAFE_INTEGER;
     this.objectStorage = options.objectStorage;
     this.promptLimits = options.promptLimits;
     this.idFactory = options.idFactory ?? createWorkerId;
@@ -854,7 +857,51 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
       },
     });
 
-    const markdown = await this.readParsedMarkdown(payload.normalized_markdown_object_key);
+    const markdownRead = await this.readParsedMarkdown(payload.normalized_markdown_object_key);
+
+    if (markdownRead.kind === "fatal") {
+      const failure = markdownRead.error;
+
+      await this.artifactRepository.updateStageExecution(stageExecutionId, {
+        status: "failed",
+        error: failure,
+        metadata: {
+          normalized_markdown_object_key: payload.normalized_markdown_object_key,
+        },
+        finishedAt: this.now(),
+      });
+      await this.jobProgress?.updateJobProgress({
+        jobId: payload.job_id,
+        knowledgeBaseId: payload.knowledge_base_id,
+        inputSnapshotId: payload.input_snapshot_id,
+        stage: "analyzing",
+        status: "failed",
+        progress: 35,
+        message: "Analysis failed.",
+        parsedContentId: payload.parsed_content_id,
+        error: failure,
+        metadata: {
+          normalized_markdown_object_key: payload.normalized_markdown_object_key,
+        },
+      });
+
+      return {
+        status: "failed",
+        should_continue: false,
+        knowledge_base_id: payload.knowledge_base_id,
+        document_id: payload.document_id,
+        parsed_content_id: payload.parsed_content_id,
+        analysis_result_id: null,
+        prompt_version_id: prompt.id,
+        model_call_id: null,
+        entities: [],
+        concepts: [],
+        contradictions: [],
+        relationships: [],
+      };
+    }
+
+    const markdown = markdownRead.text;
     const sourceMetadata = createAnalysisSourceMetadata(markdown, context.sourceDocumentMetadata);
     const messages = createAnalysisMessages(
       payload,
@@ -1285,12 +1332,37 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
     }
   }
 
-  private async readParsedMarkdown(objectKey: string): Promise<string> {
+  private async readParsedMarkdown(
+    objectKey: string,
+  ): Promise<
+    { kind: "success"; text: string } | { kind: "fatal"; error: Record<string, unknown> }
+  > {
     const object = await this.objectStorage.getObject({
       key: objectKey,
     });
+    const body = await readBodyAsStringWithinLimit(
+      object.body,
+      object.contentLength,
+      this.maxParsedMarkdownBytes,
+      objectKey,
+    );
 
-    return readBodyAsString(object.body);
+    if (body.kind === "fatal") {
+      return {
+        kind: "fatal",
+        error: {
+          code: "wiki_analyze_markdown_limit_exceeded",
+          object_key: objectKey,
+          actual_bytes: body.actualBytes,
+          limit_bytes: body.limitBytes,
+        },
+      };
+    }
+
+    return {
+      kind: "success",
+      text: body.text,
+    };
   }
 
   private async recordModelCall(input: {
@@ -2695,6 +2767,80 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     }
   }
 
+  async refreshGraphInsightsForJob(input: {
+    jobId: string;
+    knowledgeBaseId: string;
+    requestedKnowledgeVersionId: string | null;
+  }): Promise<{ status: "completed" | "failed"; knowledge_base_id: string; job_id: string }> {
+    let context: { changeSetId: string | null; knowledgeVersionId: string } | null = null;
+    const startedAt = new Date().toISOString();
+
+    try {
+      context = await this.resolveGraphInsightRefreshContext(
+        input.knowledgeBaseId,
+        input.requestedKnowledgeVersionId,
+      );
+
+      await this.markGraphInsightRefreshJobRunning(
+        input.jobId,
+        input.knowledgeBaseId,
+        context.changeSetId,
+        context.knowledgeVersionId,
+        startedAt,
+        this.db,
+      );
+
+      let graphInsights: GraphInsightsResponse | null = null;
+      const refreshContext = context;
+
+      await this.db.transaction().execute(async (trx) => {
+        await this.insertDerivedGraphSignalEdges(
+          input.knowledgeBaseId,
+          refreshContext.changeSetId,
+          refreshContext.knowledgeVersionId,
+          startedAt,
+          trx,
+        );
+        graphInsights = await this.createGraphInsightsSnapshot(input.knowledgeBaseId, trx);
+      });
+
+      if (graphInsights === null) {
+        throw new Error("Graph insight snapshot was not created.");
+      }
+
+      await this.completeGraphInsightRefreshJob(
+        input.jobId,
+        input.knowledgeBaseId,
+        context.changeSetId,
+        context.knowledgeVersionId,
+        graphInsights,
+        new Date().toISOString(),
+        this.db,
+      );
+
+      return {
+        job_id: input.jobId,
+        knowledge_base_id: input.knowledgeBaseId,
+        status: "completed",
+      };
+    } catch (error) {
+      await this.failGraphInsightRefreshJob(
+        input.jobId,
+        context?.changeSetId ?? null,
+        context?.knowledgeVersionId ?? input.requestedKnowledgeVersionId,
+        error,
+        new Date().toISOString(),
+        this.db,
+      );
+
+      return {
+        job_id: input.jobId,
+        knowledge_base_id: input.knowledgeBaseId,
+        status: "failed",
+      };
+    }
+  }
+
   private async loadSystemPageMarkdown(
     knowledgeBaseId: string,
     systemKey: string,
@@ -2738,7 +2884,7 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
 
   private async insertDerivedGraphSignalEdges(
     knowledgeBaseId: string,
-    changeSetId: string,
+    changeSetId: string | null,
     knowledgeVersionId: string,
     now: string,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
@@ -2765,7 +2911,7 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     knowledgeBaseId: string,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
   ): Promise<GraphInsightsResponse> {
-    const repository = createInMemoryRetrievalRepository();
+    const repository = createRequestLocalRetrievalRepository();
     const scope = await this.loadGraphInsightKnowledgeBaseScope(knowledgeBaseId, db);
 
     repository.upsertKnowledgeBaseScope(scope);
@@ -2830,25 +2976,27 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
       visibility_origin: string | null;
     }>`
       select
-        id,
-        current_version_id,
-        title,
-        page_type,
-        slug,
-        markdown,
-        frontmatter,
-        source_document_ids,
-        metadata,
-        system_page_key,
-        owner_knowledge_base_id,
-        visibility_origin,
-        upstream_resource_id,
-        fork_tombstoned_at
+        wiki_pages.id,
+        wiki_pages.current_version_id,
+        wiki_pages.title,
+        wiki_pages.page_type,
+        wiki_pages.slug,
+        wiki_pages.markdown,
+        wiki_pages.frontmatter,
+        wiki_pages.source_document_ids,
+        wiki_pages.metadata,
+        system_pages.system_key as system_page_key,
+        wiki_pages.owner_knowledge_base_id,
+        wiki_pages.visibility_origin,
+        wiki_pages.upstream_resource_id,
+        wiki_pages.fork_tombstoned_at
       from wiki_pages
-      where knowledge_base_id = ${knowledgeBaseId}
-        and deleted_at is null
-        and fork_tombstoned_at is null
-      order by updated_at desc, id desc
+      left join system_pages on system_pages.page_id = wiki_pages.id
+        and system_pages.knowledge_base_id = wiki_pages.knowledge_base_id
+      where wiki_pages.knowledge_base_id = ${knowledgeBaseId}
+        and wiki_pages.deleted_at is null
+        and wiki_pages.fork_tombstoned_at is null
+      order by wiki_pages.updated_at desc, wiki_pages.id desc
     `.execute(db);
 
     return result.rows.map((row) => {
@@ -3007,10 +3155,90 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     return jobId;
   }
 
+  private async resolveGraphInsightRefreshContext(
+    knowledgeBaseId: string,
+    requestedKnowledgeVersionId: string | null,
+  ): Promise<{ changeSetId: string | null; knowledgeVersionId: string }> {
+    const result = await sql<{ change_set_id: string | null; knowledge_version_id: string | null }>`
+      select
+        knowledge_versions.change_set_id,
+        coalesce(${requestedKnowledgeVersionId}, knowledge_bases.current_version_id) as knowledge_version_id
+      from knowledge_bases
+      left join knowledge_versions on knowledge_versions.id = coalesce(
+        ${requestedKnowledgeVersionId},
+        knowledge_bases.current_version_id
+      )
+      where knowledge_bases.id = ${knowledgeBaseId}
+        and knowledge_bases.deleted_at is null
+      limit 1
+    `.execute(this.db);
+    const knowledgeVersionId = result.rows[0]?.knowledge_version_id ?? null;
+
+    if (knowledgeVersionId === null) {
+      throw new Error("Graph insight refresh requires an active knowledge version.");
+    }
+
+    return {
+      changeSetId: result.rows[0]?.change_set_id ?? null,
+      knowledgeVersionId,
+    };
+  }
+
+  private async markGraphInsightRefreshJobRunning(
+    jobId: string,
+    knowledgeBaseId: string,
+    changeSetId: string | null,
+    knowledgeVersionId: string,
+    now: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ): Promise<void> {
+    await sql`
+      update jobs
+      set
+        status = 'running',
+        stage = 'indexing',
+        progress = 10,
+        progress_message = 'Updating graph insights.',
+        result = ${JSON.stringify({
+          change_set_id: changeSetId,
+          knowledge_version_id: knowledgeVersionId,
+          retry_eligible: true,
+          status: "updating",
+        })}::jsonb,
+        metadata = metadata || ${JSON.stringify({
+          affected_knowledge_base_id: knowledgeBaseId,
+          change_set_id: changeSetId,
+          generated_at: now,
+          knowledge_version_id: knowledgeVersionId,
+          refresh_kind: "graph_insights",
+          retry_eligible: true,
+        })}::jsonb,
+        started_at = coalesce(started_at, ${now}),
+        updated_at = ${now}
+      where id = ${jobId}
+    `.execute(db);
+
+    await this.insertGraphInsightRefreshEvent(
+      jobId,
+      "job.running",
+      "Updating graph insights.",
+      {
+        affected_knowledge_base_id: knowledgeBaseId,
+        change_set_id: changeSetId,
+        knowledge_version_id: knowledgeVersionId,
+        retry_eligible: true,
+        stage: "indexing",
+        status: "updating",
+      },
+      now,
+      db,
+    );
+  }
+
   private async completeGraphInsightRefreshJob(
     jobId: string,
     knowledgeBaseId: string,
-    changeSetId: string,
+    changeSetId: string | null,
     knowledgeVersionId: string,
     graphInsights: GraphInsightsResponse,
     now: string,
@@ -3063,8 +3291,8 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
 
   private async failGraphInsightRefreshJob(
     jobId: string,
-    changeSetId: string,
-    knowledgeVersionId: string,
+    changeSetId: string | null,
+    knowledgeVersionId: string | null,
     error: unknown,
     now: string,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
@@ -3151,7 +3379,7 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
   private async insertResolvedEdges(
     knowledgeBaseId: string,
     edges: readonly ResolvedRelationshipEdgeWrite[],
-    changeSetId: string,
+    changeSetId: string | null,
     knowledgeVersionId: string,
     now: string,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
@@ -4942,12 +5170,45 @@ function joinUrlPath(baseUrl: string, path: string): string {
   return trimmedBase.endsWith(`/${trimmedPath}`) ? trimmedBase : `${trimmedBase}/${trimmedPath}`;
 }
 
-async function readBodyAsString(body: unknown): Promise<string> {
-  const chunks: Buffer[] = [];
-
-  for await (const chunk of body as AsyncIterable<Buffer | string>) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+async function readBodyAsStringWithinLimit(
+  body: unknown,
+  contentLength: number | undefined,
+  maxBytes: number,
+  objectKey: string,
+): Promise<
+  | { kind: "success"; text: string }
+  | { kind: "fatal"; objectKey: string; actualBytes: number; limitBytes: number }
+> {
+  if (contentLength !== undefined && contentLength > maxBytes) {
+    return {
+      kind: "fatal",
+      objectKey,
+      actualBytes: contentLength,
+      limitBytes: maxBytes,
+    };
   }
 
-  return Buffer.concat(chunks).toString("utf8");
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+
+  for await (const chunk of body as AsyncIterable<Buffer | string>) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.byteLength;
+
+    if (totalBytes > maxBytes) {
+      return {
+        kind: "fatal",
+        objectKey,
+        actualBytes: totalBytes,
+        limitBytes: maxBytes,
+      };
+    }
+
+    chunks.push(buffer);
+  }
+
+  return {
+    kind: "success",
+    text: Buffer.concat(chunks, totalBytes).toString("utf8"),
+  };
 }

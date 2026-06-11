@@ -4,6 +4,12 @@ import {
   resolveJobProgressState,
   type JobProgressEventType,
 } from "@fococontext/contracts";
+import {
+  recordRuntimeQueuePressureEvent,
+  type RuntimeQueuePressureEvent,
+  type RuntimeQueuePressureRecorder,
+  type RuntimeQueueWorkKind,
+} from "@fococontext/core";
 import type { DatabaseSchema } from "@fococontext/db";
 import type { WorkerWebhookEventEmitter } from "./webhook-dispatch.worker.js";
 
@@ -65,6 +71,7 @@ export class PostgresWorkerJobProgressWriter
   constructor(
     private readonly db: Kysely<DatabaseSchema>,
     private readonly webhookEvents?: WorkerWebhookEventEmitter,
+    private readonly queuePressureRecorder?: RuntimeQueuePressureRecorder,
   ) {}
 
   async canContinueJob(input: WorkerJobGuardInput): Promise<WorkerJobGuardResult> {
@@ -165,6 +172,8 @@ export class PostgresWorkerJobProgressWriter
     if (updated.rows[0] === undefined) {
       return;
     }
+
+    await this.recordQueuePressure(input);
 
     await sql`
       insert into job_events (
@@ -279,6 +288,23 @@ export class PostgresWorkerJobProgressWriter
     }
   }
 
+  private async recordQueuePressure(input: WorkerJobProgressUpdate): Promise<void> {
+    const event = toRuntimeQueuePressureEvent(input.status);
+
+    if (event === null) {
+      return;
+    }
+
+    await recordRuntimeQueuePressureEvent(this.queuePressureRecorder, {
+      event,
+      now: new Date(input.now ?? Date.now()),
+      scopeId: input.knowledgeBaseId,
+      workKind: toRuntimeQueueWorkKind(input.stage),
+    }).catch((error: unknown) => {
+      console.warn("Runtime queue pressure recording failed.", error);
+    });
+  }
+
   private async readProgressTimingMetadata(
     jobId: string,
     stage: WorkerJobStage,
@@ -344,4 +370,29 @@ function toJobEventType(status: WorkerJobStatus): JobProgressEventType {
   }
 
   return "job.queued";
+}
+
+function toRuntimeQueuePressureEvent(status: WorkerJobStatus): RuntimeQueuePressureEvent | null {
+  if (status === "queued") {
+    return "queued";
+  }
+  if (status === "running") {
+    return "started";
+  }
+  if (status === "completed") {
+    return "completed";
+  }
+  if (status === "failed" || status === "canceled") {
+    return "failed";
+  }
+
+  return null;
+}
+
+function toRuntimeQueueWorkKind(stage: WorkerJobStage): RuntimeQueueWorkKind {
+  if (stage === "parsing" || stage === "ocr" || stage === "captioning") {
+    return "source-parse";
+  }
+
+  return "wiki-compile";
 }

@@ -187,6 +187,10 @@ export const apiErrorDefinitions = {
     httpStatus: 422,
     message: "Parser output empty.",
   },
+  parser_limit_exceeded: {
+    httpStatus: 413,
+    message: "Parser limit exceeded.",
+  },
   invalid_request: {
     httpStatus: 400,
     message: "Invalid request.",
@@ -222,6 +226,22 @@ export const apiErrorDefinitions = {
   retrieve_index_not_ready: {
     httpStatus: 409,
     message: "Retrieve index not ready.",
+  },
+  durable_backend_unavailable: {
+    httpStatus: 503,
+    message: "Durable backend unavailable.",
+  },
+  bounded_retrieval_unavailable: {
+    httpStatus: 503,
+    message: "Bounded retrieval backend unavailable.",
+  },
+  graph_index_unavailable: {
+    httpStatus: 503,
+    message: "Graph index unavailable.",
+  },
+  redis_metrics_degraded: {
+    httpStatus: 503,
+    message: "Redis metrics degraded.",
   },
   fork_target_invalid: {
     httpStatus: 400,
@@ -5833,6 +5853,18 @@ export const openApiPaths = {
       operationId: "getGraphInsights",
       responses: {
         "200": jsonResponse("Graph insights.", "#/components/schemas/GraphInsights"),
+        ...standardErrorResponses,
+      },
+    },
+  },
+  "/knowledge-bases/{knowledge_base_id}/graph/insights/refresh": {
+    post: {
+      summary: "Refresh graph insights",
+      description:
+        "Queues graph insight recomputation for the current Knowledge Base version and returns the durable hidden ingest job. Poll the graph insights endpoint for refresh status.",
+      operationId: "refreshGraphInsights",
+      responses: {
+        "202": jsonResponse("Graph insight refresh queued.", "#/components/schemas/IngestJob"),
         ...standardErrorResponses,
       },
     },

@@ -61,6 +61,7 @@ export interface FococontextApiClient {
   ): Promise<JobDetail>
   getGraph(knowledgeBaseId: string): Promise<GraphResponse>
   getGraphInsights(knowledgeBaseId: string): Promise<GraphInsightsResponse>
+  refreshGraphInsights(knowledgeBaseId: string): Promise<JobDetail>
   getJob(jobId: string): Promise<JobDetail>
   getIngestJobStatuses(input: {
     job_ids: string[]
@@ -1993,6 +1994,16 @@ export function createFococontextApiClient(
         baseUrl,
         `/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/graph/insights`,
         options
+      ),
+    refreshGraphInsights: (knowledgeBaseId) =>
+      requestJson(
+        fetchFn,
+        baseUrl,
+        `/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/graph/insights/refresh`,
+        options,
+        {
+          method: "POST",
+        }
       ),
     getJob: (jobId) =>
       requestJson(

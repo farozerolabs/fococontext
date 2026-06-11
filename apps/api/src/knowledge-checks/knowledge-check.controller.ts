@@ -21,7 +21,7 @@ export class KnowledgeBaseKnowledgeCheckController {
   ) {
     const scope = requireApiKeyScope(request);
 
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.knowledgeCheckService.create(knowledgeBaseId, request.body, scope),
       createRequestId(),

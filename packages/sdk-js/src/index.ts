@@ -64,6 +64,7 @@ export const apiErrorCodes = [
   "parser_timeout",
   "password_protected_pdf",
   "parser_output_empty",
+  "parser_limit_exceeded",
   "invalid_request",
   "invalid_locator",
   "unsupported_evidence_kind",
@@ -73,6 +74,10 @@ export const apiErrorCodes = [
   "ingest_failed",
   "change_set_conflict",
   "retrieve_index_not_ready",
+  "durable_backend_unavailable",
+  "bounded_retrieval_unavailable",
+  "graph_index_unavailable",
+  "redis_metrics_degraded",
   "fork_target_invalid",
   "fork_submission_requires_fork",
   "document_delete_preview_required",
@@ -1734,6 +1739,17 @@ export class FococontextClient {
     options: RequestOptions = {},
   ): Promise<TData> {
     return this.getJson(`/knowledge-bases/${encodePath(knowledgeBaseId)}/graph/insights`, options);
+  }
+
+  refreshGraphInsights<TData = JsonObject>(
+    knowledgeBaseId: string,
+    options: RequestOptions = {},
+  ): Promise<TData> {
+    return this.postJson(
+      `/knowledge-bases/${encodePath(knowledgeBaseId)}/graph/insights/refresh`,
+      {},
+      options,
+    );
   }
 
   listWikiPages<TItem = JsonObject>(

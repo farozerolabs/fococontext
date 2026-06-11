@@ -48,6 +48,21 @@ Use this page to handle structured errors, limits, cleanup operations, request I
 
 Cache metrics summarize runtime cache behavior by resource kind. Use them to detect repeated misses or invalidation-heavy workflows. Migration status reports that schema changes are owned by the dedicated startup migration service in Docker Compose deployments, so API and Worker containers can start against an already prepared schema.
 
+## Durable Backend Errors
+
+Production OpenAPI requests use PostgreSQL, pgvector, Redis, S3-compatible storage, queue workers, and persisted graph/source-evidence indexes. If a required backend is missing or unavailable, the API returns a typed response instead of switching to an in-memory compatibility path.
+
+| Code                            | Typical status | When it appears                                                              |
+| ------------------------------- | -------------: | ---------------------------------------------------------------------------- |
+| `durable_backend_unavailable`   |          `503` | A required production backend or runtime dependency is not available.        |
+| `bounded_retrieval_unavailable` |          `503` | Retrieve cannot reach the bounded PostgreSQL/pgvector retrieval backend.     |
+| `graph_index_unavailable`       |          `503` | Graph traversal or graph insight indexes are not ready or cannot be queried. |
+| `redis_metrics_degraded`        |          `503` | Redis-backed runtime metrics are unavailable for status or diagnostics.      |
+| `parser_limit_exceeded`         |          `413` | Parser or Worker hard limits stop a source before unbounded memory use.      |
+| `retrieve_index_not_ready`      |          `409` | Ingest has not produced usable Wiki/index state for this Knowledge Base yet. |
+
+The response still includes `request_id`, a safe localized message, and structured `details`. Secrets, raw source text, prompts, signed URLs, storage keys, and raw SQL are not returned.
+
 ## OpenAPI
 
 ```yaml

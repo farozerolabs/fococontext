@@ -48,6 +48,21 @@
 
 Cache metrics 按 resource kind 汇总 runtime cache 行为，可用于发现反复 miss 或 invalidation 密集的流程。Migration status 会说明 Docker Compose 部署中的 schema 变更由独立启动迁移服务负责，API 和 Worker 容器会在 schema 准备完成后运行。
 
+## 持久化后端错误
+
+生产 OpenAPI 请求使用 PostgreSQL、pgvector、Redis、S3-compatible storage、队列 Worker、持久化图谱索引和来源证据索引。必要后端缺失或不可用时，API 返回类型化响应，不会切到内存兼容路径。
+
+| Code                            | 常见状态码 | 出现场景                                                  |
+| ------------------------------- | ---------: | --------------------------------------------------------- |
+| `durable_backend_unavailable`   |      `503` | 必要生产后端或运行时依赖不可用。                          |
+| `bounded_retrieval_unavailable` |      `503` | Retrieve 无法访问有界 PostgreSQL/pgvector 检索后端。      |
+| `graph_index_unavailable`       |      `503` | 图谱遍历或图谱洞察索引未就绪，或查询不可用。              |
+| `redis_metrics_degraded`        |      `503` | Redis-backed runtime metrics 无法用于状态和诊断。         |
+| `parser_limit_exceeded`         |      `413` | Parser 或 Worker 硬限制阻止来源资料继续造成无界内存使用。 |
+| `retrieve_index_not_ready`      |      `409` | 该 Knowledge Base 的入库还没有产生可用 Wiki/index 状态。  |
+
+响应仍包含 `request_id`、安全的本地化消息和结构化 `details`。API 不返回 secret、原始来源全文、prompt、signed URL、storage key 或 raw SQL。
+
 ## OpenAPI
 
 ```yaml

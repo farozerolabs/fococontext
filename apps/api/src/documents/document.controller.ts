@@ -102,7 +102,7 @@ export class DocumentController {
     @Req() request: ApiKeyRequest,
   ) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     const result = await this.documentService.listDocuments(
       knowledgeBaseId,
       {
@@ -133,7 +133,7 @@ export class DocumentController {
     @Req() request: ApiKeyRequest & { body: CreateTextSourceBody },
   ) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.documentService.createTextSource(
         knowledgeBaseId,
@@ -153,7 +153,7 @@ export class DocumentController {
     @Req() request: ApiKeyRequest & { body: CreateUrlSourceBody },
   ) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.documentService.createUrlSource(
         knowledgeBaseId,
@@ -173,7 +173,7 @@ export class DocumentController {
     @Req() request: ApiKeyRequest & { body: CreateUploadSessionBody },
   ) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.documentService.createUploadSession(
         knowledgeBaseId,
@@ -194,7 +194,7 @@ export class DocumentController {
     @Req() request: ApiKeyRequest & { body: FinalizeUploadSessionBody },
   ) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.documentService.finalizeUploadSession(
         knowledgeBaseId,
@@ -215,7 +215,7 @@ export class DocumentController {
     @Req() request: MultipartRequest & ApiKeyRequest,
   ) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.documentService.uploadMultipart(knowledgeBaseId, request, idempotencyKey, scope),
       createRequestId(),

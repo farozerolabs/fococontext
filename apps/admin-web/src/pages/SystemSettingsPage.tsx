@@ -518,6 +518,9 @@ function SystemSettingsSectionPanel({
   }
 
   if (section === "storageIndexes") {
+    const runtimeState = readRecord(settings.dependencies, "runtimeState")
+    const retrieval = readRecord(settings.dependencies, "retrieval")
+
     return (
       <div className="flex flex-col gap-4">
         <KeyValue label={t("systemSettings.databaseStatus")}>
@@ -552,6 +555,21 @@ function SystemSettingsSectionPanel({
         </KeyValue>
         <KeyValue label={t("systemSettings.queueConcurrency")}>
           {readPrimitive(settings.dependencies, "queue", "concurrency")}
+        </KeyValue>
+        <KeyValue label={t("systemSettings.sessionStore")}>
+          <JsonBlock value={runtimeState?.sessionStore ?? {}} />
+        </KeyValue>
+        <KeyValue label={t("systemSettings.runtimeMetricsStore")}>
+          <JsonBlock value={runtimeState?.metricsStore ?? {}} />
+        </KeyValue>
+        <KeyValue label={t("systemSettings.boundedRetrieval")}>
+          <JsonBlock value={retrieval?.boundedRetrieval ?? {}} />
+        </KeyValue>
+        <KeyValue label={t("systemSettings.graphReadiness")}>
+          <JsonBlock value={retrieval?.graphReadiness ?? {}} />
+        </KeyValue>
+        <KeyValue label={t("systemSettings.sourceEvidenceReadiness")}>
+          <JsonBlock value={retrieval?.sourceEvidence ?? {}} />
         </KeyValue>
         <KeyValue label={t("systemSettings.storageProvider")}>
           {displayPrimitive(t, settings.storage.providerName)}

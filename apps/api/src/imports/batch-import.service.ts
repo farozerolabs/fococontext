@@ -29,7 +29,7 @@ export class BatchImportService {
     input: CreateBatchImportInput,
     scope?: ApiResourceScope,
   ): Promise<CreateBatchImportResponse> {
-    this.knowledgeBaseService.get(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.get(knowledgeBaseId, scope);
 
     const importJobId = createResourceId("ingestJob");
     const sourceType = readSourceType(input.source_type);

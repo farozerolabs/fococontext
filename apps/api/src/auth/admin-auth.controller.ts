@@ -21,7 +21,7 @@ export class AdminAuthController {
 
   @Post("login")
   @HttpCode(200)
-  login(@Body() body: LoginBody, @Res({ passthrough: true }) reply: FastifyReply) {
+  async login(@Body() body: LoginBody, @Res({ passthrough: true }) reply: FastifyReply) {
     const username = body.username ?? "";
     const password = body.password ?? "";
 
@@ -31,7 +31,7 @@ export class AdminAuthController {
       });
     }
 
-    const session = this.authService.createSession(username);
+    const session = await this.authService.createSession(username);
     reply.header("set-cookie", serializeAdminSessionCookie(session.token));
 
     return createSuccessEnvelope(
@@ -62,9 +62,12 @@ export class AdminAuthController {
 
   @Post("logout")
   @HttpCode(200)
-  logout(@Req() request: AdminSessionRequest, @Res({ passthrough: true }) reply: FastifyReply) {
+  async logout(
+    @Req() request: AdminSessionRequest,
+    @Res({ passthrough: true }) reply: FastifyReply,
+  ) {
     if (request.raw.adminSessionToken !== undefined) {
-      this.authService.deleteSession(request.raw.adminSessionToken);
+      await this.authService.deleteSession(request.raw.adminSessionToken);
     }
 
     reply.header("set-cookie", expireAdminSessionCookie());

@@ -3,13 +3,8 @@ import { ApiError, createResourceId } from "@fococontext/contracts";
 import type { RuntimeConfig } from "@fococontext/core";
 import { rm } from "node:fs/promises";
 
-import type { ApiResourceScope } from "../auth/api-key.guard.js";
+import { defaultApiResourceScope, type ApiResourceScope } from "../auth/api-key.guard.js";
 import { DocumentService } from "../documents/document.service.js";
-import { KnowledgeBaseService } from "../knowledge-bases/knowledge-base.service.js";
-import {
-  apiDatabaseHydratorToken,
-  type ApiDatabaseHydrator,
-} from "../database/api-database-hydrator.js";
 import { apiDatabaseMirrorToken, type ApiDatabaseMirror } from "../database/api-database-mirror.js";
 import {
   operationalReadStoreToken,
@@ -17,7 +12,6 @@ import {
 } from "../database/operational-read-store.js";
 import { runtimeConfigToken } from "../runtime-config.provider.js";
 import { mapWithConcurrency } from "../utils/bounded-concurrency.js";
-import { SourceWatchRuleRepository } from "./source-watch.repository.js";
 import {
   sourceWatchScanCoordinatorToken,
   type SourceWatchScanCoordinator,
@@ -56,6 +50,7 @@ import {
   type ListScheduledImportJobsResult,
   type ListSourceWatchRulesInput,
   type ListSourceWatchRulesResult,
+  type ScheduledImportJobRecord,
   type ScheduledImportJobEnvelope,
   type SourceWatchDiscoveredSource,
   type SourceWatchRuleEnvelope,
@@ -70,14 +65,11 @@ import {
 @Injectable()
 export class SourceWatchService {
   constructor(
-    private readonly knowledgeBaseService: KnowledgeBaseService,
-    private readonly repository: SourceWatchRuleRepository,
     private readonly documentService: DocumentService,
     @Inject(sourceWatchScannerToken) private readonly scanner: SourceWatchScanner,
     @Inject(sourceWatchScanCoordinatorToken)
     private readonly scanCoordinator: SourceWatchScanCoordinator,
     @Inject(apiDatabaseMirrorToken) private readonly databaseMirror: ApiDatabaseMirror,
-    @Inject(apiDatabaseHydratorToken) private readonly databaseHydrator: ApiDatabaseHydrator,
     @Inject(operationalReadStoreToken) private readonly operationalReadStore: OperationalReadStore,
     @Inject(runtimeConfigToken) private readonly config: RuntimeConfig,
   ) {}
@@ -87,19 +79,17 @@ export class SourceWatchService {
     input: CreateSourceWatchRuleInput,
     scope?: ApiResourceScope,
   ): Promise<SourceWatchRuleEnvelope> {
-    this.getKnowledgeBase(knowledgeBaseId, scope);
+    await this.getReadableKnowledgeBase(knowledgeBaseId, scope);
     const sourceKind = readSourceKind(input.source_kind);
     const location = readRequiredString(input.location, "location");
+    const datasetConfiguration = await this.requireDatasetConfiguration(knowledgeBaseId, scope);
 
     assertSupportedRuntimeSourceKind(sourceKind, this.config);
-    assertDatasetSupportsSourceKind(
-      sourceKind,
-      this.knowledgeBaseService.getDatasetConfiguration(knowledgeBaseId, scope).values.source_watch,
-    );
+    assertDatasetSupportsSourceKind(sourceKind, datasetConfiguration.values.source_watch);
     validateSourceWatchLocation(sourceKind, location, this.config);
 
     const now = new Date().toISOString();
-    const record = this.repository.create({
+    const record: SourceWatchRuleRecord = {
       id: createResourceId("sourceWatchRule"),
       knowledgeBaseId,
       name: readRequiredString(input.name, "name"),
@@ -117,7 +107,7 @@ export class SourceWatchService {
       latestScan: null,
       createdAt: now,
       updatedAt: now,
-    });
+    };
     await this.databaseMirror.saveSourceWatchRule(record);
 
     return {
@@ -130,7 +120,7 @@ export class SourceWatchService {
     input: ListSourceWatchRulesInput,
     scope?: ApiResourceScope,
   ): Promise<ListSourceWatchRulesResult> {
-    this.getKnowledgeBase(knowledgeBaseId, scope);
+    await this.getReadableKnowledgeBase(knowledgeBaseId, scope);
     try {
       const dbResult = await this.operationalReadStore.listSourceWatchRules({
         knowledgeBaseId,
@@ -151,35 +141,16 @@ export class SourceWatchService {
       throw toOperationalListError(error);
     }
 
-    await this.databaseHydrator.refresh();
-
-    const records = this.repository
-      .listByKnowledgeBaseId(knowledgeBaseId)
-      .sort((left, right) =>
-        compareUpdatedAtDesc(left.updatedAt, left.id, right.updatedAt, right.id),
-      );
-    const start = (input.page - 1) * input.pageSize;
-    const items = records
-      .slice(start, start + input.pageSize)
-      .map((record) => toSourceWatchRuleResponse(record, this.config));
-
-    return {
-      items,
-      page: input.page,
-      pageSize: input.pageSize,
-      total: records.length,
-      hasMore: start + input.pageSize < records.length,
-    };
+    throw new ApiError("internal_error");
   }
 
   async get(ruleId: string, scope?: ApiResourceScope): Promise<SourceWatchRuleEnvelope> {
-    await this.databaseHydrator.refresh();
-    const record = this.repository.findById(ruleId);
+    const record = await this.operationalReadStore.getSourceWatchRuleById(ruleId);
 
-    if (record === undefined) {
+    if (record === undefined || record === null) {
       throw createSourceWatchRuleNotFoundError(ruleId);
     }
-    this.assertRuleKnowledgeBaseVisible(record, scope);
+    await this.assertRuleKnowledgeBaseVisible(record, scope);
 
     return {
       rule: toSourceWatchRuleResponse(record, this.config),
@@ -191,10 +162,9 @@ export class SourceWatchService {
     input: UpdateSourceWatchRuleInput,
     scope?: ApiResourceScope,
   ): Promise<SourceWatchRuleEnvelope> {
-    await this.databaseHydrator.refresh();
-    const record = this.requireRule(ruleId, scope);
+    const record = await this.requireRule(ruleId, scope);
     const now = new Date().toISOString();
-    const updatedRecord = this.repository.update({
+    const updatedRecord: SourceWatchRuleRecord = {
       ...record,
       ...(input.name === undefined ? {} : { name: readRequiredString(input.name, "name") }),
       ...(input.include_extensions === undefined
@@ -221,7 +191,7 @@ export class SourceWatchService {
             schedule: updateSourceWatchSchedule(record.schedule, input.schedule, now, this.config),
           }),
       updatedAt: now,
-    });
+    };
     await this.databaseMirror.updateSourceWatchRule(updatedRecord);
 
     return {
@@ -233,13 +203,12 @@ export class SourceWatchService {
     jobId: string,
     scope?: ApiResourceScope,
   ): Promise<ScheduledImportJobEnvelope> {
-    await this.databaseHydrator.refresh();
-    const record = this.repository.findScheduledImportJobById(jobId);
+    const record = await this.operationalReadStore.getScheduledImportJobById(jobId);
 
-    if (record === undefined) {
+    if (record === undefined || record === null) {
       throw createScheduledImportJobNotFoundError(jobId);
     }
-    this.assertReadableKnowledgeBase(record.knowledgeBaseId, scope, () =>
+    await this.assertReadableKnowledgeBase(record.knowledgeBaseId, scope, () =>
       createScheduledImportJobNotFoundError(jobId),
     );
 
@@ -257,7 +226,7 @@ export class SourceWatchService {
       const dbRule = await this.operationalReadStore.getSourceWatchRuleById(ruleId);
 
       if (dbRule !== null) {
-        this.assertRuleKnowledgeBaseVisible(dbRule, scope);
+        await this.assertRuleKnowledgeBaseVisible(dbRule, scope);
         const dbResult = await this.operationalReadStore.listScheduledImportJobsByRuleId(
           dbRule.id,
           {
@@ -280,32 +249,17 @@ export class SourceWatchService {
       throw toOperationalListError(error);
     }
 
-    await this.databaseHydrator.refresh();
-    this.requireRule(ruleId, scope);
-    const records = this.repository.listScheduledImportJobsByRuleId(ruleId);
-    const start = (input.page - 1) * input.pageSize;
-    const items = records
-      .slice(start, start + input.pageSize)
-      .map((item) => toScheduledImportJobResponse(item));
-
-    return {
-      items,
-      page: input.page,
-      pageSize: input.pageSize,
-      total: records.length,
-      hasMore: start + input.pageSize < records.length,
-    };
+    throw new ApiError("internal_error");
   }
 
   async disable(ruleId: string, scope?: ApiResourceScope): Promise<SourceWatchRuleEnvelope> {
-    await this.databaseHydrator.refresh();
-    const record = this.requireRule(ruleId, scope);
-    const updatedRecord = this.repository.update({
+    const record = await this.requireRule(ruleId, scope);
+    const updatedRecord: SourceWatchRuleRecord = {
       ...record,
       status: "disabled",
       schedule: pauseSourceWatchSchedule(record.schedule),
       updatedAt: new Date().toISOString(),
-    });
+    };
     await this.databaseMirror.updateSourceWatchRule(updatedRecord);
 
     return {
@@ -314,15 +268,14 @@ export class SourceWatchService {
   }
 
   async enable(ruleId: string, scope?: ApiResourceScope): Promise<SourceWatchRuleEnvelope> {
-    await this.databaseHydrator.refresh();
-    const record = this.requireRule(ruleId, scope);
+    const record = await this.requireRule(ruleId, scope);
     const now = new Date().toISOString();
-    const updatedRecord = this.repository.update({
+    const updatedRecord: SourceWatchRuleRecord = {
       ...record,
       status: "enabled",
       schedule: resumeSourceWatchSchedule(record.schedule, now),
       updatedAt: now,
-    });
+    };
     await this.databaseMirror.updateSourceWatchRule(updatedRecord);
 
     return {
@@ -339,17 +292,8 @@ export class SourceWatchService {
       return [];
     }
 
-    await this.databaseHydrator.refresh();
     const nowIso = now.toISOString();
-    const dueRules = this.repository
-      .listAll()
-      .filter((rule) => rule.status === "enabled")
-      .filter((rule) => rule.schedule.enabled)
-      .filter(
-        (rule) =>
-          rule.schedule.nextRunAt !== null &&
-          new Date(rule.schedule.nextRunAt).getTime() <= now.getTime(),
-      );
+    const dueRules = await this.operationalReadStore.listDueSourceWatchRules(nowIso, 1000);
     const results: SourceWatchScanEnvelope[] = [];
 
     for (const rule of dueRules) {
@@ -365,8 +309,7 @@ export class SourceWatchService {
     scheduledFor: string | null = null,
     scope?: ApiResourceScope,
   ): Promise<SourceWatchScanEnvelope> {
-    await this.databaseHydrator.refresh();
-    const record = this.requireRule(ruleId, scope);
+    const record = await this.requireRule(ruleId, scope);
 
     return this.scanCoordinator.runExclusive({
       ruleId: record.id,
@@ -407,7 +350,7 @@ export class SourceWatchService {
         delete_candidates: deleteCandidates,
         skipped: discovery.skipped.map(cloneSkippedSource),
       };
-      const scheduledImportJob = this.repository.createScheduledImportJob({
+      const scheduledImportJob: ScheduledImportJobRecord = {
         id: createResourceId("scheduledImportJob"),
         sourceWatchRuleId: record.id,
         knowledgeBaseId: record.knowledgeBaseId,
@@ -424,7 +367,7 @@ export class SourceWatchService {
         scheduledFor,
         createdAt: now,
         updatedAt: now,
-      });
+      };
       const latestScan = createLatestScan(scheduledImportJob);
       const updatedRecord = {
         ...record,
@@ -433,7 +376,6 @@ export class SourceWatchService {
         updatedAt: now,
       };
 
-      this.repository.update(updatedRecord);
       await this.databaseMirror.saveScheduledImportJob(scheduledImportJob);
       await this.databaseMirror.updateSourceWatchRule(updatedRecord);
 
@@ -463,7 +405,9 @@ export class SourceWatchService {
     }
   }
 
-  private createCoalescedScanResponse(record: SourceWatchRuleRecord): SourceWatchScanEnvelope {
+  private async createCoalescedScanResponse(
+    record: SourceWatchRuleRecord,
+  ): Promise<SourceWatchScanEnvelope> {
     const latestScan = record.latestScan;
 
     if (latestScan === null) {
@@ -472,11 +416,11 @@ export class SourceWatchService {
       });
     }
 
-    const scheduledImportJob = this.repository.findScheduledImportJobById(
+    const scheduledImportJob = await this.operationalReadStore.getScheduledImportJobById(
       latestScan.scheduled_import_job_id,
     );
 
-    if (scheduledImportJob === undefined) {
+    if (scheduledImportJob === null) {
       throw new ApiError("invalid_request", {
         message: "Source watch scan is already running.",
       });
@@ -517,7 +461,7 @@ export class SourceWatchService {
       skipped: [],
     };
     const retryable = isRetryableSourceWatchError(input.error);
-    const scheduledImportJob = this.repository.createScheduledImportJob({
+    const scheduledImportJob: ScheduledImportJobRecord = {
       id: createResourceId("scheduledImportJob"),
       sourceWatchRuleId: record.id,
       knowledgeBaseId: record.knowledgeBaseId,
@@ -536,7 +480,7 @@ export class SourceWatchService {
       scheduledFor: input.scheduledFor,
       createdAt: now,
       updatedAt: now,
-    });
+    };
     const latestScan = createLatestScan(scheduledImportJob);
     const updatedRecord = {
       ...record,
@@ -545,7 +489,6 @@ export class SourceWatchService {
       updatedAt: now,
     };
 
-    this.repository.update(updatedRecord);
     await this.databaseMirror.saveScheduledImportJob(scheduledImportJob);
     await this.databaseMirror.updateSourceWatchRule(updatedRecord);
 
@@ -566,50 +509,66 @@ export class SourceWatchService {
     };
   }
 
-  private requireRule(ruleId: string, scope?: ApiResourceScope): SourceWatchRuleRecord {
-    const record = this.repository.findById(ruleId);
+  private async requireRule(
+    ruleId: string,
+    scope?: ApiResourceScope,
+  ): Promise<SourceWatchRuleRecord> {
+    const record = await this.operationalReadStore.getSourceWatchRuleById(ruleId);
 
-    if (record === undefined) {
+    if (record === undefined || record === null) {
       throw createSourceWatchRuleNotFoundError(ruleId);
     }
-    this.assertRuleKnowledgeBaseVisible(record, scope);
+    await this.assertRuleKnowledgeBaseVisible(record, scope);
 
     return record;
   }
 
-  private getKnowledgeBase(knowledgeBaseId: string, scope?: ApiResourceScope) {
-    return scope === undefined
-      ? this.knowledgeBaseService.get(knowledgeBaseId)
-      : this.knowledgeBaseService.get(knowledgeBaseId, scope);
+  private async getReadableKnowledgeBase(
+    knowledgeBaseId: string,
+    scope?: ApiResourceScope,
+    notFoundFactory: () => ApiError = () => new ApiError("knowledge_base_not_found"),
+  ) {
+    const knowledgeBase = await this.operationalReadStore.getKnowledgeBaseById(
+      scope ?? defaultApiResourceScope,
+      knowledgeBaseId,
+    );
+
+    if (knowledgeBase === null) {
+      throw notFoundFactory();
+    }
+
+    return knowledgeBase;
   }
 
-  private assertRuleKnowledgeBaseVisible(
+  private async assertRuleKnowledgeBaseVisible(
     record: SourceWatchRuleRecord,
     scope?: ApiResourceScope,
-  ): void {
-    this.assertReadableKnowledgeBase(record.knowledgeBaseId, scope, () =>
+  ): Promise<void> {
+    await this.assertReadableKnowledgeBase(record.knowledgeBaseId, scope, () =>
       createSourceWatchRuleNotFoundError(record.id),
     );
   }
 
-  private assertReadableKnowledgeBase(
+  private async assertReadableKnowledgeBase(
     knowledgeBaseId: string,
     scope: ApiResourceScope | undefined,
     notFoundFactory: () => ApiError,
-  ): void {
-    try {
-      if (scope === undefined) {
-        this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId);
-      } else {
-        this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
-      }
-    } catch (error) {
-      if (error instanceof ApiError && error.code === "knowledge_base_not_found") {
-        throw notFoundFactory();
-      }
+  ): Promise<void> {
+    await this.getReadableKnowledgeBase(knowledgeBaseId, scope, notFoundFactory);
+  }
 
-      throw error;
+  private async requireDatasetConfiguration(knowledgeBaseId: string, scope?: ApiResourceScope) {
+    const datasetConfiguration =
+      await this.operationalReadStore.getDatasetConfigurationByKnowledgeBaseId(
+        scope ?? defaultApiResourceScope,
+        knowledgeBaseId,
+      );
+
+    if (datasetConfiguration === null) {
+      throw new ApiError("internal_error");
     }
+
+    return datasetConfiguration;
   }
 
   private async autoIngestSources(
@@ -701,17 +660,6 @@ export class SourceWatchService {
       },
     );
   }
-}
-
-function compareUpdatedAtDesc(
-  leftUpdatedAt: string,
-  leftId: string,
-  rightUpdatedAt: string,
-  rightId: string,
-): number {
-  const updatedAtOrder = rightUpdatedAt.localeCompare(leftUpdatedAt);
-
-  return updatedAtOrder === 0 ? rightId.localeCompare(leftId) : updatedAtOrder;
 }
 
 function toOperationalListError(error: unknown): ApiError {

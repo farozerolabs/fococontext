@@ -4,7 +4,6 @@ import { ApiError, createResourceId } from "@fococontext/contracts";
 import type { ObjectStorageAdapter } from "@fococontext/storage";
 
 import { apiDatabaseMirrorToken, type ApiDatabaseMirror } from "../database/api-database-mirror.js";
-import { DocumentRepository } from "../documents/document.repository.js";
 import type { JobRecord, SourceDocumentRecord } from "../documents/document.types.js";
 import { KnowledgeBaseService } from "../knowledge-bases/knowledge-base.service.js";
 import type { DatasetConfigurationResponse } from "../knowledge-bases/knowledge-base.types.js";
@@ -16,12 +15,9 @@ import {
 } from "../queues/source-parse.queue.js";
 import type { ApiResourceScope } from "../auth/api-key.guard.js";
 import { WebhookService } from "../webhooks/webhook.service.js";
-import { WikiDraftRepository } from "./wiki-draft.repository.js";
 import type {
   SubmitWikiDraftInput,
   WikiDraftApplyMode,
-  WikiDraftChangeSetRecord,
-  WikiDraftRecord,
   WikiDraftSourceRef,
   WikiDraftStatus,
   WikiDraftSubmissionResponse,
@@ -33,8 +29,6 @@ const defaultApplyMode: WikiDraftApplyMode = "auto_ingest";
 export class WikiDraftService {
   constructor(
     private readonly knowledgeBaseService: KnowledgeBaseService,
-    private readonly documentRepository: DocumentRepository,
-    private readonly wikiDraftRepository: WikiDraftRepository,
     @Inject(objectStorageToken) private readonly objectStorage: ObjectStorageAdapter,
     @Inject(sourceParseQueueToken) private readonly sourceParseQueue: SourceParseQueue,
     @Inject(apiDatabaseMirrorToken) private readonly databaseMirror: ApiDatabaseMirror,
@@ -46,7 +40,7 @@ export class WikiDraftService {
     input: SubmitWikiDraftInput,
     scope?: ApiResourceScope,
   ): Promise<WikiDraftSubmissionResponse> {
-    const knowledgeBase = this.knowledgeBaseService.get(knowledgeBaseId, scope);
+    const knowledgeBase = await this.knowledgeBaseService.get(knowledgeBaseId, scope);
     const title = readRequiredString(input.title, "title");
     const markdown = readRequiredString(input.markdown, "markdown");
     const applyMode = readApplyMode(input.apply_mode);
@@ -76,24 +70,6 @@ export class WikiDraftService {
       now,
     });
     const status = toWikiDraftStatus();
-    const draft: WikiDraftRecord = {
-      id: draftId,
-      knowledgeBaseId,
-      title,
-      markdown,
-      sources,
-      tags,
-      metadata,
-      applyMode,
-      documentId: document.id,
-      jobId: job.id,
-      changeSetId,
-      baseKnowledgeVersionId: knowledgeBase.current_version_id,
-      targetKnowledgeVersionId: null,
-      status,
-      createdAt: now,
-    };
-
     await this.objectStorage.putObject({
       key: document.objectKey,
       body: Buffer.from(markdown),
@@ -104,12 +80,6 @@ export class WikiDraftService {
         draftId,
       },
     });
-    this.wikiDraftRepository.createDraft(draft);
-    this.wikiDraftRepository.createChangeSet(
-      createWikiDraftChangeSetRecord(draft, knowledgeBase.current_version_id, now),
-    );
-    this.documentRepository.createDocument(document);
-    this.documentRepository.createJob(job);
     await this.databaseMirror.saveSourceDocument(document);
     await this.databaseMirror.saveJob(job);
     await this.databaseMirror.appendJobEvent(createQueuedJobEvent(job));
@@ -120,7 +90,7 @@ export class WikiDraftService {
       payload: {
         change_set_id: changeSetId,
         document_id: document.id,
-        draft_id: draft.id,
+        draft_id: draftId,
         job_id: job.id,
       },
       requestTrace: {
@@ -130,7 +100,7 @@ export class WikiDraftService {
     });
 
     return {
-      draft_id: draft.id,
+      draft_id: draftId,
       document_id: document.id,
       job_id: job.id,
       change_set_id: changeSetId,
@@ -145,7 +115,7 @@ export class WikiDraftService {
     job: JobRecord,
     scope?: ApiResourceScope,
   ): Promise<void> {
-    const datasetConfiguration = this.knowledgeBaseService.getDatasetConfiguration(
+    const datasetConfiguration = await this.knowledgeBaseService.getDatasetConfiguration(
       document.knowledgeBaseId,
       scope,
     );
@@ -265,23 +235,6 @@ function createQueuedJobEvent(record: JobRecord) {
     message: record.progressMessage,
     metadata: {},
     createdAt: record.createdAt,
-  };
-}
-
-function createWikiDraftChangeSetRecord(
-  draft: WikiDraftRecord,
-  baseKnowledgeVersionId: string,
-  now: string,
-): WikiDraftChangeSetRecord {
-  return {
-    id: draft.changeSetId,
-    knowledgeBaseId: draft.knowledgeBaseId,
-    draftId: draft.id,
-    status: "pending",
-    trigger: "wiki_draft",
-    baseKnowledgeVersionId,
-    targetKnowledgeVersionId: null,
-    createdAt: now,
   };
 }
 

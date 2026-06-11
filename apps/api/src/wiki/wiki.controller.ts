@@ -39,7 +39,7 @@ export class KnowledgeBasePageController {
   ) {
     const scope = requireApiKeyScope(request);
 
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     const paginationInput = parseCursorPaginationQuery(query);
     const pagination = await this.wikiStore.listPagesPaginated(knowledgeBaseId, paginationInput);
 
@@ -66,7 +66,7 @@ export class WikiPageController {
   async detail(@Param("pageId") pageId: string, @Req() request: ApiKeyRequest) {
     const scope = requireApiKeyScope(request);
     const page = await this.wikiStore.getPage(pageId);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(
       readRequiredString(page.knowledge_base_id),
       scope,
     );
@@ -82,7 +82,7 @@ export class WikiPageController {
   ) {
     const scope = requireApiKeyScope(request);
     const currentPage = await this.wikiStore.getPage(pageId);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(
       readRequiredString(currentPage.knowledge_base_id),
       scope,
     );
@@ -140,7 +140,7 @@ export class WikiPageController {
   ) {
     const scope = requireApiKeyScope(request);
     const page = await this.wikiStore.getPage(pageId);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(
       readRequiredString(page.knowledge_base_id),
       scope,
     );
@@ -168,7 +168,7 @@ export class WikiPageController {
   ) {
     const scope = requireApiKeyScope(request);
     const page = await this.wikiStore.getPage(pageId);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(
       readRequiredString(page.knowledge_base_id),
       scope,
     );
@@ -194,7 +194,7 @@ export class WikiPageController {
   ) {
     const scope = requireApiKeyScope(request);
     const page = await this.wikiStore.getPage(pageId);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(
       readRequiredString(page.knowledge_base_id),
       scope,
     );
@@ -246,7 +246,7 @@ export class KnowledgeBaseVersionController {
   ) {
     const scope = requireApiKeyScope(request);
 
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     const paginationInput = parseCursorPaginationQuery(query);
     const pagination = await this.wikiStore.listKnowledgeVersionsPaginated(
       knowledgeBaseId,
@@ -279,7 +279,7 @@ export class KnowledgeBasePageVersionController {
   ) {
     const scope = requireApiKeyScope(request);
 
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     const paginationInput = parseCursorPaginationQuery(query);
     const pagination = await this.wikiStore.listKnowledgeBasePageVersionsPaginated(
       knowledgeBaseId,
@@ -312,7 +312,7 @@ export class KnowledgeBaseChangeSetController {
   ) {
     const scope = requireApiKeyScope(request);
 
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     const paginationInput = parseCursorPaginationQuery(query);
     const pagination = await this.wikiStore.listChangeSetsPaginated(
       knowledgeBaseId,
@@ -342,7 +342,7 @@ export class ChangeSetController {
   async detail(@Param("changeSetId") changeSetId: string, @Req() request: ApiKeyRequest) {
     const scope = requireApiKeyScope(request);
     const changeSet = await this.wikiStore.getChangeSet(changeSetId);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(
       readRequiredString(changeSet.knowledge_base_id),
       scope,
     );
@@ -355,7 +355,7 @@ export class ChangeSetController {
   async apply(@Param("changeSetId") changeSetId: string, @Req() request: ApiKeyRequest) {
     const scope = requireApiKeyScope(request);
     const changeSet = await this.wikiStore.getChangeSet(changeSetId);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(
       readRequiredString(changeSet.knowledge_base_id),
       scope,
     );
@@ -382,7 +382,7 @@ export class ChangeSetController {
   async discard(@Param("changeSetId") changeSetId: string, @Req() request: ApiKeyRequest) {
     const scope = requireApiKeyScope(request);
     const changeSet = await this.wikiStore.getChangeSet(changeSetId);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(
       readRequiredString(changeSet.knowledge_base_id),
       scope,
     );
@@ -411,7 +411,7 @@ export class KnowledgeBaseRollbackController {
   ) {
     const scope = requireApiKeyScope(request);
 
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     const result = await this.wikiStore.rollbackKnowledgeBase(knowledgeBaseId, body);
 
     await this.webhookService.emit({

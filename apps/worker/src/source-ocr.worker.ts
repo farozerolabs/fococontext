@@ -27,6 +27,18 @@ import type { WikiAnalyzeQueue } from "./wiki-compile.worker.js";
 export const sourceOcrQueueName = "source.ocr";
 export const sourceOcrJobName = "source.ocr.document";
 
+type BoundedObjectReadResult = BoundedObjectReadSuccess | BoundedObjectReadFailure;
+
+interface BoundedObjectReadSuccess {
+  kind: "success";
+  content: Buffer;
+}
+
+interface BoundedObjectReadFailure {
+  kind: "fatal";
+  error: Record<string, unknown>;
+}
+
 export interface SourceOcrQueueJob {
   name: string;
   data: SourceOcrPayload;
@@ -36,6 +48,7 @@ export interface SourceOcrProcessorConfig {
   concurrency: number;
   confidenceThreshold: number;
   languages: string[];
+  maxObjectBytes: number;
   maxPagePixels: number;
   maxPagesPerDocument: number;
   maxRetries: number;
@@ -269,23 +282,41 @@ export class SourceOcrProcessor {
       },
     });
 
-    const objectReads = new Map<string, Promise<Buffer>>();
-    const readObjectOnce = (key: string): Promise<Buffer> => {
+    const objectReads = new Map<string, Promise<BoundedObjectReadResult>>();
+    const readObjectOnce = (key: string): Promise<BoundedObjectReadResult> => {
       const existing = objectReads.get(key);
 
       if (existing !== undefined) {
         return existing;
       }
 
-      const next = this.objectStorage.getObject({ key }).then((object) => readBody(object.body));
+      const next = this.objectStorage
+        .getObject({ key })
+        .then((object) =>
+          readBodyWithinLimit(object.body, object.contentLength, this.config.maxObjectBytes, key),
+        );
       objectReads.set(key, next);
 
       return next;
     };
-    const [sourceContent, normalizedContent] = await Promise.all([
+    const [sourceRead, normalizedRead] = await Promise.all([
       readObjectOnce(payload.source_object_key),
       readObjectOnce(context.normalizedMarkdownObjectKey),
     ]);
+    if (sourceRead.kind === "fatal") {
+      await this.markFailed(payload, sourceRead.error);
+
+      return createSourceOcrFailedResult(payload);
+    }
+
+    if (normalizedRead.kind === "fatal") {
+      await this.markFailed(payload, normalizedRead.error);
+
+      return createSourceOcrFailedResult(payload);
+    }
+
+    const sourceContent = sourceRead.content;
+    const normalizedContent = normalizedRead.content;
     const nativeMarkdown = normalizedContent.toString("utf8");
     const nativePages = extractPdfNativePages(nativeMarkdown);
     const rendered = await renderPdfPagesForOcr({
@@ -1061,12 +1092,48 @@ async function sha256Hex(buffer: Buffer) {
   return createHash("sha256").update(buffer).digest("hex");
 }
 
-async function readBody(body: unknown): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-
-  for await (const chunk of body as AsyncIterable<Buffer | string>) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+async function readBodyWithinLimit(
+  body: unknown,
+  contentLength: number | undefined,
+  maxBytes: number,
+  objectKey: string,
+): Promise<BoundedObjectReadResult> {
+  if (contentLength !== undefined && contentLength > maxBytes) {
+    return createObjectReadLimitExceededResult(objectKey, contentLength, maxBytes);
   }
 
-  return Buffer.concat(chunks);
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+
+  for await (const chunk of body as AsyncIterable<Buffer | string>) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.byteLength;
+
+    if (totalBytes > maxBytes) {
+      return createObjectReadLimitExceededResult(objectKey, totalBytes, maxBytes);
+    }
+
+    chunks.push(buffer);
+  }
+
+  return {
+    kind: "success",
+    content: Buffer.concat(chunks, totalBytes),
+  };
+}
+
+function createObjectReadLimitExceededResult(
+  objectKey: string,
+  actualBytes: number,
+  limitBytes: number,
+): BoundedObjectReadFailure {
+  return {
+    kind: "fatal",
+    error: {
+      code: "source_ocr_object_limit_exceeded",
+      object_key: objectKey,
+      actual_bytes: actualBytes,
+      limit_bytes: limitBytes,
+    },
+  };
 }

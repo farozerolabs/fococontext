@@ -22,7 +22,7 @@ export class BatchImportController {
   ) {
     const scope = requireApiKeyScope(request);
 
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.batchImportService.create(knowledgeBaseId, body, scope),
       createRequestId(),

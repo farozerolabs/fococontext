@@ -1224,8 +1224,6 @@ const defaultAnswerableConfidenceThreshold = 0.6;
 const defaultPartialConfidenceThreshold = 0.35;
 const defaultAnswerabilityMinCitations = 1;
 
-const graphInsightResponseCache = new Map<string, GraphInsightsResponse>();
-
 interface NormalizedRetrieveInput {
   top_k: number;
   graph_depth: number;
@@ -1274,9 +1272,7 @@ function getOptimizedRetrievalQueryPath(
 }
 
 export class RetrieveEngine {
-  private readonly boundedGraphExpansionService: BoundedGraphExpansionService | undefined;
-  private readonly boundedLexicalService: BoundedLexicalRetrievalService | undefined;
-  private readonly boundedSemanticService: BoundedSemanticRetrievalService | undefined;
+  private readonly boundedRepository: BoundedRetrievalRepository | undefined;
   private readonly lexicalService: LexicalRetrievalService;
   private readonly semanticService: SemanticRetrievalService;
   private readonly rankFusionService: RankFusionService;
@@ -1285,21 +1281,10 @@ export class RetrieveEngine {
 
   constructor(
     private readonly repository: RetrievalRepository,
-    embeddingProvider: RetrievalEmbeddingProvider,
+    private readonly embeddingProvider: RetrievalEmbeddingProvider,
     options: RetrieveEngineOptions = {},
   ) {
-    this.boundedLexicalService =
-      options.boundedRepository === undefined
-        ? undefined
-        : new BoundedLexicalRetrievalService(options.boundedRepository);
-    this.boundedSemanticService =
-      options.boundedRepository === undefined
-        ? undefined
-        : new BoundedSemanticRetrievalService(options.boundedRepository, embeddingProvider);
-    this.boundedGraphExpansionService =
-      options.boundedRepository === undefined
-        ? undefined
-        : new BoundedGraphExpansionService(options.boundedRepository);
+    this.boundedRepository = options.boundedRepository;
     this.lexicalService = new LexicalRetrievalService(repository);
     this.semanticService = new SemanticRetrievalService(repository, embeddingProvider);
     this.rankFusionService = new RankFusionService(
@@ -1313,21 +1298,94 @@ export class RetrieveEngine {
   }
 
   private async searchLexical(input: LexicalSearchInput): Promise<RetrievalResult[]> {
-    return this.boundedLexicalService === undefined
-      ? this.lexicalService.search(input)
-      : this.boundedLexicalService.search(input);
+    if (this.boundedRepository === undefined) {
+      return this.lexicalService.search(input);
+    }
+
+    const candidates = await this.boundedRepository.searchLexicalCandidates({
+      knowledge_base_id: input.knowledge_base_id,
+      query: input.query,
+      limit: input.top_k ?? 10,
+      filters: {
+        ...(input.page_types === undefined ? {} : { page_types: input.page_types }),
+        ...(input.source_ids === undefined ? {} : { source_ids: input.source_ids }),
+      },
+    });
+
+    for (const candidate of candidates) {
+      this.repository.upsertPage(candidate.page);
+    }
+
+    return candidates.map((candidate) => createLexicalRetrievalResult(candidate, input.query));
   }
 
   private async searchSemantic(input: SemanticSearchInput): Promise<RetrievalResult[]> {
-    return this.boundedSemanticService === undefined
-      ? this.semanticService.search(input)
-      : this.boundedSemanticService.search(input);
+    if (this.boundedRepository === undefined) {
+      return this.semanticService.search(input);
+    }
+
+    const queryEmbedding = await this.embeddingProvider.embed({
+      texts: [input.query],
+    });
+    const candidates = await this.boundedRepository.searchSemanticCandidates({
+      knowledge_base_id: input.knowledge_base_id,
+      model: this.embeddingProvider.model,
+      query_vector: queryEmbedding.vectors[0] ?? [],
+      limit: input.top_k ?? 10,
+      filters: {
+        ...(input.page_types === undefined ? {} : { page_types: input.page_types }),
+        ...(input.source_ids === undefined ? {} : { source_ids: input.source_ids }),
+      },
+    });
+
+    for (const candidate of candidates) {
+      this.repository.upsertPage(candidate.page);
+      this.repository.saveEmbedding(candidate.embedding);
+    }
+
+    return candidates.map(createSemanticRetrievalResult);
   }
 
   private async expandGraph(input: GraphExpansionInput): Promise<GraphExpansion[]> {
-    return this.boundedGraphExpansionService === undefined
-      ? this.graphExpansionService.expand(input)
-      : this.boundedGraphExpansionService.expand(input);
+    if (this.boundedRepository === undefined) {
+      return this.graphExpansionService.expand(input);
+    }
+
+    const seedPageIds = uniqueStrings(input.seed_results.map((result) => result.page_id));
+    const limitPerResult = input.limit_per_result ?? 5;
+    const candidates = await this.boundedRepository.listGraphCandidates({
+      knowledge_base_id: input.knowledge_base_id,
+      seed_page_ids: seedPageIds,
+      depth: input.depth ?? 1,
+      limit: Math.max(seedPageIds.length, 1) * limitPerResult,
+      ...(input.relation_types === undefined ? {} : { relation_types: input.relation_types }),
+    });
+
+    for (const candidate of candidates) {
+      this.repository.upsertPage(candidate.source_page);
+      this.repository.upsertPage(candidate.target_page);
+      this.repository.upsertEdge(candidate.edge);
+    }
+
+    return toBoundedGraphExpansions(candidates, input.depth ?? 1);
+  }
+
+  private async seedSystemPages(input: {
+    knowledgeBaseId: string;
+    includeContextPack: boolean;
+  }): Promise<void> {
+    if (this.boundedRepository === undefined || !input.includeContextPack) {
+      return;
+    }
+
+    const candidates = await this.boundedRepository.listSystemPageCandidates({
+      knowledge_base_id: input.knowledgeBaseId,
+      limit: 8,
+    });
+
+    for (const candidate of candidates) {
+      this.repository.upsertPage(candidate.page);
+    }
   }
 
   async retrieve(input: RetrieveInput): Promise<RetrieveResponse> {
@@ -1390,7 +1448,7 @@ export class RetrieveEngine {
       },
       output: {
         ...createOptimizedRetrievalStageMetadata({
-          bounded: this.boundedLexicalService !== undefined,
+          bounded: this.boundedRepository !== undefined,
           durationMs: lexicalDurationMs,
           outputCount: lexicalResults.length,
           stage: "lexical",
@@ -1408,7 +1466,7 @@ export class RetrieveEngine {
 
     const semanticRequested = mode === "semantic" || mode === "hybrid";
     const semanticIndexRecordCount =
-      this.boundedSemanticService === undefined
+      this.boundedRepository === undefined
         ? this.repository.listEmbeddings(input.knowledge_base_id).length
         : null;
     if (semanticRequested && semanticIndexRecordCount === 0) {
@@ -1447,7 +1505,7 @@ export class RetrieveEngine {
       },
       output: {
         ...createOptimizedRetrievalStageMetadata({
-          bounded: this.boundedSemanticService !== undefined,
+          bounded: this.boundedRepository !== undefined,
           durationMs: semanticDurationMs,
           outputCount: semanticResults.length,
           stage: "semantic",
@@ -1532,7 +1590,7 @@ export class RetrieveEngine {
       },
       output: {
         ...createOptimizedRetrievalStageMetadata({
-          bounded: this.boundedGraphExpansionService !== undefined,
+          bounded: this.boundedRepository !== undefined,
           durationMs: graphDurationMs,
           inputCount: graphSeedResults.length,
           outputCount: graphExpansions.length,
@@ -1546,6 +1604,10 @@ export class RetrieveEngine {
       input.include_expand_hints === false
         ? null
         : buildExpandableGraph(this.repository, results, graphExpansions, input);
+    await this.seedSystemPages({
+      knowledgeBaseId: input.knowledge_base_id,
+      includeContextPack: input.include_context_pack === true,
+    });
     const contextPack =
       input.include_context_pack === true
         ? new ContextPackBuilder(this.repository).build({
@@ -1698,7 +1760,7 @@ export class RetrieveEngine {
     };
     const trace =
       input.include_trace === true
-        ? this.createTrace(input, responseWithoutTrace, stages, normalizedInput)
+        ? await this.createTrace(input, responseWithoutTrace, stages, normalizedInput)
         : null;
 
     return {
@@ -1707,12 +1769,12 @@ export class RetrieveEngine {
     };
   }
 
-  private createTrace(
+  private async createTrace(
     input: RetrieveInput,
     response: Omit<RetrieveResponse, "trace">,
     stages: readonly RetrievalTraceStage[],
     normalizedInput: NormalizedRetrieveInput,
-  ): RetrievalTraceRecord {
+  ): Promise<RetrievalTraceRecord> {
     const trace: RetrievalTraceRecord = {
       id: createRetrievalTraceId(),
       knowledge_base_id: input.knowledge_base_id,
@@ -1740,7 +1802,7 @@ export class RetrieveEngine {
       created_at: new Date().toISOString(),
     };
 
-    this.repository.saveTrace(trace);
+    await this.repository.saveTrace(trace);
 
     return trace;
   }
@@ -2460,14 +2522,8 @@ export class GraphQueryService {
       signalContext,
     );
     const snapshot = createGraphInsightSnapshot(pages, edges);
-    const cacheKey = `${knowledgeBaseId}:${snapshot.graph_hash}`;
-    const cached = graphInsightResponseCache.get(cacheKey);
 
-    if (cached !== undefined) {
-      return cloneGraphInsightsResponse(cached);
-    }
-
-    const response = {
+    return {
       knowledge_base_id: knowledgeBaseId,
       status: createReadyGraphInsightStatus(),
       snapshot,
@@ -2486,9 +2542,6 @@ export class GraphQueryService {
       communities,
       surprising_connections: surprisingConnections,
     };
-    graphInsightResponseCache.set(cacheKey, cloneGraphInsightsResponse(response));
-
-    return response;
   }
 }
 
@@ -2745,8 +2798,8 @@ export class ContextPackBuilder {
   }
 }
 
-export function createInMemoryRetrievalRepository(): RetrievalRepository {
-  return new InMemoryRetrievalRepository();
+export function createRequestLocalRetrievalRepository(): RetrievalRepository {
+  return new RequestLocalRetrievalRepository();
 }
 
 interface LexicalCandidate {
@@ -2768,7 +2821,10 @@ function isCanonicalScopedRecord(
 }
 
 function isForkOwnedRecord(record: RetrievalVisibilityMetadata, knowledgeBaseId: string): boolean {
-  return record.owner_knowledge_base_id === knowledgeBaseId;
+  return (
+    record.owner_knowledge_base_id === knowledgeBaseId &&
+    record.visibility_origin !== "upstream_inherited"
+  );
 }
 
 function endpointsVisible(edge: RetrievalEdgeRecord, visiblePageIds: ReadonlySet<string>): boolean {
@@ -2827,7 +2883,7 @@ function normalizeVisibleEmbedding(
   };
 }
 
-class InMemoryRetrievalRepository implements RetrievalRepository {
+class RequestLocalRetrievalRepository implements RetrievalRepository {
   private readonly scopes = new Map<string, RetrievalKnowledgeBaseScopeRecord>();
   private readonly pages = new Map<string, RetrievalPageRecord>();
   private readonly edges = new Map<string, RetrievalEdgeRecord>();
@@ -4039,7 +4095,7 @@ async function createBoundedGraphRepository(
   pages: readonly RetrievalPageRecord[],
   edges: readonly RetrievalEdgeRecord[],
 ): Promise<RetrievalRepository> {
-  const repository = createInMemoryRetrievalRepository();
+  const repository = createRequestLocalRetrievalRepository();
   const scope = await boundedRepository.findKnowledgeBaseScope(knowledgeBaseId);
 
   repository.upsertKnowledgeBaseScope(
@@ -4928,6 +4984,10 @@ function summarizeRetrieveVisibility(input: {
   }
 
   for (const entry of input.context_pack?.entries ?? []) {
+    if (entry.category === "system_pages") {
+      continue;
+    }
+
     addPage(entry.page_id, entry.visibility_origin);
   }
 
@@ -5695,10 +5755,6 @@ function normalizeGraphPageKey(value: string): string {
 
 function hashStable(value: string): string {
   return createHash("sha256").update(value).digest("hex");
-}
-
-function cloneGraphInsightsResponse(response: GraphInsightsResponse): GraphInsightsResponse {
-  return JSON.parse(JSON.stringify(response)) as GraphInsightsResponse;
 }
 
 function toGraphInsightReason(edge: RetrievalEdgeRecord): GraphInsightReason {

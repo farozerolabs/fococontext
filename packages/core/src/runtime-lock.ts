@@ -1,5 +1,3 @@
-import { randomUUID } from "node:crypto";
-
 export const runtimeLockResourceKinds = [
   "source-watch-scan",
   "graph-refresh",
@@ -53,82 +51,6 @@ export async function runWithRuntimeLock<T>(input: RunWithRuntimeLockInput<T>): 
     return await input.run(lease);
   } finally {
     await input.lock.release(lease);
-  }
-}
-
-export class InMemoryRuntimeLock implements RuntimeLock {
-  private readonly entries = new Map<
-    string,
-    {
-      expiresAtMs: number;
-      token: string;
-    }
-  >();
-
-  constructor(
-    private readonly options: {
-      now?: () => Date;
-      tokenFactory?: () => string;
-    } = {},
-  ) {}
-
-  async acquire(input: RuntimeLockAcquireInput): Promise<RuntimeLockLease | null> {
-    const key = createRuntimeLockKey(input);
-    const now = this.now().getTime();
-    const existing = this.entries.get(key);
-
-    if (existing !== undefined && existing.expiresAtMs > now) {
-      return null;
-    }
-
-    const ttlMs = normalizeTtlMs(input.ttlMs);
-    const token = this.options.tokenFactory?.() ?? randomUUID();
-    const expiresAt = new Date(now + ttlMs);
-
-    this.entries.set(key, {
-      expiresAtMs: expiresAt.getTime(),
-      token,
-    });
-
-    return {
-      expiresAt,
-      key,
-      token,
-    };
-  }
-
-  async refresh(lease: RuntimeLockLease, ttlMs?: number): Promise<boolean> {
-    const existing = this.entries.get(lease.key);
-
-    if (existing === undefined || existing.token !== lease.token) {
-      return false;
-    }
-
-    const expiresAt = new Date(this.now().getTime() + normalizeTtlMs(ttlMs));
-
-    this.entries.set(lease.key, {
-      expiresAtMs: expiresAt.getTime(),
-      token: lease.token,
-    });
-    lease.expiresAt = expiresAt;
-
-    return true;
-  }
-
-  async release(lease: RuntimeLockLease): Promise<boolean> {
-    const existing = this.entries.get(lease.key);
-
-    if (existing === undefined || existing.token !== lease.token) {
-      return false;
-    }
-
-    this.entries.delete(lease.key);
-
-    return true;
-  }
-
-  private now(): Date {
-    return this.options.now?.() ?? new Date();
   }
 }
 

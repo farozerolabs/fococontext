@@ -1,4 +1,4 @@
-import { ApiError } from "@fococontext/contracts";
+import { ApiError, type ApiErrorCode } from "@fococontext/contracts";
 import { loadReleaseMetadata, type ReleaseMetadata } from "./release-metadata.js";
 import type { SourceWatchRuntimeAdapters } from "./source-watch-config.js";
 import { parseUploadLimits, type RuntimeConfigUploadLimits } from "./upload-config.js";
@@ -19,6 +19,43 @@ export type { RuntimeConfigUploadLimits, UploadMultipartFallbackMode } from "./u
 
 export type RuntimeEnv = Readonly<Record<string, string | undefined>>;
 
+export const productionRuntimeConfigurationErrorCode = "production_runtime_configuration_invalid";
+
+export class ProductionRuntimeConfigurationError extends ApiError {
+  readonly runtimeCode = productionRuntimeConfigurationErrorCode;
+
+  constructor(input: {
+    apiErrorCode?: ApiErrorCode;
+    message: string;
+    details?: unknown;
+    cause?: unknown;
+  }) {
+    super(input.apiErrorCode ?? "invalid_request", {
+      message: input.message,
+      details: input.details,
+      cause: input.cause,
+    });
+    this.name = "ProductionRuntimeConfigurationError";
+  }
+}
+
+export function requireProductionDependency<TValue>(
+  dependencyName: string,
+  value: TValue | undefined,
+): TValue {
+  if (value === undefined) {
+    throw new ProductionRuntimeConfigurationError({
+      apiErrorCode: "durable_backend_unavailable",
+      message: `Production runtime dependency is missing or invalid: ${dependencyName}.`,
+      details: {
+        missing: [dependencyName],
+      },
+    });
+  }
+
+  return value;
+}
+
 export interface RuntimeConfig {
   api: {
     port: number;
@@ -27,6 +64,7 @@ export interface RuntimeConfig {
   admin: {
     port: number;
     publicBaseUrl?: string;
+    sessionTtlSeconds: number;
     username: string;
     password: string;
   };
@@ -321,6 +359,18 @@ const optionalVisionCaptionProviderKeys = [
   "VISION_CAPTION_MODEL",
 ] as const;
 
+const durableBackendEnvKeys = new Set<string>([
+  "DATABASE_URL",
+  "REDIS_URL",
+  "S3_PROVIDER_NAME",
+  "S3_ENDPOINT",
+  "S3_REGION",
+  "S3_BUCKET",
+  "S3_ACCESS_KEY_ID",
+  "S3_SECRET_ACCESS_KEY",
+  "S3_FORCE_PATH_STYLE",
+]);
+
 const defaultObjectStorageMetricsWindowSeconds = 300;
 const defaultObjectStorageClassAWarningThreshold = 1000;
 const defaultObjectStorageClassBWarningThreshold = 10_000;
@@ -334,6 +384,7 @@ const defaultSourceEvidenceContextChars = 800;
 const maxSourceEvidenceContextChars = 2000;
 const defaultSourceEvidenceBatchMaxItems = 20;
 const defaultSourceEvidenceBatchTotalOutputMaxChars = 40000;
+const defaultAdminSessionTtlSeconds = 7 * 24 * 60 * 60;
 
 function readRequired(env: RuntimeEnv, key: (typeof requiredEnvKeys)[number]): string {
   return env[key]?.trim() ?? "";
@@ -777,7 +828,10 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
   }
 
   if (missing.length > 0) {
-    throw new ApiError("invalid_request", {
+    throw new ProductionRuntimeConfigurationError({
+      apiErrorCode: missing.some((key) => durableBackendEnvKeys.has(key))
+        ? "durable_backend_unavailable"
+        : "invalid_request",
       message: "Missing runtime configuration.",
       details: {
         missing,
@@ -801,6 +855,12 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
     admin: {
       port: parsePositiveInteger(env, "FOCOCONTEXT_ADMIN_PORT", invalid),
       ...(publicAdminBaseUrl === undefined ? {} : { publicBaseUrl: publicAdminBaseUrl }),
+      sessionTtlSeconds: parseOptionalPositiveInteger(
+        env,
+        "FOCOCONTEXT_ADMIN_SESSION_TTL_SECONDS",
+        defaultAdminSessionTtlSeconds,
+        invalid,
+      ),
       username: readRequired(env, "FOCOCONTEXT_ADMIN_USERNAME"),
       password: readRequired(env, "FOCOCONTEXT_ADMIN_PASSWORD"),
     },
@@ -1404,7 +1464,7 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
   }
 
   if (invalid.length > 0) {
-    throw new ApiError("invalid_request", {
+    throw new ProductionRuntimeConfigurationError({
       message: "Invalid runtime configuration.",
       details: {
         invalid,

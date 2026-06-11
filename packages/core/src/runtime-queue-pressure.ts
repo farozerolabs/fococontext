@@ -59,12 +59,15 @@ export interface RuntimeQueuePressureThresholds {
 }
 
 export interface RuntimeQueuePressureRecorder {
+  close?(): Promise<void>;
   record(input: RuntimeQueuePressureRecordInput): Promise<void>;
   snapshot(
     input: RuntimeQueuePressureSnapshotInput,
     thresholds?: Partial<RuntimeQueuePressureThresholds>,
   ): Promise<RuntimeQueuePressureSummary>;
 }
+
+export const runtimeQueueGlobalScopeId = "system";
 
 export const defaultRuntimeQueuePressureThresholds = {
   degradedBackpressure: 1,
@@ -80,58 +83,21 @@ export function createRuntimeQueuePressureKey(input: {
   return `fococontext:queue-pressure:${encodeURIComponent(input.scopeId)}:${input.workKind}`;
 }
 
-export class InMemoryRuntimeQueuePressureRecorder implements RuntimeQueuePressureRecorder {
-  private readonly counters = new Map<string, RuntimeQueuePressureCounter>();
-
-  async record(input: RuntimeQueuePressureRecordInput): Promise<void> {
-    const count = normalizeCounterDelta(input.count);
-    const counter = this.getCounter(input.scopeId, input.workKind);
-
-    applyQueuePressureEvent(counter, input.event, count);
-    counter.lastEventAt = (input.now ?? new Date()).toISOString();
+export async function recordRuntimeQueuePressureEvent(
+  recorder: RuntimeQueuePressureRecorder | undefined,
+  input: RuntimeQueuePressureRecordInput,
+): Promise<void> {
+  if (recorder === undefined) {
+    return;
   }
 
-  async snapshot(
-    input: RuntimeQueuePressureSnapshotInput,
-    thresholds: Partial<RuntimeQueuePressureThresholds> = {},
-  ): Promise<RuntimeQueuePressureSummary> {
-    const workKinds = input.workKinds ?? runtimeQueueWorkKinds;
-    const counters = workKinds.map((workKind) => this.getCounter(input.scopeId, workKind));
-    const totals = sumQueuePressureCounters(counters);
+  await recorder.record(input);
 
-    return {
-      counters: counters.map((counter) => ({ ...counter })),
-      pressure: classifyRuntimeQueuePressure(totals, thresholds),
-      scopeId: input.scopeId,
-      totals,
-    };
-  }
-
-  private getCounter(scopeId: string, workKind: RuntimeQueueWorkKind): RuntimeQueuePressureCounter {
-    const key = createRuntimeQueuePressureKey({
-      scopeId,
-      workKind,
+  if (input.scopeId !== runtimeQueueGlobalScopeId) {
+    await recorder.record({
+      ...input,
+      scopeId: runtimeQueueGlobalScopeId,
     });
-    const existing = this.counters.get(key);
-
-    if (existing !== undefined) {
-      return existing;
-    }
-
-    const counter: RuntimeQueuePressureCounter = {
-      active: 0,
-      backpressureCount: 0,
-      completed: 0,
-      failed: 0,
-      lastEventAt: null,
-      queued: 0,
-      retried: 0,
-      workKind,
-    };
-
-    this.counters.set(key, counter);
-
-    return counter;
   }
 }
 
@@ -213,12 +179,4 @@ export function classifyRuntimeQueuePressure(
   }
 
   return "normal";
-}
-
-function normalizeCounterDelta(count: number | undefined): number {
-  if (count === undefined || !Number.isFinite(count)) {
-    return 1;
-  }
-
-  return Math.max(0, Math.floor(count));
 }

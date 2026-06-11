@@ -1,5 +1,7 @@
 import { Queue } from "bullmq";
-import type { RuntimeConfig } from "@fococontext/core";
+import type { RuntimeConfig, RuntimeQueuePressureRecorder } from "@fococontext/core";
+
+import { recordQueuePressureBackpressure, recordQueuePressureQueued } from "./queue-pressure.js";
 
 export const deletionCleanupQueueToken = Symbol("deletionCleanupQueue");
 export const deletionCleanupQueueName = "deletion.cleanup";
@@ -25,7 +27,10 @@ export interface DeletionCleanupQueue {
 export class BullMqDeletionCleanupQueue implements DeletionCleanupQueue {
   private readonly queue: Queue<DeletionCleanupQueuePayload>;
 
-  constructor(config: RuntimeConfig) {
+  constructor(
+    config: RuntimeConfig,
+    private readonly queuePressureRecorder?: RuntimeQueuePressureRecorder,
+  ) {
     this.queue = new Queue<DeletionCleanupQueuePayload>(deletionCleanupQueueName, {
       connection: {
         url: config.redis.url,
@@ -45,9 +50,21 @@ export class BullMqDeletionCleanupQueue implements DeletionCleanupQueue {
   async enqueueDeletionCleanupJob(
     payload: DeletionCleanupQueuePayload,
   ): Promise<EnqueuedDeletionCleanupJob> {
-    await this.queue.add(deletionCleanupJobName, payload, {
-      jobId: payload.operation_id,
-    });
+    try {
+      await this.queue.add(deletionCleanupJobName, payload, {
+        jobId: payload.operation_id,
+      });
+      await recordQueuePressureQueued({
+        recorder: this.queuePressureRecorder,
+        workKind: "deletion-cleanup",
+      });
+    } catch (error) {
+      await recordQueuePressureBackpressure({
+        recorder: this.queuePressureRecorder,
+        workKind: "deletion-cleanup",
+      });
+      throw error;
+    }
 
     return {
       queue_name: deletionCleanupQueueName,
@@ -61,6 +78,9 @@ export class BullMqDeletionCleanupQueue implements DeletionCleanupQueue {
   }
 }
 
-export function createBullMqDeletionCleanupQueue(config: RuntimeConfig): DeletionCleanupQueue {
-  return new BullMqDeletionCleanupQueue(config);
+export function createBullMqDeletionCleanupQueue(
+  config: RuntimeConfig,
+  queuePressureRecorder?: RuntimeQueuePressureRecorder,
+): DeletionCleanupQueue {
+  return new BullMqDeletionCleanupQueue(config, queuePressureRecorder);
 }

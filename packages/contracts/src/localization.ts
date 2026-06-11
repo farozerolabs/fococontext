@@ -114,6 +114,10 @@ const apiMessageCatalog = {
     "en-US": "Parser output empty.",
     "zh-CN": "解析结果为空。",
   },
+  "api.error.parser_limit_exceeded": {
+    "en-US": "Parser limit exceeded.",
+    "zh-CN": "解析超过配置限制。",
+  },
   "api.error.invalid_request": {
     "en-US": "Invalid request.",
     "zh-CN": "请求参数错误。",
@@ -149,6 +153,22 @@ const apiMessageCatalog = {
   "api.error.retrieve_index_not_ready": {
     "en-US": "Retrieve index not ready.",
     "zh-CN": "检索索引尚未就绪。",
+  },
+  "api.error.durable_backend_unavailable": {
+    "en-US": "Durable backend unavailable.",
+    "zh-CN": "持久化后端不可用。",
+  },
+  "api.error.bounded_retrieval_unavailable": {
+    "en-US": "Bounded retrieval backend unavailable.",
+    "zh-CN": "有界检索后端不可用。",
+  },
+  "api.error.graph_index_unavailable": {
+    "en-US": "Graph index unavailable.",
+    "zh-CN": "图谱索引不可用。",
+  },
+  "api.error.redis_metrics_degraded": {
+    "en-US": "Redis metrics degraded.",
+    "zh-CN": "Redis 指标状态降级。",
   },
   "api.error.fork_target_invalid": {
     "en-US": "Fork target is invalid.",
@@ -387,9 +407,25 @@ const apiMessageCatalog = {
     "en-US": "Completed jobs cannot be canceled.",
     "zh-CN": "已完成任务不能取消。",
   },
+  "api.validation.terminal_job_cancel": {
+    "en-US": "Terminal jobs cannot be canceled.",
+    "zh-CN": "终态任务不能取消。",
+  },
   "api.validation.running_job_retry": {
-    "en-US": "Running jobs cannot be retried.",
-    "zh-CN": "运行中的任务不能重试。",
+    "en-US": "Queued or running jobs cannot be retried.",
+    "zh-CN": "排队中或运行中的任务不能重试。",
+  },
+  "api.validation.completed_job_retry": {
+    "en-US": "Completed jobs cannot be retried.",
+    "zh-CN": "已完成任务不能重试。",
+  },
+  "api.validation.non_retryable_job_retry": {
+    "en-US": "This failed job is not retryable.",
+    "zh-CN": "该失败任务不可重试。",
+  },
+  "api.validation.job_retry_document_required": {
+    "en-US": "Job retry requires a source document.",
+    "zh-CN": "任务重试需要关联资料。",
   },
   "api.validation.cleanup_status_invalid": {
     "en-US": "Cleanup operation status filter is invalid.",

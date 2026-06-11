@@ -65,8 +65,8 @@ canonical、upstream_inherited 还是 fork_owned 可见记录。
 | `results[].display_metadata`              | 用于结果理解和重复标题消歧的受限展示 metadata。它会排除 raw internal metadata、secret、signed URL、storage key、部署路径和无界嵌套对象。                                                                                                      |
 | `graph_readiness.state`                   | 当前知识库的物化图谱洞察状态：`queued`、`updating`、`ready`、`failed`、`partial` 或 `stale`。非 `ready` 状态也会以 `graph.readiness.<state>` 进入请求级 warnings。                                                                            |
 | `trace.stages[].output.duration_ms`       | API 侧记录的阶段耗时，用于安全延迟排查。                                                                                                                                                                                                      |
-| `trace.stages[].output.store`             | 检索所走的后端路径，例如受限数据库读取，或本地开发使用的内存 fallback。                                                                                                                                                                       |
-| `trace.stages[].output.query_path`        | 阶段执行路径摘要，例如 optimized bounded retrieval 或 local fallback。                                                                                                                                                                        |
+| `trace.stages[].output.store`             | 检索所走的后端路径，例如 PostgreSQL lexical search、pgvector semantic search、indexed graph traversal、Redis cache 或 bounded source-evidence lookup。                                                                                        |
+| `trace.stages[].output.query_path`        | 阶段执行路径摘要，例如 optimized bounded retrieval、indexed graph expansion 或 cache-backed materialized insight lookup。                                                                                                                     |
 | `trace.stages[].output.cache_status`      | 阶段可报告时返回的 cache 行为摘要，例如 hit、miss、bypass 或 unavailable。                                                                                                                                                                    |
 | `trace.stages[].output.input_count`       | 排序、图谱或上下文阶段可报告时返回的受限输入数量。                                                                                                                                                                                            |
 | `trace.stages[].output.output_count`      | 阶段返回的受限输出数量。                                                                                                                                                                                                                      |
@@ -84,6 +84,8 @@ canonical、upstream_inherited 还是 fork_owned 可见记录。
 Retrieve 可以在图谱洞察仍在物化时返回可用的 Wiki 结果。使用图谱扩展和洞察信号前，应先查看 `graph_readiness.state`。`ready` 表示当前物化图谱洞察快照可用。`queued` 和 `updating` 表示后台任务正在处理。`partial`、`stale` 和 `failed` 表示直接检索结果仍可使用，依赖图谱的 UI 或 Agent 行为应展示限定说明、稍后重试，或回退到 citation-backed results。
 
 `include_trace` 为 true 时，trace stages 会返回安全的优化路径诊断。用 `duration_ms`、`store`、`query_path`、`cache_status`、`input_count`、`output_count` 和 `warning_codes` 排查大知识库运行情况，无需读取私有行或原始来源内容。Trace 字段属于诊断 metadata，后续可以扩展；客户端主逻辑应优先基于已文档化 warning code 和主响应字段判断。
+
+生产 Retrieve 和 Retrieve Expand 不会静默回退到全量内存扫描。有界检索、图谱索引、Redis cache state 或来源证据后端不可用时，客户端会收到类型化 warning 或类型化错误，例如 `bounded_retrieval_unavailable`、`graph_index_unavailable`、`durable_backend_unavailable` 或 `retrieve_index_not_ready`。
 
 ## Agent 无答案处理
 

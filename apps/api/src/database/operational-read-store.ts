@@ -13,6 +13,7 @@ import type {
   SourceDocumentStatus,
   SourceVisibilityOrigin,
   SourceType,
+  UploadSessionRecord,
 } from "../documents/document.types.js";
 import type {
   DeletionCleanupItemRecord,
@@ -42,6 +43,9 @@ import type {
 } from "../webhooks/webhook.types.js";
 import type { ApiResourceScope } from "../auth/api-key.guard.js";
 import type {
+  DatasetConfigurationResponse,
+  DatasetConfigurationStatus,
+  DatasetConfigurationValues,
   ForkOwnerType,
   KnowledgeBaseOutputLanguage,
   KnowledgeBaseResponse,
@@ -184,8 +188,40 @@ export interface KnowledgeBaseIngestProgressReadResult {
   representativeJobs: JobRecord[];
 }
 
+export interface RuntimeSourceJobDurationSummary {
+  count: number;
+  avgMs: number;
+  maxMs: number;
+  minMs: number;
+  latestMs: number;
+}
+
+export interface RuntimeSourceJobSummary {
+  activeJobs: number;
+  queueDepth: number;
+  retryCount: number;
+  stageCounts: Record<JobStage, number>;
+  stageDurations: Record<string, RuntimeSourceJobDurationSummary>;
+  statusCounts: Record<JobStatus, number>;
+  total: number;
+}
+
+export interface DeletionCleanupQueueSummary {
+  failed: number;
+  pending: number;
+}
+
 export interface OperationalReadStore {
   readonly supportsOperationalReads: boolean;
+  getKnowledgeBaseById(
+    scope: ApiResourceScope,
+    knowledgeBaseId: string,
+  ): Promise<KnowledgeBaseResponse | null>;
+  getKnowledgeBaseResourceScope(knowledgeBaseId: string): Promise<ApiResourceScope | null>;
+  getDatasetConfigurationByKnowledgeBaseId(
+    scope: ApiResourceScope,
+    knowledgeBaseId: string,
+  ): Promise<DatasetConfigurationResponse | null>;
   listKnowledgeBases(
     scope: ApiResourceScope,
     input: KnowledgeBaseReadInput,
@@ -197,6 +233,7 @@ export interface OperationalReadStore {
   listKnowledgeChecks(
     input: KnowledgeCheckReadInput,
   ): Promise<PaginatedKnowledgeCheckReadResult | null>;
+  getKnowledgeCheckById(checkId: string): Promise<KnowledgeCheckRecord | null>;
   listJobs(input: PaginatedReadInput): Promise<PaginatedJobReadResult | null>;
   listSourceDocuments(
     input: SourceDocumentReadInput,
@@ -205,13 +242,28 @@ export interface OperationalReadStore {
     input: SourceWatchDocumentReadInput,
   ): Promise<SourceDocumentRecord[] | null>;
   getSourceDocumentById(documentId: string): Promise<SourceDocumentRecord | null>;
+  getVisibleSourceDocumentById(
+    knowledgeBaseId: string,
+    documentId: string,
+  ): Promise<SourceDocumentRecord | null>;
+  getUploadSessionById(uploadSessionId: string): Promise<UploadSessionRecord | null>;
+  getUploadSessionByIdempotencyKey(
+    knowledgeBaseId: string,
+    idempotencyKey: string,
+  ): Promise<UploadSessionRecord | null>;
+  listExpiredCreatedUploadSessions(now: string, limit: number): Promise<UploadSessionRecord[]>;
   getLatestJobByDocumentId(documentId: string): Promise<JobRecord | null>;
   listJobsByDocumentId(documentId: string): Promise<JobRecord[]>;
+  getJobByIdempotencyKey(
+    knowledgeBaseId: string,
+    idempotencyKey: string,
+  ): Promise<JobRecord | null>;
   getParsedContentByDocumentId(documentId: string): Promise<ParsedContentRecord | null>;
   listMediaAssetsByDocumentId(
     documentId: string,
     input: Omit<PaginatedReadInput, "knowledgeBaseId">,
   ): Promise<PaginatedMediaAssetReadResult | null>;
+  getMediaAssetById(mediaAssetId: string): Promise<MediaAssetRecord | null>;
   findReferencedObjectKeys(input: ReferencedObjectKeyReadInput): Promise<Set<string>>;
   listWikiPageRecordsBySourceDocumentId(
     knowledgeBaseId: string,
@@ -226,12 +278,14 @@ export interface OperationalReadStore {
     input: PaginatedReadInput,
   ): Promise<PaginatedSourceWatchRuleReadResult | null>;
   getSourceWatchRuleById(ruleId: string): Promise<SourceWatchRuleRecord | null>;
+  listDueSourceWatchRules(now: string, limit: number): Promise<SourceWatchRuleRecord[]>;
   getJobById(jobId: string): Promise<JobRecord | null>;
   listJobsByIds(jobIds: readonly string[]): Promise<Map<string, JobRecord>>;
   listScheduledImportJobsByRuleId(
     ruleId: string,
     input: Omit<PaginatedReadInput, "knowledgeBaseId">,
   ): Promise<PaginatedScheduledImportJobReadResult | null>;
+  getScheduledImportJobById(jobId: string): Promise<ScheduledImportJobRecord | null>;
   listWebhooks(
     scope: ApiResourceScope,
     input: Omit<PaginatedReadInput, "knowledgeBaseId">,
@@ -240,6 +294,11 @@ export interface OperationalReadStore {
     scope: ApiResourceScope,
     webhookId: string,
   ): Promise<WebhookDetailReadResult | null>;
+  listMatchingWebhooks(input: {
+    scope: ApiResourceScope;
+    eventType: WebhookEventType;
+    knowledgeBaseId: string | null;
+  }): Promise<WebhookRecord[]>;
   listWebhookDeliveriesByWebhookId(
     webhookId: string,
     input: Omit<PaginatedReadInput, "knowledgeBaseId">,
@@ -258,6 +317,8 @@ export interface OperationalReadStore {
     knowledgeBaseId: string,
     representativeJobLimit: number,
   ): Promise<KnowledgeBaseIngestProgressReadResult | null>;
+  getRuntimeSourceJobSummary(): Promise<RuntimeSourceJobSummary>;
+  getDeletionCleanupQueueSummary(): Promise<DeletionCleanupQueueSummary>;
 }
 
 export function createNoopOperationalReadStore(): OperationalReadStore {
@@ -272,6 +333,18 @@ export function createNoopOperationalReadStore(): OperationalReadStore {
     async listKnowledgeChecks() {
       return null;
     },
+    async getKnowledgeCheckById() {
+      return null;
+    },
+    async getKnowledgeBaseById() {
+      return null;
+    },
+    async getKnowledgeBaseResourceScope() {
+      return null;
+    },
+    async getDatasetConfigurationByKnowledgeBaseId() {
+      return null;
+    },
     async listJobs() {
       return null;
     },
@@ -284,16 +357,34 @@ export function createNoopOperationalReadStore(): OperationalReadStore {
     async getSourceDocumentById() {
       return null;
     },
+    async getVisibleSourceDocumentById() {
+      return null;
+    },
+    async getUploadSessionById() {
+      return null;
+    },
+    async getUploadSessionByIdempotencyKey() {
+      return null;
+    },
+    async listExpiredCreatedUploadSessions() {
+      return [];
+    },
     async getLatestJobByDocumentId() {
       return null;
     },
     async listJobsByDocumentId() {
       return [];
     },
+    async getJobByIdempotencyKey() {
+      return null;
+    },
     async getParsedContentByDocumentId() {
       return null;
     },
     async listMediaAssetsByDocumentId() {
+      return null;
+    },
+    async getMediaAssetById() {
       return null;
     },
     async findReferencedObjectKeys() {
@@ -311,6 +402,9 @@ export function createNoopOperationalReadStore(): OperationalReadStore {
     async getSourceWatchRuleById() {
       return null;
     },
+    async listDueSourceWatchRules() {
+      return [];
+    },
     async getJobById() {
       return null;
     },
@@ -320,11 +414,17 @@ export function createNoopOperationalReadStore(): OperationalReadStore {
     async listScheduledImportJobsByRuleId() {
       return null;
     },
+    async getScheduledImportJobById() {
+      return null;
+    },
     async listWebhooks() {
       return null;
     },
     async getWebhookById() {
       return null;
+    },
+    async listMatchingWebhooks() {
+      return [];
     },
     async listWebhookDeliveriesByWebhookId() {
       return null;
@@ -341,6 +441,15 @@ export function createNoopOperationalReadStore(): OperationalReadStore {
     async getKnowledgeBaseIngestProgress() {
       return null;
     },
+    async getRuntimeSourceJobSummary() {
+      return createEmptyRuntimeSourceJobSummary();
+    },
+    async getDeletionCleanupQueueSummary() {
+      return {
+        failed: 0,
+        pending: 0,
+      };
+    },
   };
 }
 
@@ -354,6 +463,101 @@ class PostgresOperationalReadStore implements OperationalReadStore {
   readonly supportsOperationalReads = true;
 
   constructor(private readonly db: Kysely<DatabaseSchema>) {}
+
+  async getKnowledgeBaseById(
+    scope: ApiResourceScope,
+    knowledgeBaseId: string,
+  ): Promise<KnowledgeBaseResponse | null> {
+    const result = await sql<KnowledgeBaseRow>`
+      select
+        knowledge_bases.id,
+        knowledge_bases.name,
+        knowledge_bases.slug,
+        knowledge_bases.description,
+        knowledge_bases.knowledge_base_type,
+        knowledge_bases.upstream_knowledge_base_id,
+        knowledge_bases.upstream_base_version_id,
+        knowledge_bases.upstream_synced_version_id,
+        knowledge_bases.fork_owner_type,
+        knowledge_bases.fork_owner_external_id,
+        knowledge_bases.fork_owner_display_name,
+        knowledge_bases.sync_status,
+        knowledge_bases.template,
+        knowledge_bases.output_language,
+        knowledge_bases.status,
+        knowledge_bases.current_version_id,
+        knowledge_bases.created_at,
+        knowledge_bases.updated_at,
+        knowledge_base_settings.purpose,
+        knowledge_base_settings.wiki_schema,
+        knowledge_base_settings.retrieval_settings
+      from knowledge_bases
+      left join knowledge_base_settings
+        on knowledge_base_settings.knowledge_base_id = knowledge_bases.id
+      where knowledge_bases.tenant_id = ${scope.tenantId}
+        and knowledge_bases.project_id = ${scope.projectId}
+        and knowledge_bases.id = ${knowledgeBaseId}
+        and knowledge_bases.deleted_at is null
+        and knowledge_bases.status <> 'deleted'
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toKnowledgeBaseResponse(row);
+  }
+
+  async getKnowledgeBaseResourceScope(knowledgeBaseId: string): Promise<ApiResourceScope | null> {
+    const result = await sql<{ tenant_id: string; project_id: string }>`
+      select tenant_id, project_id
+      from knowledge_bases
+      where id = ${knowledgeBaseId}
+        and deleted_at is null
+        and status <> 'deleted'
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined
+      ? null
+      : {
+          projectId: row.project_id,
+          tenantId: row.tenant_id,
+        };
+  }
+
+  async getDatasetConfigurationByKnowledgeBaseId(
+    scope: ApiResourceScope,
+    knowledgeBaseId: string,
+  ): Promise<DatasetConfigurationResponse | null> {
+    const result = await sql<DatasetConfigurationRow>`
+      select
+        knowledge_base_dataset_configurations.id,
+        knowledge_base_dataset_configurations.knowledge_base_id,
+        knowledge_base_dataset_configurations.preset_id,
+        knowledge_base_dataset_configurations.status,
+        knowledge_base_dataset_configurations.version,
+        knowledge_base_dataset_configurations.values,
+        knowledge_base_dataset_configurations.latest_snapshot_id,
+        knowledge_base_dataset_configurations.updated_by,
+        knowledge_base_dataset_configurations.metadata,
+        knowledge_base_dataset_configurations.created_at,
+        knowledge_base_dataset_configurations.updated_at
+      from knowledge_base_dataset_configurations
+      inner join knowledge_bases
+        on knowledge_bases.id = knowledge_base_dataset_configurations.knowledge_base_id
+      where knowledge_bases.tenant_id = ${scope.tenantId}
+        and knowledge_bases.project_id = ${scope.projectId}
+        and knowledge_bases.id = ${knowledgeBaseId}
+        and knowledge_bases.deleted_at is null
+        and knowledge_bases.status <> 'deleted'
+        and knowledge_base_dataset_configurations.status = 'active'
+      order by knowledge_base_dataset_configurations.version desc
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toDatasetConfigurationResponse(row);
+  }
 
   async listKnowledgeBases(
     scope: ApiResourceScope,
@@ -565,6 +769,26 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     };
   }
 
+  async getKnowledgeCheckById(checkId: string): Promise<KnowledgeCheckRecord | null> {
+    const result = await sql<KnowledgeCheckRow>`
+      select
+        id,
+        knowledge_base_id,
+        status,
+        progress,
+        findings,
+        metadata,
+        created_at,
+        updated_at
+      from knowledge_checks
+      where id = ${checkId}
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toKnowledgeCheckRecord(row);
+  }
+
   async listJobs(input: PaginatedReadInput): Promise<PaginatedJobReadResult> {
     const offset = (input.page - 1) * input.pageSize;
     const [itemsResult, totalResult] = await Promise.all([
@@ -617,6 +841,122 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     const sourceType = input.sourceType ?? null;
     const [itemsResult, totalResult] = await Promise.all([
       sql<SourceDocumentRow>`
+        with target_kb as (
+          select id, knowledge_base_type, upstream_knowledge_base_id
+          from knowledge_bases
+          where id = ${input.knowledgeBaseId}
+            and deleted_at is null
+            and status <> 'deleted'
+          limit 1
+        ),
+        fork_tombstones as (
+          select upstream_resource_id
+          from source_documents
+          where owner_knowledge_base_id = ${input.knowledgeBaseId}
+            and upstream_resource_id is not null
+            and fork_tombstoned_at is not null
+        ),
+        visible_source_documents as (
+          select
+            source_documents.id,
+            source_documents.knowledge_base_id,
+            source_documents.source_type,
+            source_documents.name,
+            source_documents.status,
+            source_documents.content_hash,
+            source_documents.object_key,
+            source_documents.mime_type,
+            source_documents.size_bytes,
+            source_documents.metadata,
+            source_documents.ocr_status,
+            source_documents.ocr_summary,
+            source_documents.visibility_origin,
+            source_documents.owner_knowledge_base_id,
+            source_documents.upstream_resource_id,
+            source_documents.fork_tombstoned_at,
+            source_documents.created_at,
+            source_documents.updated_at,
+            source_documents.id as visible_key,
+            0 as visible_priority
+          from source_documents
+          inner join target_kb on target_kb.id = source_documents.knowledge_base_id
+          where target_kb.knowledge_base_type <> 'fork'
+            and source_documents.owner_knowledge_base_id is null
+            and source_documents.fork_tombstoned_at is null
+            and source_documents.deleted_at is null
+            and source_documents.status <> 'deleted'
+          union all
+          select
+            source_documents.id,
+            target_kb.id as knowledge_base_id,
+            source_documents.source_type,
+            source_documents.name,
+            source_documents.status,
+            source_documents.content_hash,
+            source_documents.object_key,
+            source_documents.mime_type,
+            source_documents.size_bytes,
+            source_documents.metadata,
+            source_documents.ocr_status,
+            source_documents.ocr_summary,
+            'upstream_inherited' as visibility_origin,
+            target_kb.id as owner_knowledge_base_id,
+            source_documents.id as upstream_resource_id,
+            null::timestamptz as fork_tombstoned_at,
+            source_documents.created_at,
+            source_documents.updated_at,
+            source_documents.id as visible_key,
+            1 as visible_priority
+          from source_documents
+          inner join target_kb on target_kb.upstream_knowledge_base_id = source_documents.knowledge_base_id
+          where target_kb.knowledge_base_type = 'fork'
+            and source_documents.owner_knowledge_base_id is null
+            and source_documents.fork_tombstoned_at is null
+            and source_documents.deleted_at is null
+            and source_documents.status <> 'deleted'
+            and not exists (
+              select 1
+              from fork_tombstones
+              where fork_tombstones.upstream_resource_id = source_documents.id
+            )
+          union all
+          select
+            source_documents.id,
+            target_kb.id as knowledge_base_id,
+            source_documents.source_type,
+            source_documents.name,
+            source_documents.status,
+            source_documents.content_hash,
+            source_documents.object_key,
+            source_documents.mime_type,
+            source_documents.size_bytes,
+            source_documents.metadata,
+            source_documents.ocr_status,
+            source_documents.ocr_summary,
+            'fork_owned' as visibility_origin,
+            target_kb.id as owner_knowledge_base_id,
+            source_documents.upstream_resource_id,
+            source_documents.fork_tombstoned_at,
+            source_documents.created_at,
+            source_documents.updated_at,
+            coalesce(source_documents.upstream_resource_id, source_documents.id) as visible_key,
+            0 as visible_priority
+          from source_documents
+          inner join target_kb on target_kb.id = source_documents.owner_knowledge_base_id
+          where target_kb.knowledge_base_type = 'fork'
+            and source_documents.fork_tombstoned_at is null
+            and source_documents.deleted_at is null
+            and source_documents.status <> 'deleted'
+        ),
+        ranked_visible_documents as (
+          select
+            *,
+            row_number() over (
+              partition by visible_key
+              order by visible_priority asc, updated_at desc, id desc
+            ) as visible_rank
+          from visible_source_documents
+        )
         select
           id,
           knowledge_base_id,
@@ -636,12 +976,8 @@ class PostgresOperationalReadStore implements OperationalReadStore {
           fork_tombstoned_at,
           created_at,
           updated_at
-        from source_documents
-        where knowledge_base_id = ${input.knowledgeBaseId}
-          and owner_knowledge_base_id is null
-          and fork_tombstoned_at is null
-          and deleted_at is null
-          and status <> 'deleted'
+        from ranked_visible_documents
+        where visible_rank = 1
           and (${status}::text is null or status = ${status})
           and (${sourceType}::text is null or source_type = ${sourceType})
           and (
@@ -661,13 +997,89 @@ class PostgresOperationalReadStore implements OperationalReadStore {
         offset ${offset}
       `.execute(this.db),
       sql<{ total: string | number | bigint }>`
+        with target_kb as (
+          select id, knowledge_base_type, upstream_knowledge_base_id
+          from knowledge_bases
+          where id = ${input.knowledgeBaseId}
+            and deleted_at is null
+            and status <> 'deleted'
+          limit 1
+        ),
+        fork_tombstones as (
+          select upstream_resource_id
+          from source_documents
+          where owner_knowledge_base_id = ${input.knowledgeBaseId}
+            and upstream_resource_id is not null
+            and fork_tombstoned_at is not null
+        ),
+        visible_source_documents as (
+          select
+            source_documents.id,
+            source_documents.source_type,
+            source_documents.name,
+            source_documents.status,
+            source_documents.metadata,
+            source_documents.updated_at,
+            source_documents.id as visible_key,
+            0 as visible_priority
+          from source_documents
+          inner join target_kb on target_kb.id = source_documents.knowledge_base_id
+          where target_kb.knowledge_base_type <> 'fork'
+            and source_documents.owner_knowledge_base_id is null
+            and source_documents.fork_tombstoned_at is null
+            and source_documents.deleted_at is null
+            and source_documents.status <> 'deleted'
+          union all
+          select
+            source_documents.id,
+            source_documents.source_type,
+            source_documents.name,
+            source_documents.status,
+            source_documents.metadata,
+            source_documents.updated_at,
+            source_documents.id as visible_key,
+            1 as visible_priority
+          from source_documents
+          inner join target_kb on target_kb.upstream_knowledge_base_id = source_documents.knowledge_base_id
+          where target_kb.knowledge_base_type = 'fork'
+            and source_documents.owner_knowledge_base_id is null
+            and source_documents.fork_tombstoned_at is null
+            and source_documents.deleted_at is null
+            and source_documents.status <> 'deleted'
+            and not exists (
+              select 1
+              from fork_tombstones
+              where fork_tombstones.upstream_resource_id = source_documents.id
+            )
+          union all
+          select
+            source_documents.id,
+            source_documents.source_type,
+            source_documents.name,
+            source_documents.status,
+            source_documents.metadata,
+            source_documents.updated_at,
+            coalesce(source_documents.upstream_resource_id, source_documents.id) as visible_key,
+            0 as visible_priority
+          from source_documents
+          inner join target_kb on target_kb.id = source_documents.owner_knowledge_base_id
+          where target_kb.knowledge_base_type = 'fork'
+            and source_documents.fork_tombstoned_at is null
+            and source_documents.deleted_at is null
+            and source_documents.status <> 'deleted'
+        ),
+        ranked_visible_documents as (
+          select
+            *,
+            row_number() over (
+              partition by visible_key
+              order by visible_priority asc, updated_at desc, id desc
+            ) as visible_rank
+          from visible_source_documents
+        )
         select count(*) as total
-        from source_documents
-        where knowledge_base_id = ${input.knowledgeBaseId}
-          and owner_knowledge_base_id is null
-          and fork_tombstoned_at is null
-          and deleted_at is null
-          and status <> 'deleted'
+        from ranked_visible_documents
+        where visible_rank = 1
           and (${status}::text is null or status = ${status})
           and (${sourceType}::text is null or source_type = ${sourceType})
           and (
@@ -762,6 +1174,201 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     return row === undefined ? null : toSourceDocumentRecord(row);
   }
 
+  async getVisibleSourceDocumentById(
+    knowledgeBaseId: string,
+    documentId: string,
+  ): Promise<SourceDocumentRecord | null> {
+    const result = await sql<SourceDocumentRow>`
+      with target_kb as (
+        select id, knowledge_base_type, upstream_knowledge_base_id
+        from knowledge_bases
+        where id = ${knowledgeBaseId}
+          and deleted_at is null
+          and status <> 'deleted'
+        limit 1
+      )
+      select
+        source_documents.id,
+        case
+          when source_documents.knowledge_base_id = target_kb.upstream_knowledge_base_id
+            then target_kb.id
+          else source_documents.knowledge_base_id
+        end as knowledge_base_id,
+        source_documents.source_type,
+        source_documents.name,
+        source_documents.status,
+        source_documents.content_hash,
+        source_documents.object_key,
+        source_documents.mime_type,
+        source_documents.size_bytes::bigint as size_bytes,
+        source_documents.metadata,
+        source_documents.ocr_status,
+        source_documents.ocr_summary,
+        case
+          when source_documents.knowledge_base_id = target_kb.upstream_knowledge_base_id
+            then 'upstream_inherited'
+          else source_documents.visibility_origin
+        end as visibility_origin,
+        case
+          when source_documents.knowledge_base_id = target_kb.upstream_knowledge_base_id
+            then target_kb.id
+          else source_documents.owner_knowledge_base_id
+        end as owner_knowledge_base_id,
+        case
+          when source_documents.knowledge_base_id = target_kb.upstream_knowledge_base_id
+            then source_documents.id
+          else source_documents.upstream_resource_id
+        end as upstream_resource_id,
+        source_documents.fork_tombstoned_at,
+        source_documents.created_at,
+        source_documents.updated_at
+      from source_documents
+      inner join target_kb on true
+      where source_documents.deleted_at is null
+        and source_documents.status <> 'deleted'
+        and source_documents.fork_tombstoned_at is null
+        and (
+          (
+            source_documents.id = ${documentId}
+            and source_documents.knowledge_base_id = target_kb.id
+          )
+          or (
+            source_documents.upstream_resource_id = ${documentId}
+            and source_documents.owner_knowledge_base_id = target_kb.id
+          )
+          or (
+            target_kb.knowledge_base_type = 'fork'
+            and source_documents.id = ${documentId}
+            and source_documents.knowledge_base_id = target_kb.upstream_knowledge_base_id
+            and not exists (
+              select 1
+              from source_documents tombstone
+              where tombstone.owner_knowledge_base_id = target_kb.id
+                and tombstone.upstream_resource_id = source_documents.id
+                and tombstone.fork_tombstoned_at is not null
+            )
+          )
+        )
+      order by
+        case
+          when source_documents.owner_knowledge_base_id = target_kb.id then 0
+          when source_documents.knowledge_base_id = target_kb.id then 1
+          else 2
+        end asc,
+        source_documents.updated_at desc,
+        source_documents.id desc
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toSourceDocumentRecord(row);
+  }
+
+  async getUploadSessionById(uploadSessionId: string): Promise<UploadSessionRecord | null> {
+    const result = await sql<UploadSessionRow>`
+      select
+        id,
+        knowledge_base_id,
+        document_id,
+        object_key,
+        file_name,
+        display_name,
+        mime_type,
+        size_bytes::bigint as size_bytes,
+        content_hash,
+        source_path,
+        metadata,
+        status,
+        idempotency_key,
+        finalize_idempotency_key,
+        finalized_document_id,
+        finalized_job_id,
+        cleanup_operation_id,
+        expires_at,
+        created_at,
+        updated_at
+      from upload_sessions
+      where id = ${uploadSessionId}
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toUploadSessionRecord(row);
+  }
+
+  async getUploadSessionByIdempotencyKey(
+    knowledgeBaseId: string,
+    idempotencyKey: string,
+  ): Promise<UploadSessionRecord | null> {
+    const result = await sql<UploadSessionRow>`
+      select
+        id,
+        knowledge_base_id,
+        document_id,
+        object_key,
+        file_name,
+        display_name,
+        mime_type,
+        size_bytes::bigint as size_bytes,
+        content_hash,
+        source_path,
+        metadata,
+        status,
+        idempotency_key,
+        finalize_idempotency_key,
+        finalized_document_id,
+        finalized_job_id,
+        cleanup_operation_id,
+        expires_at,
+        created_at,
+        updated_at
+      from upload_sessions
+      where knowledge_base_id = ${knowledgeBaseId}
+        and idempotency_key = ${idempotencyKey}
+      order by created_at desc, id desc
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toUploadSessionRecord(row);
+  }
+
+  async listExpiredCreatedUploadSessions(
+    now: string,
+    limit: number,
+  ): Promise<UploadSessionRecord[]> {
+    const result = await sql<UploadSessionRow>`
+      select
+        id,
+        knowledge_base_id,
+        document_id,
+        object_key,
+        file_name,
+        display_name,
+        mime_type,
+        size_bytes::bigint as size_bytes,
+        content_hash,
+        source_path,
+        metadata,
+        status,
+        idempotency_key,
+        finalize_idempotency_key,
+        finalized_document_id,
+        finalized_job_id,
+        cleanup_operation_id,
+        expires_at,
+        created_at,
+        updated_at
+      from upload_sessions
+      where status = 'created'
+        and expires_at <= ${now}
+      order by expires_at asc, id asc
+      limit ${limit}
+    `.execute(this.db);
+
+    return result.rows.map(toUploadSessionRecord);
+  }
+
   async getLatestJobByDocumentId(documentId: string): Promise<JobRecord | null> {
     const result = await sql<JobRow>`
       select
@@ -814,6 +1421,38 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     `.execute(this.db);
 
     return result.rows.map(toJobRecord);
+  }
+
+  async getJobByIdempotencyKey(
+    knowledgeBaseId: string,
+    idempotencyKey: string,
+  ): Promise<JobRecord | null> {
+    const result = await sql<JobRow>`
+      select
+        id,
+        knowledge_base_id,
+        source_document_id,
+        job_type,
+        status,
+        stage,
+        progress,
+        progress_message,
+        idempotency_key,
+        dedupe_key,
+        result,
+        error,
+        metadata,
+        queued_at,
+        updated_at
+      from jobs
+      where knowledge_base_id = ${knowledgeBaseId}
+        and idempotency_key = ${idempotencyKey}
+      order by queued_at desc, id desc
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toJobRecord(row);
   }
 
   async getParsedContentByDocumentId(documentId: string): Promise<ParsedContentRecord | null> {
@@ -925,6 +1564,40 @@ class PostgresOperationalReadStore implements OperationalReadStore {
       total,
       hasMore: offset + input.pageSize < total,
     };
+  }
+
+  async getMediaAssetById(mediaAssetId: string): Promise<MediaAssetRecord | null> {
+    const result = await sql<MediaAssetRow>`
+      select
+        id,
+        source_document_id,
+        parsed_content_id,
+        mime_type,
+        object_key,
+        hash,
+        locator,
+        width,
+        height,
+        caption_status,
+        caption,
+        caption_provider_name,
+        caption_model,
+        caption_prompt_version,
+        caption_model_call_id,
+        caption_cache_hit,
+        caption_attempt_count,
+        caption_error,
+        caption_generated_at,
+        updated_at,
+        created_at
+      from media_assets
+      where id = ${mediaAssetId}
+        and fork_tombstoned_at is null
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toMediaAssetRecord(row);
   }
 
   async findReferencedObjectKeys(input: ReferencedObjectKeyReadInput): Promise<Set<string>> {
@@ -1114,6 +1787,34 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     return row === undefined ? null : toSourceWatchRuleRecord(row);
   }
 
+  async listDueSourceWatchRules(now: string, limit: number): Promise<SourceWatchRuleRecord[]> {
+    const result = await sql<SourceWatchRuleRow>`
+      select
+        id,
+        knowledge_base_id,
+        name,
+        source_type,
+        location,
+        auto_ingest_enabled,
+        include_patterns,
+        exclude_patterns,
+        status,
+        schedule,
+        metadata,
+        created_at,
+        updated_at
+      from source_watch_rules
+      where status = 'enabled'
+        and coalesce((schedule->>'enabled')::boolean, false) = true
+        and schedule->>'next_run_at' is not null
+        and (schedule->>'next_run_at')::timestamptz <= ${now}::timestamptz
+      order by (schedule->>'next_run_at')::timestamptz asc, updated_at asc, id asc
+      limit ${limit}
+    `.execute(this.db);
+
+    return result.rows.map(toSourceWatchRuleRecord);
+  }
+
   async getJobById(jobId: string): Promise<JobRecord | null> {
     const jobs = await this.listJobsByIds([jobId]);
 
@@ -1201,6 +1902,34 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     };
   }
 
+  async getScheduledImportJobById(jobId: string): Promise<ScheduledImportJobRecord | null> {
+    const result = await sql<ScheduledImportJobRow>`
+      select
+        id,
+        source_watch_rule_id,
+        knowledge_base_id,
+        status,
+        trigger_type,
+        scan_result,
+        started_at,
+        finished_at,
+        duration_ms,
+        retry_count,
+        retryable,
+        next_retry_at,
+        error,
+        scheduled_for,
+        created_at,
+        updated_at
+      from scheduled_import_jobs
+      where id = ${jobId}
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toScheduledImportJobRecord(row);
+  }
+
   async listWebhooks(
     scope: ApiResourceScope,
     input: Omit<PaginatedReadInput, "knowledgeBaseId">,
@@ -1282,6 +2011,39 @@ class PostgresOperationalReadStore implements OperationalReadStore {
       webhook,
       latestDelivery: latestDeliveries.get(webhook.id) ?? null,
     };
+  }
+
+  async listMatchingWebhooks(input: {
+    scope: ApiResourceScope;
+    eventType: WebhookEventType;
+    knowledgeBaseId: string | null;
+  }): Promise<WebhookRecord[]> {
+    const result = await sql<WebhookRow>`
+      select
+        id,
+        tenant_id,
+        project_id,
+        knowledge_base_id,
+        target_url,
+        event_types,
+        status,
+        secret_configured,
+        secret_ciphertext,
+        created_at,
+        updated_at
+      from webhooks
+      where tenant_id = ${input.scope.tenantId}
+        and project_id = ${input.scope.projectId}
+        and status = 'enabled'
+        and ${input.eventType} = any(event_types)
+        and (
+          knowledge_base_id is null
+          or knowledge_base_id = ${input.knowledgeBaseId}
+        )
+      order by updated_at desc, id desc
+    `.execute(this.db);
+
+    return result.rows.map(toWebhookRecord);
   }
 
   async listWebhookDeliveriesByWebhookId(
@@ -1606,6 +2368,104 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     };
   }
 
+  async getRuntimeSourceJobSummary(): Promise<RuntimeSourceJobSummary> {
+    const durationSampleLimit = 50_000;
+    const [countsResult, stageResult, durationResult] = await Promise.all([
+      sql<RuntimeSourceJobCountsRow>`
+        select
+          count(*)::bigint as total,
+          count(*) filter (where status = 'queued')::bigint as queued,
+          count(*) filter (where status = 'running')::bigint as running,
+          count(*) filter (where status = 'completed')::bigint as completed,
+          count(*) filter (where status = 'failed')::bigint as failed,
+          count(*) filter (where status = 'canceled')::bigint as canceled,
+          count(*) filter (
+            where nullif(metadata->>'retry_of_job_id', '') is not null
+          )::bigint as retry_count
+        from jobs
+        where coalesce(job_type, '') <> 'graph.insights.refresh'
+      `.execute(this.db),
+      sql<StageCountRow>`
+        select coalesce(stage, 'parsing') as stage, count(*)::bigint as total
+        from jobs
+        where coalesce(job_type, '') <> 'graph.insights.refresh'
+        group by coalesce(stage, 'parsing')
+      `.execute(this.db),
+      sql<RuntimeSourceJobDurationRow>`
+        with duration_events as (
+          select
+            coalesce(metadata->>'stage', 'parsing') as stage,
+            (metadata->>'stage_duration_ms')::double precision as duration_ms,
+            created_at
+          from job_events
+          where jsonb_typeof(metadata) = 'object'
+            and metadata ? 'stage_duration_ms'
+            and (metadata->>'stage_duration_ms') ~ '^[0-9]+(\\.[0-9]+)?$'
+          order by created_at desc
+          limit ${durationSampleLimit}
+        )
+        select
+          stage,
+          count(*)::bigint as count,
+          round(avg(duration_ms))::bigint as avg_ms,
+          round(max(duration_ms))::bigint as max_ms,
+          round(min(duration_ms))::bigint as min_ms,
+          round((array_agg(duration_ms order by created_at desc))[1])::bigint as latest_ms
+        from duration_events
+        group by stage
+      `.execute(this.db),
+    ]);
+    const countsRow = countsResult.rows[0];
+    const statusCounts: Record<JobStatus, number> = {
+      canceled: readCount(countsRow?.canceled),
+      completed: readCount(countsRow?.completed),
+      failed: readCount(countsRow?.failed),
+      queued: readCount(countsRow?.queued),
+      running: readCount(countsRow?.running),
+    };
+    const stageCounts = createEmptyStageCounts();
+    const stageDurations: Record<string, RuntimeSourceJobDurationSummary> = {};
+
+    for (const row of stageResult.rows) {
+      stageCounts[readJobStage(row.stage)] = readCount(row.total);
+    }
+
+    for (const row of durationResult.rows) {
+      stageDurations[readJobStage(row.stage)] = {
+        avgMs: readCount(row.avg_ms),
+        count: readCount(row.count),
+        latestMs: readCount(row.latest_ms),
+        maxMs: readCount(row.max_ms),
+        minMs: readCount(row.min_ms),
+      };
+    }
+
+    return {
+      activeJobs: statusCounts.running,
+      queueDepth: statusCounts.queued,
+      retryCount: readCount(countsRow?.retry_count),
+      stageCounts,
+      stageDurations,
+      statusCounts,
+      total: readCount(countsRow?.total),
+    };
+  }
+
+  async getDeletionCleanupQueueSummary(): Promise<DeletionCleanupQueueSummary> {
+    const result = await sql<DeletionCleanupQueueSummaryRow>`
+      select
+        count(*) filter (where status in ('queued', 'running'))::bigint as pending,
+        count(*) filter (where status = 'failed')::bigint as failed
+      from deletion_cleanup_operations
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return {
+      failed: readCount(row?.failed),
+      pending: readCount(row?.pending),
+    };
+  }
+
   private async listLatestWebhookDeliveriesByWebhookIds(
     webhookIds: readonly string[],
   ): Promise<Map<string, WebhookDeliveryRecord>> {
@@ -1735,6 +2595,20 @@ interface KnowledgeBaseRow {
   retrieval_settings: unknown;
 }
 
+interface DatasetConfigurationRow {
+  id: string;
+  knowledge_base_id: string;
+  preset_id: string;
+  status: string;
+  version: number;
+  values: unknown;
+  latest_snapshot_id: string;
+  updated_by: string | null;
+  metadata: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
 interface KnowledgeCheckRow {
   id: string;
   knowledge_base_id: string;
@@ -1763,6 +2637,29 @@ interface SourceDocumentRow {
   owner_knowledge_base_id: string | null;
   upstream_resource_id: string | null;
   fork_tombstoned_at: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
+interface UploadSessionRow {
+  id: string;
+  knowledge_base_id: string;
+  document_id: string;
+  object_key: string;
+  file_name: string;
+  display_name: string;
+  mime_type: string;
+  size_bytes: string | number | bigint;
+  content_hash: string | null;
+  source_path: string | null;
+  metadata: unknown;
+  status: string;
+  idempotency_key: string | null;
+  finalize_idempotency_key: string | null;
+  finalized_document_id: string | null;
+  finalized_job_id: string | null;
+  cleanup_operation_id: string | null;
+  expires_at: unknown;
   created_at: unknown;
   updated_at: unknown;
 }
@@ -1990,9 +2887,33 @@ interface ProgressCountsRow {
   latest_job_updated_at: string | null;
 }
 
+interface RuntimeSourceJobCountsRow {
+  total: string | number | bigint;
+  queued: string | number | bigint;
+  running: string | number | bigint;
+  completed: string | number | bigint;
+  failed: string | number | bigint;
+  canceled: string | number | bigint;
+  retry_count: string | number | bigint;
+}
+
 interface StageCountRow {
   stage: string;
   total: string | number | bigint;
+}
+
+interface RuntimeSourceJobDurationRow {
+  stage: string;
+  count: string | number | bigint;
+  avg_ms: string | number | bigint;
+  max_ms: string | number | bigint;
+  min_ms: string | number | bigint;
+  latest_ms: string | number | bigint;
+}
+
+interface DeletionCleanupQueueSummaryRow {
+  failed: string | number | bigint;
+  pending: string | number | bigint;
 }
 
 const jobStages: readonly JobStage[] = [
@@ -2033,6 +2954,44 @@ function toKnowledgeBaseResponse(row: KnowledgeBaseRow): KnowledgeBaseResponse {
   }
 
   return response;
+}
+
+function toDatasetConfigurationResponse(
+  row: DatasetConfigurationRow,
+): DatasetConfigurationResponse {
+  return {
+    id: row.id,
+    knowledge_base_id: row.knowledge_base_id,
+    preset_id: readKnowledgeBaseTemplate(row.preset_id),
+    status: readDatasetConfigurationStatus(row.status),
+    version: row.version,
+    values: normalizeJsonObject(row.values) as DatasetConfigurationValues,
+    latest_snapshot_id: row.latest_snapshot_id,
+    created_at: normalizeTimestamp(row.created_at),
+    updated_at: normalizeTimestamp(row.updated_at),
+    updated_by: row.updated_by,
+    metadata: normalizeJsonObject(row.metadata),
+  };
+}
+
+function createEmptyRuntimeSourceJobSummary(): RuntimeSourceJobSummary {
+  const statusCounts: Record<JobStatus, number> = {
+    canceled: 0,
+    completed: 0,
+    failed: 0,
+    queued: 0,
+    running: 0,
+  };
+
+  return {
+    activeJobs: 0,
+    queueDepth: 0,
+    retryCount: 0,
+    stageCounts: createEmptyStageCounts(),
+    stageDurations: {},
+    statusCounts,
+    total: 0,
+  };
 }
 
 function toKnowledgeCheckRecord(row: KnowledgeCheckRow): KnowledgeCheckRecord {
@@ -2120,6 +3079,31 @@ function toSourceDocumentRecord(row: SourceDocumentRow): SourceDocumentRecord {
     ownerKnowledgeBaseId: row.owner_knowledge_base_id,
     upstreamResourceId: row.upstream_resource_id,
     forkTombstonedAt: normalizeNullableTimestamp(row.fork_tombstoned_at),
+    createdAt: normalizeTimestamp(row.created_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toUploadSessionRecord(row: UploadSessionRow): UploadSessionRecord {
+  return {
+    id: row.id,
+    knowledgeBaseId: row.knowledge_base_id,
+    documentId: row.document_id,
+    objectKey: row.object_key,
+    fileName: row.file_name,
+    displayName: row.display_name,
+    mimeType: row.mime_type,
+    size: readCount(row.size_bytes),
+    contentHash: row.content_hash,
+    ...(row.source_path === null ? {} : { sourcePath: row.source_path }),
+    metadata: normalizeJsonObject(row.metadata),
+    status: readUploadSessionStatus(row.status),
+    idempotencyKey: row.idempotency_key,
+    finalizeIdempotencyKey: row.finalize_idempotency_key,
+    finalizedDocumentId: row.finalized_document_id,
+    finalizedJobId: row.finalized_job_id,
+    cleanupOperationId: row.cleanup_operation_id,
+    expiresAt: normalizeTimestamp(row.expires_at),
     createdAt: normalizeTimestamp(row.created_at),
     updatedAt: normalizeTimestamp(row.updated_at),
   };
@@ -2588,6 +3572,10 @@ function readKnowledgeBaseOutputLanguage(value: unknown): KnowledgeBaseOutputLan
   return "auto";
 }
 
+function readDatasetConfigurationStatus(value: unknown): DatasetConfigurationStatus {
+  return value === "active" ? "active" : "active";
+}
+
 function readKnowledgeBaseStatus(value: unknown): Exclude<KnowledgeBaseStatus, "deleted"> {
   if (value === "indexing" || value === "outdated" || value === "failed") {
     return value;
@@ -2721,6 +3709,14 @@ function readSourceDocumentStatus(value: unknown): SourceDocumentStatus {
   }
 
   return "uploaded";
+}
+
+function readUploadSessionStatus(value: unknown): UploadSessionRecord["status"] {
+  if (value === "created" || value === "finalized" || value === "expired" || value === "canceled") {
+    return value;
+  }
+
+  return "created";
 }
 
 function readSourceVisibilityOrigin(value: unknown): SourceVisibilityOrigin {

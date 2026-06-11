@@ -1,9 +1,10 @@
-import { Controller, Get, Param, Query, Req } from "@nestjs/common";
+import { Controller, Get, HttpCode, Param, Post, Query, Req } from "@nestjs/common";
 import { createRequestId, createSuccessEnvelope } from "@fococontext/contracts";
 import type { RetrievalRelationType } from "@fococontext/retrieval";
 
 import { requireApiKeyScope, type ApiKeyRequest } from "../auth/api-key.guard.js";
 import { KnowledgeBaseService } from "../knowledge-bases/knowledge-base.service.js";
+import { GraphInsightsRefreshService } from "./graph-insights-refresh.service.js";
 import { RetrieveService } from "./retrieve.service.js";
 
 interface GraphQuery {
@@ -21,6 +22,7 @@ export class GraphController {
   constructor(
     private readonly retrieveService: RetrieveService,
     private readonly knowledgeBaseService: KnowledgeBaseService,
+    private readonly graphInsightsRefreshService: GraphInsightsRefreshService,
   ) {}
 
   @Get()
@@ -31,7 +33,7 @@ export class GraphController {
   ) {
     const scope = requireApiKeyScope(request);
 
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.retrieveService.graph(
         knowledgeBaseId,
@@ -56,9 +58,23 @@ export class GraphController {
   async insights(@Param("knowledgeBaseId") knowledgeBaseId: string, @Req() request: ApiKeyRequest) {
     const scope = requireApiKeyScope(request);
 
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.retrieveService.graphInsights(knowledgeBaseId, scope),
+      createRequestId(),
+    );
+  }
+
+  @Post("insights/refresh")
+  @HttpCode(202)
+  async refreshInsights(
+    @Param("knowledgeBaseId") knowledgeBaseId: string,
+    @Req() request: ApiKeyRequest,
+  ) {
+    const scope = requireApiKeyScope(request);
+
+    return createSuccessEnvelope(
+      await this.graphInsightsRefreshService.refresh(knowledgeBaseId, scope),
       createRequestId(),
     );
   }

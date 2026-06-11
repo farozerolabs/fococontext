@@ -23,14 +23,15 @@
 
 ## 管理员和 OpenAPI 访问
 
-| 字段                             | 说明                       | 建议值                                                                    |
-| -------------------------------- | -------------------------- | ------------------------------------------------------------------------- |
-| `FOCOCONTEXT_ADMIN_USERNAME`     | 管理员用户名               | 本地可用 `admin`；生产使用不易猜的管理员名                                |
-| `FOCOCONTEXT_ADMIN_PASSWORD`     | 管理员密码                 | 至少 16 位随机密码，不要提交到 Git                                        |
-| `FOCOCONTEXT_API_KEY`            | Bearer API Key             | 使用 32 位以上随机值，只保存在服务端                                      |
-| `FOCOCONTEXT_CORS_ORIGINS`       | 逗号分隔 origin            | 本地填 `http://localhost:18081,http://127.0.0.1:18081`；生产只填可信域名  |
-| `FOCOCONTEXT_ADMIN_API_BASE_URL` | Admin 调用 API 的 base URL | Compose 内本地用 `http://localhost:18080/v1`；反向代理部署填公开 API 路径 |
-| `FOCOCONTEXT_ADMIN_BASE_URL`     | Admin 自身访问地址         | 本地用 `http://localhost:18081`；生产填 HTTPS 域名                        |
+| 字段                                    | 说明                       | 建议值                                                                    |
+| --------------------------------------- | -------------------------- | ------------------------------------------------------------------------- |
+| `FOCOCONTEXT_ADMIN_USERNAME`            | 管理员用户名               | 本地可用 `admin`；生产使用不易猜的管理员名                                |
+| `FOCOCONTEXT_ADMIN_PASSWORD`            | 管理员密码                 | 至少 16 位随机密码，不要提交到 Git                                        |
+| `FOCOCONTEXT_ADMIN_SESSION_TTL_SECONDS` | 管理后台会话 TTL 秒数      | 默认 `604800`，即 7 天                                                    |
+| `FOCOCONTEXT_API_KEY`                   | Bearer API Key             | 使用 32 位以上随机值，只保存在服务端                                      |
+| `FOCOCONTEXT_CORS_ORIGINS`              | 逗号分隔 origin            | 本地填 `http://localhost:18081,http://127.0.0.1:18081`；生产只填可信域名  |
+| `FOCOCONTEXT_ADMIN_API_BASE_URL`        | Admin 调用 API 的 base URL | Compose 内本地用 `http://localhost:18080/v1`；反向代理部署填公开 API 路径 |
+| `FOCOCONTEXT_ADMIN_BASE_URL`            | Admin 自身访问地址         | 本地用 `http://localhost:18081`；生产填 HTTPS 域名                        |
 
 ## Source Watch 挂载目录
 

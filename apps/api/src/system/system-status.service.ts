@@ -1,39 +1,78 @@
 import { Injectable } from "@nestjs/common";
 import {
   maskSecret,
-  snapshotRuntimeCacheMetrics,
+  runtimeQueueGlobalScopeId,
+  runtimeCacheResourceKinds,
   type ReleaseMetadata,
   type RuntimeConfig,
+  type RuntimeCacheMetricSummary,
+  type RuntimeQueuePressureRecorder,
+  type RuntimeQueuePressureSummary,
 } from "@fococontext/core";
 import { openApiDocument } from "@fococontext/contracts";
 import { getOrderedSqlMigrations, type DefaultIdentitySeed } from "@fococontext/db";
 import {
-  defaultObjectStorageOperationRecorder,
   type ObjectStorageOperationClass,
   type ObjectStorageOperationRecord,
   type ObjectStorageOperationStatus,
 } from "@fococontext/storage";
 
-import type { DeletionCleanupRepository } from "../deletion-cleanup/deletion-cleanup.repository.js";
-import type { DocumentRepository } from "../documents/document.repository.js";
 import type {
-  JobEventRecord,
-  JobRecord,
-  JobStage,
-  JobStatus,
-} from "../documents/document.types.js";
+  OperationalReadStore,
+  RuntimeSourceJobSummary,
+} from "../database/operational-read-store.js";
 import type { UploadAdmissionService } from "../documents/upload-admission.service.js";
-import { snapshotRetrievalQualityMetrics } from "../retrieve/retrieve-quality-metrics.js";
-import { snapshotRuntimeApiMetrics } from "../runtime/runtime-api-metrics.js";
+import type {
+  RetrievalQualityMetricsStore,
+  RetrieveQualityMetricSummary,
+} from "../retrieve/retrieve-quality-metrics.js";
+import type { RuntimeCacheMetricsStore } from "../runtime/redis-runtime-cache.js";
+import type { RedisObjectStorageOperationRecorder } from "../runtime/redis-object-storage-operation-recorder.js";
+import type {
+  RuntimeApiMetricSummary,
+  RuntimeApiMetricsStore,
+} from "../runtime/runtime-api-metrics.js";
+
+export interface RuntimeMetricsStatus {
+  api: RuntimeApiMetricSummary;
+  backends: {
+    api: "redis" | "unavailable";
+    cache: "redis" | "unavailable";
+    objectStorageOperations: "redis" | "unavailable";
+    queuePressure: "redis" | "unavailable";
+    retrievalQuality: "redis" | "unavailable";
+    sourceJobs: "postgresql";
+  };
+  cache: RuntimeCacheMetricSummary;
+  compile: {
+    activeJobs: number;
+    depth: number;
+    retryCount: number;
+    stageDurations: Record<string, DurationSummary>;
+  };
+  objectStorageOperations: ReturnType<typeof summarizeObjectStorageOperations>;
+  queue: {
+    activeJobs: number;
+    depth: number;
+    retryCount: number;
+  };
+  queuePressure: RuntimeQueuePressureSummary;
+  retrievalQuality: RetrieveQualityMetricSummary;
+  sourceJobs: RuntimeSourceJobSummary;
+}
 
 @Injectable()
 export class SystemStatusService {
   constructor(
     private readonly config: RuntimeConfig,
     private readonly defaultIdentity?: DefaultIdentitySeed,
-    private readonly deletionCleanupRepository?: DeletionCleanupRepository,
     private readonly uploadAdmissionService?: UploadAdmissionService,
-    private readonly documentRepository?: DocumentRepository,
+    private readonly operationalReadStore?: OperationalReadStore,
+    private readonly runtimeApiMetricsStore?: RuntimeApiMetricsStore,
+    private readonly runtimeCacheMetricsStore?: RuntimeCacheMetricsStore,
+    private readonly objectStorageOperationRecorder?: RedisObjectStorageOperationRecorder,
+    private readonly retrievalQualityMetricsStore?: RetrievalQualityMetricsStore,
+    private readonly runtimeQueuePressureRecorder?: RuntimeQueuePressureRecorder,
   ) {}
 
   async getHealthStatus() {
@@ -52,6 +91,11 @@ export class SystemStatusService {
         username: this.config.admin.username,
         passwordConfigured: isConfigured(this.config.admin.password),
         lastSignIn: null,
+        sessionStore: {
+          backend: "redis",
+          status: statusOf(this.config.redis.url),
+          ttlSeconds: this.config.admin.sessionTtlSeconds,
+        },
       },
       apiAccess: {
         status: statusOf(this.config.auth.apiKey),
@@ -108,6 +152,8 @@ export class SystemStatusService {
   }
 
   private async getDependencyStatus() {
+    const metrics = await this.getRuntimeMetricsStatus();
+
     return {
       database: {
         status: statusOf(this.config.database.url),
@@ -128,11 +174,13 @@ export class SystemStatusService {
         status: "configured",
         concurrency: this.config.limits.queue.concurrency,
       },
+      runtimeState: this.getRuntimeStateStatus(metrics),
+      retrieval: this.getRetrievalRuntimeStatus(),
       upload: this.getUploadRuntimeStatus(),
-      pressure: this.getPressureStatus(),
-      metrics: this.getRuntimeMetricsStatus(),
+      pressure: this.getPressureStatus(metrics),
+      metrics,
       migration: this.getMigrationRuntimeStatus(),
-      cleanupQueue: this.getCleanupQueueStatus(),
+      cleanupQueue: await this.getCleanupQueueStatus(),
       ocr: await this.getOcrRuntimeStatus(),
       sourceWatch: this.getSourceWatchRuntimeStatus(),
     };
@@ -233,30 +281,56 @@ export class SystemStatusService {
     };
   }
 
-  private getRuntimeMetricsStatus() {
-    const sourceJobs = summarizeSourceJobs(
-      this.documentRepository?.listAllJobs() ?? [],
-      this.documentRepository?.listAllJobEvents() ?? [],
-    );
+  private async getRuntimeMetricsStatus(): Promise<RuntimeMetricsStatus> {
+    const sourceJobs =
+      this.operationalReadStore === undefined
+        ? emptyRuntimeSourceJobSummary()
+        : await this.operationalReadStore.getRuntimeSourceJobSummary();
     const objectStorageOperations = summarizeObjectStorageOperations(
-      defaultObjectStorageOperationRecorder.snapshot(
-        this.config.limits.objectStorageOperations.metricsWindowSeconds,
-      ),
+      this.objectStorageOperationRecorder === undefined
+        ? []
+        : await this.objectStorageOperationRecorder.snapshotAsync(
+            this.config.limits.objectStorageOperations.metricsWindowSeconds,
+          ),
       this.config.limits.objectStorageOperations.metricsWindowSeconds,
       this.config.limits.objectStorageOperations.metricsEnabled,
     );
+    const queuePressure =
+      this.runtimeQueuePressureRecorder === undefined
+        ? emptyRuntimeQueuePressure()
+        : await this.runtimeQueuePressureRecorder.snapshot({
+            scopeId: runtimeQueueGlobalScopeId,
+          });
 
     return {
-      api: snapshotRuntimeApiMetrics(),
-      cache: snapshotRuntimeCacheMetrics(),
+      api:
+        this.runtimeApiMetricsStore === undefined
+          ? emptyRuntimeApiMetrics()
+          : await this.runtimeApiMetricsStore.snapshot(),
+      backends: {
+        api: this.runtimeApiMetricsStore?.backend ?? "unavailable",
+        cache: this.runtimeCacheMetricsStore?.backend ?? "unavailable",
+        objectStorageOperations: this.objectStorageOperationRecorder?.backend ?? "unavailable",
+        queuePressure: this.runtimeQueuePressureRecorder === undefined ? "unavailable" : "redis",
+        retrievalQuality: this.retrievalQualityMetricsStore?.backend ?? "unavailable",
+        sourceJobs: "postgresql",
+      },
+      cache:
+        this.runtimeCacheMetricsStore === undefined
+          ? emptyRuntimeCacheMetrics()
+          : await this.runtimeCacheMetricsStore.snapshot(),
       sourceJobs,
       objectStorageOperations,
-      retrievalQuality: snapshotRetrievalQualityMetrics(),
+      retrievalQuality:
+        this.retrievalQualityMetricsStore === undefined
+          ? emptyRetrievalQualityMetrics()
+          : await this.retrievalQualityMetricsStore.snapshot(),
       queue: {
         depth: sourceJobs.queueDepth,
         activeJobs: sourceJobs.activeJobs,
         retryCount: sourceJobs.retryCount,
       },
+      queuePressure,
       compile: {
         depth: sourceJobs.queueDepth,
         activeJobs: sourceJobs.activeJobs,
@@ -282,14 +356,13 @@ export class SystemStatusService {
     };
   }
 
-  private getPressureStatus() {
+  private getPressureStatus(metrics: RuntimeMetricsStatus) {
     const admission = this.uploadAdmissionService?.getSnapshot() ?? {
       activeMultipartUploads: 0,
       multipartAdmissionLimit: this.config.limits.upload.admissionConcurrency,
       pressureDegradedThreshold: this.config.limits.upload.pressureDegradedThreshold,
       pressure: "normal",
     };
-    const metrics = this.getRuntimeMetricsStatus();
     const queueStatus = classifyPressureState(
       metrics.queue.depth,
       this.config.limits.pressure.queueDepthDegradedThreshold,
@@ -336,6 +409,57 @@ export class SystemStatusService {
       },
       validation: {
         expensiveValidationEnabled: this.config.limits.pressure.expensiveValidationEnabled,
+      },
+    };
+  }
+
+  private getRuntimeStateStatus(metrics: RuntimeMetricsStatus) {
+    const metricBackends = metrics.backends;
+    const metricStatuses = Object.entries(metricBackends).map(([name, backend]) => ({
+      name,
+      backend,
+      status: backend === "unavailable" ? "degraded" : "configured",
+    }));
+    const degradedMetrics = metricStatuses
+      .filter((item) => item.status === "degraded")
+      .map((item) => item.name);
+
+    return {
+      sessionStore: {
+        backend: "redis",
+        status: statusOf(this.config.redis.url),
+        ttlSeconds: this.config.admin.sessionTtlSeconds,
+      },
+      metricsStore: {
+        status: degradedMetrics.length === 0 ? "configured" : "degraded",
+        backends: metricBackends,
+        degraded: degradedMetrics,
+      },
+    };
+  }
+
+  private getRetrievalRuntimeStatus() {
+    return {
+      boundedRetrieval: {
+        backend: "postgresql",
+        lexical: "postgresql_indexed",
+        semantic: "pgvector",
+        graphTraversal: "postgresql_indexed",
+        status: statusOf(this.config.database.url),
+      },
+      graphReadiness: {
+        backend: "postgresql",
+        insights: "materialized_snapshot",
+        status: statusOf(this.config.database.url),
+      },
+      sourceEvidence: {
+        backend: "postgresql_s3",
+        status:
+          isConfigured(this.config.database.url) &&
+          isConfigured(this.config.storage.bucket) &&
+          isConfigured(this.config.storage.endpoint)
+            ? "configured"
+            : "missing",
       },
     };
   }
@@ -441,13 +565,15 @@ export class SystemStatusService {
     };
   }
 
-  private getCleanupQueueStatus() {
+  private async getCleanupQueueStatus() {
     const workerConfigured = this.getWorkerStatus() === "configured";
-    const operations = this.deletionCleanupRepository?.listOperations() ?? [];
-    const pending = operations.filter(
-      (operation) => operation.status === "queued" || operation.status === "running",
-    ).length;
-    const failed = operations.filter((operation) => operation.status === "failed").length;
+    const operations =
+      this.operationalReadStore === undefined
+        ? {
+            failed: 0,
+            pending: 0,
+          }
+        : await this.operationalReadStore.getDeletionCleanupQueueSummary();
 
     return {
       enabled: true,
@@ -466,8 +592,8 @@ export class SystemStatusService {
         itemRetentionDays: this.config.limits.deletionCleanup.itemRetentionDays,
       },
       operations: {
-        pending,
-        failed,
+        pending: operations.pending,
+        failed: operations.failed,
       },
     };
   }
@@ -704,8 +830,6 @@ export interface DurationSummary {
   latestMs: number;
 }
 
-type SourceStatusCounts = Record<JobStatus, number>;
-
 export interface ObjectStorageOperationMetricSummary {
   countsByCaller: Record<string, number>;
   countsByClass: Record<ObjectStorageOperationClass, number>;
@@ -722,29 +846,6 @@ export interface ObjectStorageOperationMetricSummary {
   retryCount: number;
   total: number;
   windowSeconds: number;
-}
-
-function summarizeSourceJobs(jobs: readonly JobRecord[], events: readonly JobEventRecord[]) {
-  const statusCounts = countSourceStatuses(jobs);
-  const stageCounts = countBy(jobs, (job) => job.stage);
-  const durationSamples = new Map<JobStage, number[]>();
-
-  for (const event of events) {
-    const duration = readFiniteNumber(event.metadata.stage_duration_ms);
-    if (duration !== undefined) {
-      addDurationSample(durationSamples, event.stage, duration);
-    }
-  }
-
-  return {
-    total: jobs.length,
-    queueDepth: statusCounts.queued,
-    activeJobs: statusCounts.running,
-    retryCount: jobs.filter((job) => job.retryOfJobId !== null).length,
-    statusCounts,
-    stageCounts,
-    stageDurations: summarizeDurations(durationSamples),
-  };
 }
 
 function summarizeObjectStorageOperations(
@@ -924,63 +1025,6 @@ function compareCountDesc<TRecord extends { count: number }>(
   return right.count - left.count;
 }
 
-function countSourceStatuses(jobs: readonly JobRecord[]): SourceStatusCounts {
-  return {
-    queued: jobs.filter((job) => job.status === "queued").length,
-    running: jobs.filter((job) => job.status === "running").length,
-    completed: jobs.filter((job) => job.status === "completed").length,
-    failed: jobs.filter((job) => job.status === "failed").length,
-    canceled: jobs.filter((job) => job.status === "canceled").length,
-  };
-}
-
-function countBy<TRecord, TKey extends string>(
-  records: readonly TRecord[],
-  getKey: (record: TRecord) => TKey,
-): Record<TKey, number> {
-  const counts = {} as Record<TKey, number>;
-
-  for (const record of records) {
-    const key = getKey(record);
-    counts[key] = (counts[key] ?? 0) + 1;
-  }
-
-  return counts;
-}
-
-function addDurationSample<TKey extends string>(
-  samples: Map<TKey, number[]>,
-  key: TKey,
-  value: number,
-): void {
-  const values = samples.get(key) ?? [];
-  values.push(value);
-  samples.set(key, values);
-}
-
-function summarizeDurations<TKey extends string>(
-  samples: ReadonlyMap<TKey, readonly number[]>,
-): Record<TKey, DurationSummary> {
-  const summary = {} as Record<TKey, DurationSummary>;
-
-  for (const [key, values] of samples.entries()) {
-    if (values.length === 0) {
-      continue;
-    }
-    const total = values.reduce((sum, value) => sum + value, 0);
-
-    summary[key] = {
-      count: values.length,
-      avgMs: Math.round(total / values.length),
-      maxMs: Math.max(...values),
-      minMs: Math.min(...values),
-      latestMs: values.at(-1) ?? 0,
-    };
-  }
-
-  return summary;
-}
-
 function readAvailableMigrations(): Array<{ name: string }> {
   try {
     return getOrderedSqlMigrations().map((migration) => ({
@@ -989,6 +1033,136 @@ function readAvailableMigrations(): Array<{ name: string }> {
   } catch {
     return [];
   }
+}
+
+function emptyRuntimeApiMetrics(): RuntimeApiMetricSummary {
+  return {
+    endpointGroups: {},
+    listLatencyBuckets: {},
+    queryDurationBuckets: {},
+    returnedCountBuckets: {},
+    statusCodes: {},
+    total: 0,
+    warningCounts: {},
+    windowSeconds: 300,
+  };
+}
+
+function emptyRuntimeCacheMetrics(): RuntimeCacheMetricSummary {
+  return {
+    byResourceKind: Object.fromEntries(
+      runtimeCacheResourceKinds.map((resourceKind) => [
+        resourceKind,
+        {
+          deletes: 0,
+          expiredMisses: 0,
+          hits: 0,
+          invalidatedKeys: 0,
+          invalidations: 0,
+          misses: 0,
+          sets: 0,
+        },
+      ]),
+    ) as RuntimeCacheMetricSummary["byResourceKind"],
+    totals: {
+      deletes: 0,
+      expiredMisses: 0,
+      hits: 0,
+      invalidatedKeys: 0,
+      invalidations: 0,
+      misses: 0,
+      sets: 0,
+    },
+  };
+}
+
+function emptyRuntimeQueuePressure(): RuntimeQueuePressureSummary {
+  return {
+    counters: [],
+    pressure: "normal",
+    scopeId: runtimeQueueGlobalScopeId,
+    totals: {
+      active: 0,
+      backpressureCount: 0,
+      completed: 0,
+      failed: 0,
+      queued: 0,
+      retried: 0,
+    },
+  };
+}
+
+function emptyRetrievalQualityMetrics(): RetrieveQualityMetricSummary {
+  return {
+    answerabilityReasonCounts: {},
+    answerabilityStatusCounts: {
+      answerable: 0,
+      not_answerable: 0,
+      partial: 0,
+    },
+    confidenceBuckets: {},
+    evidenceSufficiencyCounts: {
+      insufficient: 0,
+      partial: 0,
+      sufficient: 0,
+    },
+    eventCounts: {
+      budgetExceeded: 0,
+      citationUnresolved: 0,
+      duplicateCandidatesPruned: 0,
+      duplicateContextPruned: 0,
+      fallbackEvidenceRequested: 0,
+      graphExpansionLimited: 0,
+      insufficientEvidence: 0,
+      lowConfidence: 0,
+      noAnswer: 0,
+      partialAnswerability: 0,
+      skippedRerank: 0,
+      unreadyIndex: 0,
+    },
+    latencyBuckets: {},
+    modeCounts: {},
+    resultCountBuckets: {},
+    rerankStatusCounts: {
+      applied: 0,
+      disabled: 0,
+      failed: 0,
+      skipped: 0,
+      timed_out: 0,
+      unknown: 0,
+    },
+    traceStageCounts: {},
+    warningCounts: {},
+    total: 0,
+    windowSeconds: 300,
+  };
+}
+
+function emptyRuntimeSourceJobSummary(): RuntimeSourceJobSummary {
+  return {
+    activeJobs: 0,
+    queueDepth: 0,
+    retryCount: 0,
+    stageCounts: {
+      analyzing: 0,
+      captioning: 0,
+      generating: 0,
+      indexing: 0,
+      merging: 0,
+      ocr: 0,
+      parsing: 0,
+      uploading: 0,
+    },
+    stageDurations: {},
+    statusCounts: {
+      canceled: 0,
+      completed: 0,
+      failed: 0,
+      queued: 0,
+      running: 0,
+    },
+    total: 0,
+  };
 }
 
 function classifyPressureState(
@@ -1004,8 +1178,4 @@ function classifyPressureState(
   }
 
   return "normal";
-}
-
-function readFiniteNumber(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }

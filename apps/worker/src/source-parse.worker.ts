@@ -2,8 +2,9 @@ import { Worker } from "bullmq";
 import { createResourceId } from "@fococontext/contracts";
 import type { RuntimeConfig } from "@fococontext/core";
 import {
-  createInMemoryParserCache,
   createDefaultParserRegistry,
+  createNoopParserCache,
+  createParserLimitError,
   type DocumentParser,
   type ParserFatalError,
   type ParserCache,
@@ -162,7 +163,7 @@ export class SourceParseProcessor {
     this.jobProgress = options.jobProgress;
     this.jobGuard = options.jobGuard;
     this.parserRegistry = options.parserRegistry ?? createDefaultParserRegistry();
-    this.parserCache = options.parserCache ?? createInMemoryParserCache();
+    this.parserCache = options.parserCache ?? createNoopParserCache();
     this.parserLimits = options.parserLimits;
     this.mediaAssetUploadConcurrency = normalizePositiveInteger(
       options.mediaAssetUploadConcurrency,
@@ -178,10 +179,6 @@ export class SourceParseProcessor {
       return this.createFailedResult(payload, initialGuardError);
     }
 
-    const original = await this.objectStorage.getObject({
-      key: payload.object_key,
-    });
-    const content = await readBody(original.body);
     const fileName = basename(payload.object_key);
     const resolution = this.parserRegistry.resolve({
       fileName,
@@ -194,6 +191,23 @@ export class SourceParseProcessor {
       return this.createFailedResult(payload, resolution.error);
     }
 
+    const original = await this.objectStorage.getObject({
+      key: payload.object_key,
+    });
+    const contentResult = await this.readOriginalContentWithinLimits(
+      original.body,
+      original.contentLength,
+      resolution.parser,
+      fileName,
+      payload.mime_type,
+    );
+
+    if (contentResult.kind === "fatal") {
+      await this.markParsingFailed(payload, contentResult.error);
+
+      return this.createFailedResult(payload, contentResult.error);
+    }
+
     const parsedContentId = createResourceId("parsedContent");
     const result = await parseWithCache(
       this.createParserWithRuntimeLimits(resolution.parser),
@@ -203,7 +217,7 @@ export class SourceParseProcessor {
         fileName,
         mimeType: payload.mime_type,
         contentHash: payload.content_hash,
-        content,
+        content: contentResult.content,
       },
       this.parserCache,
       {
@@ -423,6 +437,48 @@ export class SourceParseProcessor {
       ...parser,
       parse: (input) => parseWithLimits(parser, input, limits),
     };
+  }
+
+  private async readOriginalContentWithinLimits(
+    body: unknown,
+    contentLength: number | undefined,
+    parser: DocumentParser,
+    fileName: string,
+    mimeType: string,
+  ): Promise<
+    { kind: "success"; content: Buffer | string } | { kind: "fatal"; error: ParserFatalError }
+  > {
+    const limit = this.parserLimits?.maxFileSizeBytes;
+
+    if (limit !== undefined && contentLength !== undefined && contentLength > limit) {
+      return {
+        kind: "fatal",
+        error: createParserLimitError("file_size", contentLength, limit, {
+          parserName: parser.name,
+          parserVersion: parser.version,
+          fileName,
+          mimeType,
+        }),
+      };
+    }
+
+    const content = isTextSourceParser(parser, fileName, mimeType)
+      ? await readTextBodyWithinLimit(body, limit)
+      : await readBodyWithinLimit(body, limit);
+
+    if (content.kind === "fatal") {
+      return {
+        kind: "fatal",
+        error: createParserLimitError("file_size", content.actual, content.limit, {
+          parserName: parser.name,
+          parserVersion: parser.version,
+          fileName,
+          mimeType,
+        }),
+      };
+    }
+
+    return content;
   }
 
   private async writeMediaAssetObjects(
@@ -747,12 +803,100 @@ function basename(path: string): string {
   return path.split("/").filter(Boolean).at(-1) ?? "source.bin";
 }
 
-async function readBody(body: unknown): Promise<Buffer> {
+function isTextSourceParser(parser: DocumentParser, fileName: string, mimeType: string): boolean {
+  const normalizedMimeType = mimeType.trim().toLowerCase();
+  const extension = fileName.includes(".")
+    ? `.${fileName.split(".").at(-1)?.toLowerCase() ?? ""}`
+    : "";
+  const textMimeTypes = new Set([
+    "application/json",
+    "application/jsonl",
+    "application/ndjson",
+    "application/x-ndjson",
+    "application/xml",
+    "application/yaml",
+  ]);
+  const textExtensions = new Set([
+    ".csv",
+    ".html",
+    ".htm",
+    ".json",
+    ".jsonl",
+    ".markdown",
+    ".md",
+    ".ndjson",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+  ]);
+
+  return (
+    normalizedMimeType.startsWith("text/") ||
+    textMimeTypes.has(normalizedMimeType) ||
+    textExtensions.has(extension) ||
+    parser.mimeTypes.some((item) => item.trim().toLowerCase().startsWith("text/")) ||
+    parser.extensions.some((item) => textExtensions.has(item.trim().toLowerCase()))
+  );
+}
+
+async function readBodyWithinLimit(
+  body: unknown,
+  maxBytes: number | undefined,
+): Promise<
+  { kind: "success"; content: Buffer } | { kind: "fatal"; actual: number; limit: number }
+> {
   const chunks: Buffer[] = [];
+  let totalBytes = 0;
 
   for await (const chunk of body as AsyncIterable<Buffer | string>) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.byteLength;
+
+    if (maxBytes !== undefined && totalBytes > maxBytes) {
+      return {
+        kind: "fatal",
+        actual: totalBytes,
+        limit: maxBytes,
+      };
+    }
+
+    chunks.push(buffer);
   }
 
-  return Buffer.concat(chunks);
+  return {
+    kind: "success",
+    content: Buffer.concat(chunks, totalBytes),
+  };
+}
+
+async function readTextBodyWithinLimit(
+  body: unknown,
+  maxBytes: number | undefined,
+): Promise<
+  { kind: "success"; content: string } | { kind: "fatal"; actual: number; limit: number }
+> {
+  const chunks: string[] = [];
+  let totalBytes = 0;
+
+  for await (const chunk of body as AsyncIterable<Buffer | string>) {
+    const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+
+    totalBytes += Buffer.byteLength(text);
+
+    if (maxBytes !== undefined && totalBytes > maxBytes) {
+      return {
+        kind: "fatal",
+        actual: totalBytes,
+        limit: maxBytes,
+      };
+    }
+
+    chunks.push(text);
+  }
+
+  return {
+    kind: "success",
+    content: chunks.join(""),
+  };
 }

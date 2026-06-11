@@ -23,14 +23,15 @@ Keep `FOCOCONTEXT_*_PORT` values numeric. Put the host bind address in
 
 ## Admin and OpenAPI Access
 
-| Field                            | Description                | Recommended Value                                                                                             |
-| -------------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `FOCOCONTEXT_ADMIN_USERNAME`     | Admin username             | `admin` is fine locally; use a less guessable name in production                                              |
-| `FOCOCONTEXT_ADMIN_PASSWORD`     | Admin password             | Random password with at least 16 characters                                                                   |
-| `FOCOCONTEXT_API_KEY`            | Bearer API Key             | Random value with at least 32 characters, stored server-side only                                             |
-| `FOCOCONTEXT_CORS_ORIGINS`       | Comma-separated origins    | Local default is `http://localhost:18081,http://127.0.0.1:18081`; production should list trusted domains only |
-| `FOCOCONTEXT_ADMIN_API_BASE_URL` | API base URL used by Admin | Compose local value is `http://localhost:18080/v1`; use your public API route behind a proxy                  |
-| `FOCOCONTEXT_ADMIN_BASE_URL`     | Admin base URL             | Local value is `http://localhost:18081`; production should use an HTTPS domain                                |
+| Field                                   | Description                  | Recommended Value                                                                                             |
+| --------------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `FOCOCONTEXT_ADMIN_USERNAME`            | Admin username               | `admin` is fine locally; use a less guessable name in production                                              |
+| `FOCOCONTEXT_ADMIN_PASSWORD`            | Admin password               | Random password with at least 16 characters                                                                   |
+| `FOCOCONTEXT_ADMIN_SESSION_TTL_SECONDS` | Admin session TTL in seconds | Default `604800`, 7 days                                                                                      |
+| `FOCOCONTEXT_API_KEY`                   | Bearer API Key               | Random value with at least 32 characters, stored server-side only                                             |
+| `FOCOCONTEXT_CORS_ORIGINS`              | Comma-separated origins      | Local default is `http://localhost:18081,http://127.0.0.1:18081`; production should list trusted domains only |
+| `FOCOCONTEXT_ADMIN_API_BASE_URL`        | API base URL used by Admin   | Compose local value is `http://localhost:18080/v1`; use your public API route behind a proxy                  |
+| `FOCOCONTEXT_ADMIN_BASE_URL`            | Admin base URL               | Local value is `http://localhost:18081`; production should use an HTTPS domain                                |
 
 ## Source Watch Mounted Directory
 

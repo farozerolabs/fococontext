@@ -1,6 +1,8 @@
 import { Queue } from "bullmq";
-import type { RuntimeConfig } from "@fococontext/core";
+import type { RuntimeConfig, RuntimeQueuePressureRecorder } from "@fococontext/core";
 import type { WebhookEventType } from "@fococontext/contracts";
+
+import { recordQueuePressureBackpressure, recordQueuePressureQueued } from "./queue-pressure.js";
 
 export const webhookDispatchQueueName = "webhook.dispatch";
 export const webhookDispatchJobName = "webhook.dispatch.event";
@@ -42,7 +44,10 @@ export function createWebhookDispatchJobId(deliveryId: string, attempt: number):
 export class BullMqWebhookDispatchQueue implements WebhookDispatchQueue {
   private readonly queue: Queue<WebhookDispatchPayload>;
 
-  constructor(config: RuntimeConfig) {
+  constructor(
+    config: RuntimeConfig,
+    private readonly queuePressureRecorder?: RuntimeQueuePressureRecorder,
+  ) {
     this.queue = new Queue<WebhookDispatchPayload>(webhookDispatchQueueName, {
       connection: {
         url: config.redis.url,
@@ -58,9 +63,23 @@ export class BullMqWebhookDispatchQueue implements WebhookDispatchQueue {
   async enqueueWebhookDispatch(
     payload: WebhookDispatchPayload,
   ): Promise<EnqueuedWebhookDispatchJob> {
-    await this.queue.add(webhookDispatchJobName, payload, {
-      jobId: createWebhookDispatchJobId(payload.delivery_id, payload.attempt),
-    });
+    try {
+      await this.queue.add(webhookDispatchJobName, payload, {
+        jobId: createWebhookDispatchJobId(payload.delivery_id, payload.attempt),
+      });
+      await recordQueuePressureQueued({
+        recorder: this.queuePressureRecorder,
+        scopeId: payload.knowledge_base_id,
+        workKind: "source-watch",
+      });
+    } catch (error) {
+      await recordQueuePressureBackpressure({
+        recorder: this.queuePressureRecorder,
+        scopeId: payload.knowledge_base_id,
+        workKind: "source-watch",
+      });
+      throw error;
+    }
 
     return {
       queue_name: webhookDispatchQueueName,
@@ -74,6 +93,9 @@ export class BullMqWebhookDispatchQueue implements WebhookDispatchQueue {
   }
 }
 
-export function createBullMqWebhookDispatchQueue(config: RuntimeConfig): WebhookDispatchQueue {
-  return new BullMqWebhookDispatchQueue(config);
+export function createBullMqWebhookDispatchQueue(
+  config: RuntimeConfig,
+  queuePressureRecorder?: RuntimeQueuePressureRecorder,
+): WebhookDispatchQueue {
+  return new BullMqWebhookDispatchQueue(config, queuePressureRecorder);
 }

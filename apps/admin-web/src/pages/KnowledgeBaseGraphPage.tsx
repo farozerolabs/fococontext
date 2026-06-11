@@ -4,7 +4,7 @@ import {
   useRegisterEvents,
   useSigma,
 } from "@react-sigma/core"
-import { useQuery } from "@tanstack/react-query"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { MultiDirectedGraph } from "graphology"
 import * as forceAtlas2 from "graphology-layout-forceatlas2"
 import type {
@@ -21,6 +21,7 @@ import {
 } from "react"
 import { useTranslation } from "react-i18next"
 import { useParams } from "react-router"
+import { NodeCircleProgram } from "sigma/rendering"
 import type { NodeHoverDrawingFunction } from "sigma/rendering"
 import type { SigmaEdgeEventPayload, SigmaNodeEventPayload } from "sigma/types"
 import "@react-sigma/core/lib/style.css"
@@ -151,6 +152,7 @@ export function KnowledgeBaseGraphPage() {
   const { knowledgeBaseId } = useParams()
   const { t } = useTranslation()
   const apiClient = useApiClient()
+  const queryClient = useQueryClient()
   const [selection, setSelection] = useState<GraphSelection | null>(null)
   const [focusStack, setFocusStack] = useState<string[]>([])
   const [knowledgeCheckOpen, setKnowledgeCheckOpen] = useState(false)
@@ -192,6 +194,33 @@ export function KnowledgeBaseGraphPage() {
       isActiveGraphInsightStatus(query.state.data?.status) ? 3000 : false,
     refetchIntervalInBackground: true,
   })
+  const refreshInsightsMutation = useMutation({
+    mutationFn: () =>
+      knowledgeBaseId === undefined
+        ? Promise.reject(new Error("Knowledge Base ID is required."))
+        : apiClient.refreshGraphInsights(knowledgeBaseId),
+    onSuccess: async () => {
+      if (knowledgeBaseId === undefined) {
+        return
+      }
+
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: adminQueryKeys.graph(knowledgeBaseId),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: adminQueryKeys.graphInsights(knowledgeBaseId),
+        }),
+      ])
+    },
+  })
+  const handleRefreshInsights = useCallback(() => {
+    if (knowledgeBaseId === undefined || refreshInsightsMutation.isPending) {
+      return
+    }
+
+    refreshInsightsMutation.mutate()
+  }, [knowledgeBaseId, refreshInsightsMutation])
 
   const graph = graphQuery.data
   const insights = collectInsights(insightsQuery.data)
@@ -301,10 +330,8 @@ export function KnowledgeBaseGraphPage() {
           insightStatus={insightStatus}
           insights={insights}
           isInsightsError={insightsQuery.isError}
-          onRefresh={() => {
-            void graphQuery.refetch()
-            void insightsQuery.refetch()
-          }}
+          isRefreshPending={refreshInsightsMutation.isPending}
+          onRefresh={handleRefreshInsights}
           onClearSelection={handleClearSelection}
           onDrillDown={(nodeId) =>
             setFocusStack((current) =>
@@ -336,6 +363,7 @@ function GraphWorkbenchDetail({
   insightStatus,
   insights,
   isInsightsError,
+  isRefreshPending,
   onRefresh,
   onClearSelection,
   onDrillDown,
@@ -353,6 +381,7 @@ function GraphWorkbenchDetail({
   insightStatus: GraphInsightStatus
   insights: GraphInsightItem[]
   isInsightsError: boolean
+  isRefreshPending: boolean
   onRefresh: () => void
   onClearSelection: () => void
   onDrillDown: (nodeId: string) => void
@@ -443,6 +472,7 @@ function GraphWorkbenchDetail({
         <div className="flex h-full min-h-0 flex-col">
           <GraphReadinessBanner
             isInsightsError={isInsightsError}
+            isRefreshPending={isRefreshPending}
             onRefresh={onRefresh}
             status={insightStatus}
           />
@@ -473,10 +503,12 @@ function GraphWorkbenchDetail({
 
 function GraphReadinessBanner({
   isInsightsError,
+  isRefreshPending,
   onRefresh,
   status,
 }: {
   isInsightsError: boolean
+  isRefreshPending: boolean
   onRefresh: () => void
   status: GraphInsightStatus
 }) {
@@ -542,7 +574,13 @@ function GraphReadinessBanner({
             </div>
           </AlertDescription>
         </div>
-        <Button onClick={onRefresh} size="sm" type="button" variant="outline">
+        <Button
+          disabled={isRefreshPending}
+          onClick={onRefresh}
+          size="sm"
+          type="button"
+          variant="outline"
+        >
           {t("action.retry")}
         </Button>
       </div>
@@ -659,6 +697,7 @@ function GraphCanvas({
           defaultEdgeColor: "#cbd5e1",
           defaultEdgeType: "arrow",
           defaultNodeColor: "#e2e8f0",
+          defaultNodeType: "circle",
           edgeLabelColor: { color: "#e5e7eb" },
           edgeLabelSize: 12,
           hideEdgesOnMove: false,
@@ -671,6 +710,12 @@ function GraphCanvas({
           renderEdgeLabels: true,
           stagePadding: 42,
           defaultDrawNodeHover: drawGraphNodeHover,
+          nodeProgramClasses: {
+            circle: NodeCircleProgram,
+          },
+          nodeHoverProgramClasses: {
+            circle: NodeCircleProgram,
+          },
           edgeReducer: (_edge, attributes) => reduceSigmaEdge(attributes),
           nodeReducer: (_node, attributes) => reduceSigmaNode(attributes),
         }}

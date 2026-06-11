@@ -4,8 +4,10 @@ import {
   type ExecutionContext,
   type NestInterceptor,
 } from "@nestjs/common";
+import { RedisConnection } from "bullmq";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { catchError, tap, throwError, type Observable } from "rxjs";
+import type { RuntimeConfig } from "@fococontext/core";
 
 type RuntimeApiOutcome = "success" | "error";
 
@@ -55,10 +57,71 @@ export interface RuntimeApiMetricSummary {
 
 const defaultWindowSeconds = 300;
 const maxRecords = 2_000;
-const runtimeApiMetricRecords: RuntimeApiMetricRecord[] = [];
+const runtimeApiMetricsKey = "fococontext:runtime-api-metrics";
+const runtimeApiMetricsKeyTtlSeconds = 24 * 60 * 60;
+
+export interface RuntimeApiMetricsStore {
+  readonly backend: "redis";
+  close?(): Promise<void>;
+  record(record: RuntimeApiMetricRecord): Promise<void>;
+  reset?(): Promise<void>;
+  snapshot(windowSeconds?: number, nowMs?: number): Promise<RuntimeApiMetricSummary>;
+}
+
+export const runtimeApiMetricsStoreToken = Symbol("runtimeApiMetricsStore");
+
+export function createRedisRuntimeApiMetricsStore(config: RuntimeConfig): RuntimeApiMetricsStore {
+  return new RedisRuntimeApiMetricsStore(config);
+}
+
+export class RedisRuntimeApiMetricsStore implements RuntimeApiMetricsStore {
+  readonly backend = "redis";
+
+  private readonly connection: RedisConnection;
+
+  constructor(config: RuntimeConfig) {
+    this.connection = new RedisConnection({
+      url: config.redis.url,
+    });
+  }
+
+  async record(record: RuntimeApiMetricRecord): Promise<void> {
+    const client = await this.connection.client;
+
+    await client.runCommand("rpush", [runtimeApiMetricsKey, JSON.stringify(record)]);
+    await client.runCommand("ltrim", [runtimeApiMetricsKey, String(-maxRecords), "-1"]);
+    await client.runCommand("expire", [
+      runtimeApiMetricsKey,
+      String(runtimeApiMetricsKeyTtlSeconds),
+    ]);
+  }
+
+  async snapshot(
+    windowSeconds = defaultWindowSeconds,
+    nowMs = Date.now(),
+  ): Promise<RuntimeApiMetricSummary> {
+    const client = await this.connection.client;
+    const values = await client.runCommand("lrange", [runtimeApiMetricsKey, "0", "-1"]);
+    const records = readMetricRecords(values);
+
+    return summarizeRuntimeApiMetrics(records, windowSeconds, nowMs);
+  }
+
+  async reset(): Promise<void> {
+    const client = await this.connection.client;
+
+    await client.runCommand("del", [runtimeApiMetricsKey]);
+  }
+
+  async close(): Promise<void> {
+    await this.connection.close();
+  }
+}
 
 @Injectable()
 export class RuntimeApiMetricsInterceptor implements NestInterceptor {
+  constructor(private readonly metricsStore: RuntimeApiMetricsStore) {}
+
   intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
     const request = context.switchToHttp().getRequest<FastifyRequest>();
     const response = context.switchToHttp().getResponse<FastifyReply>();
@@ -66,7 +129,7 @@ export class RuntimeApiMetricsInterceptor implements NestInterceptor {
 
     return next.handle().pipe(
       tap((body: unknown) => {
-        recordRuntimeApiMetricFromHttp({
+        this.recordMetricFromHttp({
           body,
           method: request.method,
           outcome: "success",
@@ -76,7 +139,7 @@ export class RuntimeApiMetricsInterceptor implements NestInterceptor {
         });
       }),
       catchError((error: unknown) => {
-        recordRuntimeApiMetricFromHttp({
+        this.recordMetricFromHttp({
           body: undefined,
           method: request.method,
           outcome: "error",
@@ -89,22 +152,35 @@ export class RuntimeApiMetricsInterceptor implements NestInterceptor {
       }),
     );
   }
+
+  private recordMetricFromHttp(input: {
+    body: unknown;
+    method: string | undefined;
+    outcome: RuntimeApiOutcome;
+    route: string | undefined;
+    statusCode: number | undefined;
+    startedAt: number;
+  }): void {
+    void this.metricsStore.record(createRuntimeApiMetricFromHttp(input)).catch((error: unknown) => {
+      console.warn("Runtime API metrics recording failed.", error);
+    });
+  }
 }
 
-export function recordRuntimeApiMetricFromHttp(input: {
+export function createRuntimeApiMetricFromHttp(input: {
   body: unknown;
   method: string | undefined;
   outcome: RuntimeApiOutcome;
   route: string | undefined;
   statusCode: number | undefined;
   startedAt: number;
-}): void {
+}): RuntimeApiMetricRecord {
   const latencyMs = Math.max(0, Date.now() - input.startedAt);
   const responseDetails = readResponseMetricDetails(input.body);
   const returnedCount = responseDetails.returnedCount;
   const pageSize = responseDetails.pageSize;
 
-  runtimeApiMetricRecords.push({
+  return {
     endpointGroup: toEndpointGroup(input.route),
     graphReadinessState: responseDetails.graphReadinessState,
     hasMore: responseDetails.hasMore,
@@ -120,19 +196,16 @@ export function recordRuntimeApiMetricFromHttp(input: {
     timestampMs: Date.now(),
     total: responseDetails.total,
     warningCodes: responseDetails.warningCodes,
-  });
-
-  if (runtimeApiMetricRecords.length > maxRecords) {
-    runtimeApiMetricRecords.splice(0, runtimeApiMetricRecords.length - maxRecords);
-  }
+  };
 }
 
-export function snapshotRuntimeApiMetrics(
+export function summarizeRuntimeApiMetrics(
+  inputRecords: readonly RuntimeApiMetricRecord[],
   windowSeconds = defaultWindowSeconds,
   nowMs = Date.now(),
 ): RuntimeApiMetricSummary {
   const cutoffMs = nowMs - windowSeconds * 1000;
-  const records = runtimeApiMetricRecords.filter((record) => record.timestampMs >= cutoffMs);
+  const records = inputRecords.filter((record) => record.timestampMs >= cutoffMs);
   const summary: RuntimeApiMetricSummary = {
     endpointGroups: {},
     listLatencyBuckets: {},
@@ -182,10 +255,6 @@ export function snapshotRuntimeApiMetrics(
   }
 
   return summary;
-}
-
-export function resetRuntimeApiMetrics(): void {
-  runtimeApiMetricRecords.splice(0, runtimeApiMetricRecords.length);
 }
 
 function createEmptyEndpointSummary(): RuntimeApiMetricEndpointSummary {
@@ -380,4 +449,48 @@ function readNonNegativeInteger(value: unknown): number | null {
 
 function increment(record: Record<string, number>, key: string): void {
   record[key] = (record[key] ?? 0) + 1;
+}
+
+function readMetricRecords(value: unknown): RuntimeApiMetricRecord[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item) => (typeof item === "string" ? safeParseMetricRecord(item) : null))
+    .filter((item): item is RuntimeApiMetricRecord => item !== null);
+}
+
+function safeParseMetricRecord(value: string): RuntimeApiMetricRecord | null {
+  try {
+    const parsed = JSON.parse(value);
+
+    return isRuntimeApiMetricRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function isRuntimeApiMetricRecord(value: unknown): value is RuntimeApiMetricRecord {
+  const record = readRecord(value);
+
+  return (
+    record !== null &&
+    typeof record.endpointGroup === "string" &&
+    (typeof record.graphReadinessState === "string" || record.graphReadinessState === null) &&
+    (typeof record.hasMore === "boolean" || record.hasMore === null) &&
+    typeof record.latencyBucket === "string" &&
+    typeof record.latencyMs === "number" &&
+    typeof record.method === "string" &&
+    (record.outcome === "success" || record.outcome === "error") &&
+    (typeof record.pageSize === "number" || record.pageSize === null) &&
+    (typeof record.pageSizeBucket === "string" || record.pageSizeBucket === null) &&
+    (typeof record.returnedCount === "number" || record.returnedCount === null) &&
+    (typeof record.returnedCountBucket === "string" || record.returnedCountBucket === null) &&
+    typeof record.statusCode === "number" &&
+    typeof record.timestampMs === "number" &&
+    (typeof record.total === "number" || record.total === null) &&
+    Array.isArray(record.warningCodes) &&
+    record.warningCodes.every((item) => typeof item === "string")
+  );
 }

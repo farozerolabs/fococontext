@@ -23,9 +23,7 @@ export function createRedisRuntimeQueuePressureRecorder(
   return new RedisRuntimeQueuePressureRecorder(config);
 }
 
-export const runtimeQueuePressureRecorderToken = Symbol("runtimeQueuePressureRecorder");
-
-export class RedisRuntimeQueuePressureRecorder implements RuntimeQueuePressureRecorder {
+class RedisRuntimeQueuePressureRecorder implements RuntimeQueuePressureRecorder {
   private readonly connection: RedisConnection;
 
   constructor(config: RuntimeConfig) {

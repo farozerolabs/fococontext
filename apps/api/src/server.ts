@@ -2,10 +2,6 @@ import { loadRuntimeConfig } from "@fococontext/core";
 import { createPostgresDatabase, seedDefaultIdentity } from "@fococontext/db";
 
 import { createPostgresApiDatabaseMirror } from "./database/api-database-mirror.js";
-import {
-  apiDatabaseHydratorToken,
-  createPostgresApiDatabaseHydrator,
-} from "./database/api-database-hydrator.js";
 import { createPostgresOperationalReadStore } from "./database/operational-read-store.js";
 import { createPostgresBoundedRetrievalRepository } from "./retrieve/postgres-bounded-retrieval-repository.js";
 import {
@@ -26,14 +22,11 @@ async function main(): Promise<void> {
   const app = await createApiApp(config, {
     apiKeyResolver: createPostgresApiKeyResolver(db),
     apiDatabaseMirror: createPostgresApiDatabaseMirror(db, identity),
-    apiDatabaseHydratorFactory: (repositories) =>
-      createPostgresApiDatabaseHydrator(db, repositories),
     boundedRetrievalRepository: createPostgresBoundedRetrievalRepository(db),
     operationalReadStore: createPostgresOperationalReadStore(db),
     defaultIdentity: identity,
     wikiStore: createPostgresWikiStore(db),
   });
-  await app.get(apiDatabaseHydratorToken).refresh();
 
   await app.listen(config.api.port, "0.0.0.0");
 }
