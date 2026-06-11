@@ -918,11 +918,10 @@ function createCandidateTraceSummaries(
 }
 
 function createRerankCandidateTextByPageId(
-  repository: RetrievalRepository,
-  knowledgeBaseId: string,
+  pages: readonly RetrievalPageRecord[],
 ): Map<string, string> {
   return new Map(
-    repository.listPages(knowledgeBaseId).map((page) => [
+    pages.map((page) => [
       page.page_id,
       [
         page.title,
@@ -1238,6 +1237,17 @@ interface NormalizedRetrieveInput {
 
 type OptimizedRetrievalTraceStage = "graph" | "lexical" | "semantic";
 
+interface RetrievalResultSet {
+  results: RetrievalResult[];
+  pages: RetrievalPageRecord[];
+}
+
+interface GraphExpansionSet {
+  expansions: GraphExpansion[];
+  pages: RetrievalPageRecord[];
+  edges: RetrievalEdgeRecord[];
+}
+
 function createOptimizedRetrievalStageMetadata(input: {
   bounded: boolean;
   durationMs: number;
@@ -1273,33 +1283,71 @@ function getOptimizedRetrievalQueryPath(
 
 export class RetrieveEngine {
   private readonly boundedRepository: BoundedRetrievalRepository | undefined;
-  private readonly lexicalService: LexicalRetrievalService;
-  private readonly semanticService: SemanticRetrievalService;
+  private readonly lexicalService: LexicalRetrievalService | undefined;
+  private readonly semanticService: SemanticRetrievalService | undefined;
   private readonly rankFusionService: RankFusionService;
-  private readonly graphExpansionService: GraphExpansionService;
+  private readonly graphExpansionService: GraphExpansionService | undefined;
   private readonly limits: RetrievalRuntimeLimits;
 
   constructor(
-    private readonly repository: RetrievalRepository,
+    private readonly repository: RetrievalRepository | undefined,
     private readonly embeddingProvider: RetrievalEmbeddingProvider,
     options: RetrieveEngineOptions = {},
   ) {
     this.boundedRepository = options.boundedRepository;
-    this.lexicalService = new LexicalRetrievalService(repository);
-    this.semanticService = new SemanticRetrievalService(repository, embeddingProvider);
+    this.lexicalService =
+      repository === undefined ? undefined : new LexicalRetrievalService(repository);
+    this.semanticService =
+      repository === undefined
+        ? undefined
+        : new SemanticRetrievalService(repository, embeddingProvider);
     this.rankFusionService = new RankFusionService(
       options.rerankProvider === undefined ? {} : { rerankProvider: options.rerankProvider },
     );
-    this.graphExpansionService = new GraphExpansionService(repository);
+    this.graphExpansionService =
+      repository === undefined ? undefined : new GraphExpansionService(repository);
     this.limits = {
       ...defaultRetrievalRuntimeLimits,
       ...options.limits,
     };
   }
 
-  private async searchLexical(input: LexicalSearchInput): Promise<RetrievalResult[]> {
+  private requireExecutionRepository(): RetrievalRepository {
+    if (this.repository === undefined) {
+      throw new Error("Retrieval execution repository is unavailable.");
+    }
+
+    return this.repository;
+  }
+
+  private async findTargetKnowledgeBaseType(
+    knowledgeBaseId: string,
+  ): Promise<RetrievalKnowledgeBaseScopeRecord["knowledge_base_type"]> {
+    if (this.boundedRepository !== undefined) {
+      return (
+        (await this.boundedRepository.findKnowledgeBaseScope(knowledgeBaseId))
+          ?.knowledge_base_type ?? "canonical"
+      );
+    }
+
+    return (
+      this.requireExecutionRepository().findKnowledgeBaseScope(knowledgeBaseId)
+        ?.knowledge_base_type ?? "canonical"
+    );
+  }
+
+  private async searchLexical(input: LexicalSearchInput): Promise<RetrievalResultSet> {
     if (this.boundedRepository === undefined) {
-      return this.lexicalService.search(input);
+      const repository = this.requireExecutionRepository();
+      const results = this.lexicalService?.search(input) ?? [];
+      const resultPageIds = new Set(results.map((result) => result.page_id));
+
+      return {
+        results,
+        pages: repository
+          .listPages(input.knowledge_base_id)
+          .filter((page) => resultPageIds.has(page.page_id)),
+      };
     }
 
     const candidates = await this.boundedRepository.searchLexicalCandidates({
@@ -1312,16 +1360,24 @@ export class RetrieveEngine {
       },
     });
 
-    for (const candidate of candidates) {
-      this.repository.upsertPage(candidate.page);
-    }
-
-    return candidates.map((candidate) => createLexicalRetrievalResult(candidate, input.query));
+    return {
+      results: candidates.map((candidate) => createLexicalRetrievalResult(candidate, input.query)),
+      pages: candidates.map((candidate) => candidate.page),
+    };
   }
 
-  private async searchSemantic(input: SemanticSearchInput): Promise<RetrievalResult[]> {
+  private async searchSemantic(input: SemanticSearchInput): Promise<RetrievalResultSet> {
     if (this.boundedRepository === undefined) {
-      return this.semanticService.search(input);
+      const repository = this.requireExecutionRepository();
+      const results = (await this.semanticService?.search(input)) ?? [];
+      const resultPageIds = new Set(results.map((result) => result.page_id));
+
+      return {
+        results,
+        pages: repository
+          .listPages(input.knowledge_base_id)
+          .filter((page) => resultPageIds.has(page.page_id)),
+      };
     }
 
     const queryEmbedding = await this.embeddingProvider.embed({
@@ -1338,17 +1394,30 @@ export class RetrieveEngine {
       },
     });
 
-    for (const candidate of candidates) {
-      this.repository.upsertPage(candidate.page);
-      this.repository.saveEmbedding(candidate.embedding);
-    }
-
-    return candidates.map(createSemanticRetrievalResult);
+    return {
+      results: candidates.map(createSemanticRetrievalResult),
+      pages: candidates.map((candidate) => candidate.page),
+    };
   }
 
-  private async expandGraph(input: GraphExpansionInput): Promise<GraphExpansion[]> {
+  private async expandGraph(input: GraphExpansionInput): Promise<GraphExpansionSet> {
     if (this.boundedRepository === undefined) {
-      return this.graphExpansionService.expand(input);
+      const repository = this.requireExecutionRepository();
+      const expansions = this.graphExpansionService?.expand(input) ?? [];
+      const pageIds = new Set([
+        ...input.seed_results.map((result) => result.page_id),
+        ...expansions.map((expansion) => expansion.to_page_id),
+      ]);
+
+      return {
+        expansions,
+        pages: repository
+          .listPages(input.knowledge_base_id)
+          .filter((page) => pageIds.has(page.page_id)),
+        edges: repository
+          .listEdges(input.knowledge_base_id)
+          .filter((edge) => expansions.some((expansion) => expansion.edge_id === edge.edge_id)),
+      };
     }
 
     const seedPageIds = uniqueStrings(input.seed_results.map((result) => result.page_id));
@@ -1361,21 +1430,25 @@ export class RetrieveEngine {
       ...(input.relation_types === undefined ? {} : { relation_types: input.relation_types }),
     });
 
-    for (const candidate of candidates) {
-      this.repository.upsertPage(candidate.source_page);
-      this.repository.upsertPage(candidate.target_page);
-      this.repository.upsertEdge(candidate.edge);
-    }
-
-    return toBoundedGraphExpansions(candidates, input.depth ?? 1);
+    return {
+      expansions: toBoundedGraphExpansions(candidates, input.depth ?? 1),
+      pages: [...createBoundedGraphPageMap(candidates).values()],
+      edges: uniqueEdges(candidates.map((candidate) => candidate.edge)),
+    };
   }
 
   private async seedSystemPages(input: {
     knowledgeBaseId: string;
     includeContextPack: boolean;
-  }): Promise<void> {
-    if (this.boundedRepository === undefined || !input.includeContextPack) {
-      return;
+  }): Promise<RetrievalPageRecord[]> {
+    if (!input.includeContextPack) {
+      return [];
+    }
+
+    if (this.boundedRepository === undefined) {
+      return this.requireExecutionRepository()
+        .listPages(input.knowledgeBaseId)
+        .filter((page) => page.is_system_page);
     }
 
     const candidates = await this.boundedRepository.listSystemPageCandidates({
@@ -1383,18 +1456,14 @@ export class RetrieveEngine {
       limit: 8,
     });
 
-    for (const candidate of candidates) {
-      this.repository.upsertPage(candidate.page);
-    }
+    return candidates.map((candidate) => candidate.page);
   }
 
   async retrieve(input: RetrieveInput): Promise<RetrieveResponse> {
     const mode = input.mode ?? "hybrid";
     const normalizedInput = normalizeRetrieveInput(input, this.limits);
     const topK = normalizedInput.top_k;
-    const targetKnowledgeBaseType =
-      this.repository.findKnowledgeBaseScope(input.knowledge_base_id)?.knowledge_base_type ??
-      "canonical";
+    const targetKnowledgeBaseType = await this.findTargetKnowledgeBaseType(input.knowledge_base_id);
     const stages: RetrievalTraceStage[] = [];
     const lexicalQuery = createLexicalQuery(input.query);
     const requestWarnings: string[] = [];
@@ -1434,8 +1503,11 @@ export class RetrieveEngine {
     }
 
     const lexicalStartedAt = Date.now();
-    const lexicalResults =
-      mode === "keyword" || mode === "hybrid" ? await this.searchLexical(lexicalInput) : [];
+    const lexicalSet =
+      mode === "keyword" || mode === "hybrid"
+        ? await this.searchLexical(lexicalInput)
+        : { results: [], pages: [] };
+    const lexicalResults = lexicalSet.results;
     const lexicalDurationMs = Date.now() - lexicalStartedAt;
 
     stages.push({
@@ -1467,18 +1539,22 @@ export class RetrieveEngine {
     const semanticRequested = mode === "semantic" || mode === "hybrid";
     const semanticIndexRecordCount =
       this.boundedRepository === undefined
-        ? this.repository.listEmbeddings(input.knowledge_base_id).length
+        ? this.requireExecutionRepository().listEmbeddings(input.knowledge_base_id).length
         : null;
     if (semanticRequested && semanticIndexRecordCount === 0) {
       requestWarnings.push("retrieve.index.semantic_not_ready");
     }
 
     let semanticResults: RetrievalResult[] = [];
+    let semanticPages: RetrievalPageRecord[] = [];
     let semanticIndexUnavailable = false;
     const semanticStartedAt = Date.now();
     if (semanticRequested) {
       try {
-        semanticResults = await this.searchSemantic(semanticInput);
+        const semanticSet = await this.searchSemantic(semanticInput);
+
+        semanticResults = semanticSet.results;
+        semanticPages = semanticSet.pages;
       } catch (error) {
         if (error instanceof BoundedRetrievalIndexUnavailableError) {
           semanticIndexUnavailable = true;
@@ -1526,8 +1602,7 @@ export class RetrieveEngine {
       lexical_results: mode === "semantic" ? [] : lexicalResults,
       semantic_results: mode === "keyword" ? [] : semanticResults,
       candidate_text_by_page_id: createRerankCandidateTextByPageId(
-        this.repository,
-        input.knowledge_base_id,
+        uniquePagesById([...lexicalSet.pages, ...semanticPages]),
       ),
       top_k: topK,
     });
@@ -1576,7 +1651,11 @@ export class RetrieveEngine {
     }
 
     const graphStartedAt = Date.now();
-    const graphExpansions = input.include_graph === false ? [] : await this.expandGraph(graphInput);
+    const graphSet =
+      input.include_graph === false
+        ? { expansions: [], pages: [], edges: [] }
+        : await this.expandGraph(graphInput);
+    const graphExpansions = graphSet.expansions;
     const graphDurationMs = Date.now() - graphStartedAt;
 
     stages.push({
@@ -1603,14 +1682,25 @@ export class RetrieveEngine {
     const expandableGraph =
       input.include_expand_hints === false
         ? null
-        : buildExpandableGraph(this.repository, results, graphExpansions, input);
-    await this.seedSystemPages({
+        : buildExpandableGraph(
+            uniquePagesById([...lexicalSet.pages, ...semanticPages, ...graphSet.pages]),
+            results,
+            graphExpansions,
+            input,
+          );
+    const systemPages = await this.seedSystemPages({
       knowledgeBaseId: input.knowledge_base_id,
       includeContextPack: input.include_context_pack === true,
     });
+    const contextPages = uniquePagesById([
+      ...systemPages,
+      ...lexicalSet.pages,
+      ...semanticPages,
+      ...graphSet.pages,
+    ]);
     const contextPack =
       input.include_context_pack === true
-        ? new ContextPackBuilder(this.repository).build({
+        ? new ContextPackBuilder(contextPages).build({
             knowledge_base_id: input.knowledge_base_id,
             results,
             graph_expansions: graphExpansions,
@@ -1802,8 +1892,6 @@ export class RetrieveEngine {
       created_at: new Date().toISOString(),
     };
 
-    await this.repository.saveTrace(trace);
-
     return trace;
   }
 }
@@ -1940,7 +2028,7 @@ export class RetrieveExpandEngine {
               {
                 page_id: page.page_id,
                 page_version_id: page.page_version_id,
-                source_refs: page.source_refs.map((source) => ({ ...source })),
+                source_refs: clonePageSourceRefs(page),
                 title: page.title,
                 type: page.type,
                 visibility_origin: page.visibility_origin ?? "canonical",
@@ -2014,15 +2102,6 @@ export class BoundedRetrieveExpandEngine {
     });
     const graphExpansions = toBoundedGraphExpansions(candidates, depth);
     const pagesById = createBoundedGraphPageMap(candidates);
-    const edgesById = new Map(
-      candidates.map((candidate) => [candidate.edge.edge_id, candidate.edge]),
-    );
-    const miniRepository = await createBoundedGraphRepository(
-      this.repository,
-      input.knowledge_base_id,
-      [...pagesById.values()],
-      [...edgesById.values()],
-    );
     const expandedResults = graphExpansions.flatMap((expansion) => {
       const page = pagesById.get(expansion.to_page_id);
 
@@ -2030,7 +2109,7 @@ export class BoundedRetrieveExpandEngine {
     });
     const contextPackDelta =
       input.include_context_pack === true
-        ? new ContextPackBuilder(miniRepository).build({
+        ? new ContextPackBuilder([...pagesById.values()]).build({
             knowledge_base_id: input.knowledge_base_id,
             results: expandedResults,
             graph_expansions: [],
@@ -2309,6 +2388,159 @@ export class BoundedGraphQueryService {
   }
 }
 
+export function createGraphInsightsFromRecords(input: {
+  knowledgeBaseId: string;
+  pages: readonly RetrievalPageRecord[];
+  edges: readonly RetrievalEdgeRecord[];
+  status?: GraphInsightStatus;
+}): GraphInsightsResponse {
+  const pageIds = new Set(input.pages.map((page) => page.page_id));
+  const pageById = new Map(input.pages.map((page) => [page.page_id, page]));
+  const visibleEdges = input.edges.filter(
+    (edge) => pageIds.has(edge.from_page_id) && pageIds.has(edge.to_page_id),
+  );
+  const signalContext = createGraphSignalContributionContext(input.pages, visibleEdges);
+  const degreeByPageId = new Map<string, number>();
+  const edgesByPageId = new Map<string, RetrievalEdgeRecord[]>();
+
+  for (const edge of visibleEdges) {
+    degreeByPageId.set(edge.from_page_id, (degreeByPageId.get(edge.from_page_id) ?? 0) + 1);
+    degreeByPageId.set(edge.to_page_id, (degreeByPageId.get(edge.to_page_id) ?? 0) + 1);
+    edgesByPageId.set(edge.from_page_id, [...(edgesByPageId.get(edge.from_page_id) ?? []), edge]);
+    edgesByPageId.set(edge.to_page_id, [...(edgesByPageId.get(edge.to_page_id) ?? []), edge]);
+  }
+
+  const communityAnalysis = detectGraphCommunities(input.pages, visibleEdges);
+  const isolatedPages = input.pages
+    .filter((page) => isGraphInsightPage(page))
+    .filter((page) => (degreeByPageId.get(page.page_id) ?? 0) === 0)
+    .map((page) =>
+      createGraphInsightItem({
+        insight_type: "isolated_page",
+        page_id: page.page_id,
+        title: page.title,
+        reason: "Page has no relationship evidence.",
+        reason_codes: ["isolated_page"],
+        severity: "medium",
+        score: 1,
+        evidence_refs: [
+          {
+            object_type: "wiki_page",
+            page_id: page.page_id,
+          },
+        ],
+      }),
+    );
+  const sparsePages = input.pages
+    .filter((page) => isGraphInsightPage(page))
+    .filter((page) => {
+      const degree = degreeByPageId.get(page.page_id) ?? 0;
+
+      return degree > 0 && degree < 2;
+    })
+    .map((page) => ({
+      ...createGraphInsightItem({
+        insight_type: "sparse_page" as const,
+        page_id: page.page_id,
+        title: page.title,
+        reason_codes: ["sparse_page"],
+        severity: "low",
+        score: 0.5,
+      }),
+      reason: "Page has fewer than two graph relationships.",
+    }));
+  const bridgePages = input.pages
+    .filter((page) => isGraphInsightPage(page))
+    .filter((page) => isBridgePage(page, communityAnalysis.assignments, edgesByPageId))
+    .map((page) => ({
+      ...createGraphInsightItem({
+        insight_type: "bridge_page",
+        page_id: page.page_id,
+        title: page.title,
+        reason_codes: ["bridge_page"],
+        severity: "low",
+        score: countNeighborCommunities(page.page_id, communityAnalysis.assignments, edgesByPageId),
+      }),
+      reasons: (edgesByPageId.get(page.page_id) ?? [])
+        .sort((left, right) => right.weight - left.weight)
+        .slice(0, 1)
+        .map(toGraphInsightReason),
+    }));
+  const sparseCommunityGaps = communityAnalysis.communities
+    .filter((community) => community.cohesion < 0.15 && community.memberIds.length >= 3)
+    .map((community) =>
+      createGraphInsightItem({
+        community: toGraphCommunityMetadata(community),
+        insight_type: "knowledge_gap",
+        page_ids: community.memberIds,
+        reason: "Community has weak internal graph cohesion.",
+        reason_codes: ["sparse_community"],
+        severity: "low",
+        score: Number((1 - community.cohesion).toFixed(4)),
+        title: `Sparse community: ${community.topPageTitles[0] ?? community.id}`,
+      }),
+    );
+  const bridgeGaps = bridgePages.map((item) => ({
+    ...item,
+    id: createStableGraphInsightId("knowledge_gap", item.page_id ?? "", "bridge"),
+    insight_type: "knowledge_gap" as const,
+    reason: "Page connects multiple graph communities.",
+    reason_codes: ["bridge_page"],
+  }));
+  const knowledgeGaps = [
+    ...isolatedPages.map((item) => ({
+      ...item,
+      id: createStableGraphInsightId("knowledge_gap", item.page_id ?? "", "isolated"),
+      insight_type: "knowledge_gap" as const,
+      reason: "Page has no relationship evidence.",
+      reason_codes: ["isolated_page"],
+    })),
+    ...sparseCommunityGaps,
+    ...bridgeGaps,
+  ];
+  const communities = communityAnalysis.communities
+    .filter((community) => community.memberIds.length >= 2)
+    .map((community) =>
+      createGraphInsightItem({
+        community: toGraphCommunityMetadata(community),
+        insight_type: "community",
+        page_ids: community.memberIds,
+        reason: "Connected pages share graph relationships.",
+        reason_codes: ["community"],
+        score: community.cohesion,
+        title: community.topPageTitles[0] ?? community.id,
+      }),
+    );
+  const surprisingConnections = findSurprisingGraphConnections(
+    visibleEdges,
+    pageById,
+    degreeByPageId,
+    communityAnalysis.assignments,
+    signalContext,
+  );
+  const snapshot = createGraphInsightSnapshot(input.pages, visibleEdges);
+
+  return {
+    knowledge_base_id: input.knowledgeBaseId,
+    status: input.status ?? createReadyGraphInsightStatus(),
+    snapshot,
+    empty_reasons: createGraphInsightEmptyReasons({
+      bridge_pages: bridgePages,
+      communities,
+      isolated_pages: isolatedPages,
+      knowledge_gaps: knowledgeGaps,
+      sparse_pages: sparsePages,
+      surprising_connections: surprisingConnections,
+    }),
+    isolated_pages: isolatedPages,
+    sparse_pages: sparsePages,
+    bridge_pages: bridgePages,
+    knowledge_gaps: knowledgeGaps,
+    communities,
+    surprising_connections: surprisingConnections,
+  };
+}
+
 export class GraphQueryService {
   constructor(private readonly repository: RetrievalRepository) {}
 
@@ -2356,7 +2588,7 @@ export class GraphQueryService {
         {
           page_id: page.page_id,
           page_version_id: page.page_version_id,
-          source_refs: page.source_refs.map((source) => ({ ...source })),
+          source_refs: clonePageSourceRefs(page),
           title: page.title,
           type: page.type,
           visibility_origin: page.visibility_origin ?? "canonical",
@@ -2393,155 +2625,19 @@ export class GraphQueryService {
 
   insights(knowledgeBaseId: string): GraphInsightsResponse {
     const pages = this.repository.listPages(knowledgeBaseId);
-    const pageIds = new Set(pages.map((page) => page.page_id));
-    const pageById = new Map(pages.map((page) => [page.page_id, page]));
     const edges = this.repository
       .listEdges(knowledgeBaseId)
-      .filter((edge) => pageIds.has(edge.from_page_id) && pageIds.has(edge.to_page_id));
-    const signalContext = createGraphSignalContributionContext(pages, edges);
-    const degreeByPageId = new Map<string, number>();
-    const edgesByPageId = new Map<string, RetrievalEdgeRecord[]>();
-
-    for (const edge of edges) {
-      degreeByPageId.set(edge.from_page_id, (degreeByPageId.get(edge.from_page_id) ?? 0) + 1);
-      degreeByPageId.set(edge.to_page_id, (degreeByPageId.get(edge.to_page_id) ?? 0) + 1);
-      edgesByPageId.set(edge.from_page_id, [...(edgesByPageId.get(edge.from_page_id) ?? []), edge]);
-      edgesByPageId.set(edge.to_page_id, [...(edgesByPageId.get(edge.to_page_id) ?? []), edge]);
-    }
-
-    const communityAnalysis = detectGraphCommunities(pages, edges);
-    const isolatedPages = pages
-      .filter((page) => isGraphInsightPage(page))
-      .filter((page) => (degreeByPageId.get(page.page_id) ?? 0) === 0)
-      .map((page) =>
-        createGraphInsightItem({
-          insight_type: "isolated_page",
-          page_id: page.page_id,
-          title: page.title,
-          reason: "Page has no relationship evidence.",
-          reason_codes: ["isolated_page"],
-          severity: "medium",
-          score: 1,
-          evidence_refs: [
-            {
-              object_type: "wiki_page",
-              page_id: page.page_id,
-            },
-          ],
-        }),
+      .filter(
+        (edge) =>
+          pages.some((page) => page.page_id === edge.from_page_id) &&
+          pages.some((page) => page.page_id === edge.to_page_id),
       );
-    const sparsePages = pages
-      .filter((page) => isGraphInsightPage(page))
-      .filter((page) => {
-        const degree = degreeByPageId.get(page.page_id) ?? 0;
 
-        return degree > 0 && degree < 2;
-      })
-      .map((page) => ({
-        ...createGraphInsightItem({
-          insight_type: "sparse_page" as const,
-          page_id: page.page_id,
-          title: page.title,
-          reason_codes: ["sparse_page"],
-          severity: "low",
-          score: 0.5,
-        }),
-        reason: "Page has fewer than two graph relationships.",
-      }));
-    const bridgePages = pages
-      .filter((page) => isGraphInsightPage(page))
-      .filter((page) => isBridgePage(page, communityAnalysis.assignments, edgesByPageId))
-      .map((page) => ({
-        ...createGraphInsightItem({
-          insight_type: "bridge_page",
-          page_id: page.page_id,
-          title: page.title,
-          reason_codes: ["bridge_page"],
-          severity: "low",
-          score: countNeighborCommunities(
-            page.page_id,
-            communityAnalysis.assignments,
-            edgesByPageId,
-          ),
-        }),
-        reasons: (edgesByPageId.get(page.page_id) ?? [])
-          .sort((left, right) => right.weight - left.weight)
-          .slice(0, 1)
-          .map(toGraphInsightReason),
-      }));
-    const sparseCommunityGaps = communityAnalysis.communities
-      .filter((community) => community.cohesion < 0.15 && community.memberIds.length >= 3)
-      .map((community) =>
-        createGraphInsightItem({
-          community: toGraphCommunityMetadata(community),
-          insight_type: "knowledge_gap",
-          page_ids: community.memberIds,
-          reason: "Community has weak internal graph cohesion.",
-          reason_codes: ["sparse_community"],
-          severity: "low",
-          score: Number((1 - community.cohesion).toFixed(4)),
-          title: `Sparse community: ${community.topPageTitles[0] ?? community.id}`,
-        }),
-      );
-    const bridgeGaps = bridgePages.map((item) => ({
-      ...item,
-      id: createStableGraphInsightId("knowledge_gap", item.page_id ?? "", "bridge"),
-      insight_type: "knowledge_gap" as const,
-      reason: "Page connects multiple graph communities.",
-      reason_codes: ["bridge_page"],
-    }));
-    const knowledgeGaps = [
-      ...isolatedPages.map((item) => ({
-        ...item,
-        id: createStableGraphInsightId("knowledge_gap", item.page_id ?? "", "isolated"),
-        insight_type: "knowledge_gap" as const,
-        reason: "Page has no relationship evidence.",
-        reason_codes: ["isolated_page"],
-      })),
-      ...sparseCommunityGaps,
-      ...bridgeGaps,
-    ];
-    const communities = communityAnalysis.communities
-      .filter((community) => community.memberIds.length >= 2)
-      .map((community) =>
-        createGraphInsightItem({
-          community: toGraphCommunityMetadata(community),
-          insight_type: "community",
-          page_ids: community.memberIds,
-          reason: "Connected pages share graph relationships.",
-          reason_codes: ["community"],
-          score: community.cohesion,
-          title: community.topPageTitles[0] ?? community.id,
-        }),
-      );
-    const surprisingConnections = findSurprisingGraphConnections(
+    return createGraphInsightsFromRecords({
+      knowledgeBaseId,
+      pages,
       edges,
-      pageById,
-      degreeByPageId,
-      communityAnalysis.assignments,
-      signalContext,
-    );
-    const snapshot = createGraphInsightSnapshot(pages, edges);
-
-    return {
-      knowledge_base_id: knowledgeBaseId,
-      status: createReadyGraphInsightStatus(),
-      snapshot,
-      empty_reasons: createGraphInsightEmptyReasons({
-        bridge_pages: bridgePages,
-        communities,
-        isolated_pages: isolatedPages,
-        knowledge_gaps: knowledgeGaps,
-        sparse_pages: sparsePages,
-        surprising_connections: surprisingConnections,
-      }),
-      isolated_pages: isolatedPages,
-      sparse_pages: sparsePages,
-      bridge_pages: bridgePages,
-      knowledge_gaps: knowledgeGaps,
-      communities,
-      surprising_connections: surprisingConnections,
-    };
+    });
   }
 }
 
@@ -2639,11 +2735,13 @@ export interface BuildContextPackInput {
   budget_tokens: number;
 }
 
+type ContextPackPageSource = RetrievalRepository | readonly RetrievalPageRecord[];
+
 export class ContextPackBuilder {
-  constructor(private readonly repository: RetrievalRepository) {}
+  constructor(private readonly pageSource: ContextPackPageSource) {}
 
   build(input: BuildContextPackInput): ContextPack {
-    const visiblePages = this.repository.listPages(input.knowledge_base_id);
+    const visiblePages = listContextPackPages(this.pageSource, input.knowledge_base_id);
     const visiblePagesById = new Map(visiblePages.map((page) => [page.page_id, page]));
     const systemPages = visiblePages.filter((page) => page.is_system_page);
     const sortedResults = sortResultsForContext(input.results);
@@ -2798,8 +2896,20 @@ export class ContextPackBuilder {
   }
 }
 
-export function createRequestLocalRetrievalRepository(): RetrievalRepository {
-  return new RequestLocalRetrievalRepository();
+function listContextPackPages(
+  pageSource: ContextPackPageSource,
+  knowledgeBaseId: string,
+): RetrievalPageRecord[] {
+  const pages: readonly RetrievalPageRecord[] =
+    typeof (pageSource as RetrievalRepository).listPages === "function"
+      ? (pageSource as RetrievalRepository).listPages(knowledgeBaseId)
+      : (pageSource as readonly RetrievalPageRecord[]);
+
+  return pages.filter((page) => page.knowledge_base_id === knowledgeBaseId).map(clonePage);
+}
+
+export function createBoundedRetrievalExecutionContext(): RetrievalRepository {
+  return new BoundedRetrievalExecutionContext();
 }
 
 interface LexicalCandidate {
@@ -2883,7 +2993,7 @@ function normalizeVisibleEmbedding(
   };
 }
 
-class RequestLocalRetrievalRepository implements RetrievalRepository {
+class BoundedRetrievalExecutionContext implements RetrievalRepository {
   private readonly scopes = new Map<string, RetrievalKnowledgeBaseScopeRecord>();
   private readonly pages = new Map<string, RetrievalPageRecord>();
   private readonly edges = new Map<string, RetrievalEdgeRecord>();
@@ -4089,42 +4199,13 @@ function createBoundedGraphPageMap(
   return pagesById;
 }
 
-async function createBoundedGraphRepository(
-  boundedRepository: BoundedRetrievalRepository,
-  knowledgeBaseId: string,
-  pages: readonly RetrievalPageRecord[],
-  edges: readonly RetrievalEdgeRecord[],
-): Promise<RetrievalRepository> {
-  const repository = createRequestLocalRetrievalRepository();
-  const scope = await boundedRepository.findKnowledgeBaseScope(knowledgeBaseId);
-
-  repository.upsertKnowledgeBaseScope(
-    scope ?? {
-      knowledge_base_id: knowledgeBaseId,
-      knowledge_base_type: "canonical",
-      upstream_knowledge_base_id: null,
-      upstream_synced_version_id: null,
-    },
-  );
-
-  for (const page of pages) {
-    repository.upsertPage(page);
-  }
-
-  for (const edge of edges) {
-    repository.upsertEdge(edge);
-  }
-
-  return repository;
-}
-
 function toExpandableGraphNode(page: RetrievalPageRecord): ExpandableGraphNode {
   const displayMetadata = createDisplayMetadata(page);
 
   return {
     page_id: page.page_id,
     page_version_id: page.page_version_id,
-    source_refs: page.source_refs.map((source) => ({ ...source })),
+    source_refs: clonePageSourceRefs(page),
     title: page.title,
     type: page.type,
     ...(displayMetadata === undefined ? {} : { display_metadata: displayMetadata }),
@@ -4867,7 +4948,7 @@ function clampPositiveInteger(
 }
 
 function buildExpandableGraph(
-  repository: RetrievalRepository,
+  pages: readonly RetrievalPageRecord[],
   results: readonly RetrievalResult[],
   graphExpansions: readonly GraphExpansion[],
   input: RetrieveInput,
@@ -4877,7 +4958,9 @@ function buildExpandableGraph(
     ...new Set([...seedPageIds, ...graphExpansions.map((item) => item.to_page_id)]),
   ];
   const visiblePagesById = new Map(
-    repository.listPages(input.knowledge_base_id).map((page) => [page.page_id, page]),
+    pages
+      .filter((page) => page.knowledge_base_id === input.knowledge_base_id)
+      .map((page) => [page.page_id, page]),
   );
   const nodes = nodePageIds.flatMap((pageId) => {
     const page = visiblePagesById.get(pageId);
@@ -4892,7 +4975,7 @@ function buildExpandableGraph(
       {
         page_id: page.page_id,
         page_version_id: page.page_version_id,
-        source_refs: page.source_refs.map((source) => ({ ...source })),
+        source_refs: clonePageSourceRefs(page),
         title: page.title,
         type: page.type,
         ...(displayMetadata === undefined ? {} : { display_metadata: displayMetadata }),
@@ -4938,6 +5021,18 @@ function uniqueResultsByPage(results: readonly RetrievalResult[]): RetrievalResu
   }
 
   return uniqueResults;
+}
+
+function uniquePagesById(pages: readonly RetrievalPageRecord[]): RetrievalPageRecord[] {
+  const pagesById = new Map<string, RetrievalPageRecord>();
+
+  for (const page of pages) {
+    if (!pagesById.has(page.page_id)) {
+      pagesById.set(page.page_id, page);
+    }
+  }
+
+  return [...pagesById.values()];
 }
 
 function summarizeRetrieveVisibility(input: {
@@ -7620,10 +7715,19 @@ function normalized(value: string): string {
   return value.toLowerCase();
 }
 
+function clonePageSourceRefs(page: RetrievalPageRecord): RetrievalSourceRef[] {
+  const visibilityOrigin = page.visibility_origin ?? "canonical";
+
+  return page.source_refs.map((source) => ({
+    ...source,
+    visibility_origin: source.visibility_origin ?? visibilityOrigin,
+  }));
+}
+
 function clonePage(page: RetrievalPageRecord): RetrievalPageRecord {
   return {
     ...page,
-    source_refs: page.source_refs.map((source) => ({ ...source })),
+    source_refs: clonePageSourceRefs(page),
     ...(page.frontmatter === undefined
       ? {}
       : { frontmatter: JSON.parse(JSON.stringify(page.frontmatter)) as Record<string, unknown> }),

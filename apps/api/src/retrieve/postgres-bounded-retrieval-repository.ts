@@ -22,6 +22,7 @@ import {
   type RetrievalEmbeddingRecord,
   type RetrievalEdgeRecord,
   type RetrievalKnowledgeBaseScopeRecord,
+  type RetrievalMediaEvidence,
   type RetrievalPageRecord,
   type RetrievalRelationType,
   type RetrievalSourceRef,
@@ -51,6 +52,14 @@ interface SourceDocumentMetadataRow {
   id: string;
   metadata: unknown;
   name: string;
+}
+
+interface SystemPageCandidateRow {
+  id: string;
+  knowledge_base_id: string;
+  system_key: string;
+  title: string;
+  markdown: string;
 }
 
 interface SemanticCandidateRow extends SearchablePageRow {
@@ -302,24 +311,83 @@ class PostgresBoundedRetrievalRepository implements BoundedRetrievalRepository {
   }
 
   async listSystemPageCandidates(
-    _input: BoundedSystemPageCandidateInput,
+    input: BoundedSystemPageCandidateInput,
   ): Promise<readonly BoundedSystemPageCandidate[]> {
-    void _input;
-    return [];
+    const systemPageKeys = input.system_page_keys ?? [];
+    const keyCondition =
+      systemPageKeys.length === 0 ? sql`true` : sql`system_key = any(${systemPageKeys})`;
+    const result = await sql<SystemPageCandidateRow>`
+      select
+        id,
+        knowledge_base_id,
+        system_key,
+        title,
+        markdown
+      from system_pages
+      where knowledge_base_id = ${input.knowledge_base_id}
+        and ${keyCondition}
+      order by updated_at desc, id desc
+      limit ${normalizeLimit(input.limit)}
+    `.execute(this.db);
+
+    return result.rows.map((row, index) => ({
+      page: toSystemRetrievalPageRecord(row),
+      rank: index + 1,
+      reason: "system_page",
+    }));
   }
 
   async listCitationCandidates(
-    _input: BoundedCitationCandidateInput,
+    input: BoundedCitationCandidateInput,
   ): Promise<readonly BoundedCitationCandidate[]> {
-    void _input;
-    return [];
+    const pages = await this.loadVisiblePagesByIds(input.knowledge_base_id, input.page_ids);
+    const allowedPageVersionIds =
+      input.page_version_ids === undefined ? null : new Set(input.page_version_ids);
+
+    return pages
+      .filter(
+        (page) => allowedPageVersionIds === null || allowedPageVersionIds.has(page.page_version_id),
+      )
+      .flatMap((page) =>
+        page.source_refs.map((sourceRef) => ({
+          page_id: page.page_id,
+          page_version_id: page.page_version_id,
+          source_ref: sourceRef,
+        })),
+      )
+      .slice(0, normalizeLimit(input.limit));
   }
 
   async listMediaEvidenceCandidates(
-    _input: BoundedMediaEvidenceCandidateInput,
+    input: BoundedMediaEvidenceCandidateInput,
   ): Promise<readonly BoundedMediaEvidenceCandidate[]> {
-    void _input;
-    return [];
+    const pages = await this.loadVisiblePagesByIds(input.knowledge_base_id, input.page_ids);
+    const sourceDocumentIds =
+      input.source_document_ids === undefined ? null : new Set(input.source_document_ids);
+
+    return pages
+      .flatMap((page) =>
+        page.source_refs.flatMap((sourceRef) => {
+          if (sourceDocumentIds !== null && !sourceDocumentIds.has(sourceRef.document_id)) {
+            return [];
+          }
+
+          const mediaEvidence = toRetrievalMediaEvidence(sourceRef);
+
+          if (mediaEvidence === null) {
+            return [];
+          }
+
+          return [
+            {
+              media_evidence: mediaEvidence,
+              page_id: page.page_id,
+              page_version_id: page.page_version_id,
+            },
+          ];
+        }),
+      )
+      .slice(0, normalizeLimit(input.limit));
   }
 
   async saveTrace(record: RetrievalTraceRecord): Promise<void> {
@@ -478,6 +546,142 @@ class PostgresBoundedRetrievalRepository implements BoundedRetrievalRepository {
         and ${searchCondition}
       order by updated_at desc, id desc
       limit ${candidateLimit}
+    `.execute(this.db);
+
+    return result.rows;
+  }
+
+  private async loadVisiblePagesByIds(
+    knowledgeBaseId: string,
+    pageIds: readonly string[],
+  ): Promise<RetrievalPageRecord[]> {
+    const normalizedPageIds = uniqueStrings(pageIds).filter((pageId) => pageId.length > 0);
+
+    if (normalizedPageIds.length === 0) {
+      return [];
+    }
+
+    const scope = await this.findKnowledgeBaseScope(knowledgeBaseId);
+
+    if (scope === undefined) {
+      return [];
+    }
+
+    const rows = await this.selectVisiblePageRowsByIds(knowledgeBaseId, normalizedPageIds, scope);
+    const sourceMetadata = await this.loadSourceDocumentMetadata(collectSourceDocumentIds(rows));
+
+    return rows.map((row) => toRetrievalPageRecord(row, sourceMetadata));
+  }
+
+  private async selectVisiblePageRowsByIds(
+    knowledgeBaseId: string,
+    pageIds: readonly string[],
+    scope: RetrievalKnowledgeBaseScopeRecord,
+  ): Promise<SearchablePageRow[]> {
+    const pageIdArray = formatTextArray(pageIds);
+
+    if (scope.knowledge_base_type === "fork" && scope.upstream_knowledge_base_id !== null) {
+      const result = await sql<SearchablePageRow>`
+        with fork_page_tombstones as (
+          select upstream_resource_id
+          from wiki_pages
+          where owner_knowledge_base_id = ${knowledgeBaseId}
+            and fork_tombstoned_at is not null
+            and upstream_resource_id is not null
+        ),
+        visible_pages as (
+          select
+            wiki_pages.id,
+            ${knowledgeBaseId}::text as knowledge_base_id,
+            wiki_pages.slug,
+            wiki_pages.title,
+            wiki_pages.page_type as "type",
+            wiki_pages.current_version_id,
+            wiki_pages.markdown,
+            wiki_pages.frontmatter,
+            wiki_pages.source_document_ids,
+            coalesce(current_page_version.source_snapshot, '[]'::jsonb) as source_refs,
+            wiki_pages.metadata,
+            'upstream_inherited'::text as visibility_origin,
+            ${knowledgeBaseId}::text as owner_knowledge_base_id,
+            wiki_pages.id as upstream_resource_id,
+            null::timestamptz as fork_tombstoned_at,
+            wiki_pages.updated_at
+          from wiki_pages
+          left join wiki_page_versions current_page_version
+            on current_page_version.id = wiki_pages.current_version_id
+          where wiki_pages.knowledge_base_id = ${scope.upstream_knowledge_base_id}
+            and wiki_pages.owner_knowledge_base_id is null
+            and wiki_pages.deleted_at is null
+            and wiki_pages.fork_tombstoned_at is null
+            and not exists (
+              select 1
+              from fork_page_tombstones
+              where fork_page_tombstones.upstream_resource_id = wiki_pages.id
+            )
+          union all
+          select
+            wiki_pages.id,
+            ${knowledgeBaseId}::text as knowledge_base_id,
+            wiki_pages.slug,
+            wiki_pages.title,
+            wiki_pages.page_type as "type",
+            wiki_pages.current_version_id,
+            wiki_pages.markdown,
+            wiki_pages.frontmatter,
+            wiki_pages.source_document_ids,
+            coalesce(current_page_version.source_snapshot, '[]'::jsonb) as source_refs,
+            wiki_pages.metadata,
+            'fork_owned'::text as visibility_origin,
+            ${knowledgeBaseId}::text as owner_knowledge_base_id,
+            wiki_pages.upstream_resource_id,
+            wiki_pages.fork_tombstoned_at,
+            wiki_pages.updated_at
+          from wiki_pages
+          left join wiki_page_versions current_page_version
+            on current_page_version.id = wiki_pages.current_version_id
+          where (wiki_pages.knowledge_base_id = ${knowledgeBaseId}
+              or wiki_pages.owner_knowledge_base_id = ${knowledgeBaseId})
+            and wiki_pages.deleted_at is null
+            and wiki_pages.fork_tombstoned_at is null
+        )
+        select *
+        from visible_pages
+        where id = any(${pageIds})
+        order by array_position(${pageIdArray}, id), updated_at desc, id desc
+        limit ${Math.max(1, Math.min(pageIds.length, 500))}
+      `.execute(this.db);
+
+      return result.rows;
+    }
+
+    const result = await sql<SearchablePageRow>`
+      select
+        wiki_pages.id,
+        wiki_pages.knowledge_base_id,
+        wiki_pages.slug,
+        wiki_pages.title,
+        wiki_pages.page_type as "type",
+        wiki_pages.current_version_id,
+        wiki_pages.markdown,
+        wiki_pages.frontmatter,
+        wiki_pages.source_document_ids,
+        coalesce(current_page_version.source_snapshot, '[]'::jsonb) as source_refs,
+        wiki_pages.metadata,
+        'canonical'::text as visibility_origin,
+        null::text as owner_knowledge_base_id,
+        null::text as upstream_resource_id,
+        null::timestamptz as fork_tombstoned_at
+      from wiki_pages
+      left join wiki_page_versions current_page_version
+        on current_page_version.id = wiki_pages.current_version_id
+      where wiki_pages.knowledge_base_id = ${knowledgeBaseId}
+        and wiki_pages.id = any(${pageIds})
+        and wiki_pages.owner_knowledge_base_id is null
+        and wiki_pages.fork_tombstoned_at is null
+        and wiki_pages.deleted_at is null
+      order by array_position(${pageIdArray}, wiki_pages.id), wiki_pages.updated_at desc, wiki_pages.id desc
+      limit ${Math.max(1, Math.min(pageIds.length, 500))}
     `.execute(this.db);
 
     return result.rows;
@@ -1131,6 +1335,10 @@ function normalizeCandidateLimit(value: number): number {
   return Math.max(50, Math.min(normalizeLimit(value) * 25, 500));
 }
 
+function uniqueStrings(values: readonly string[]): string[] {
+  return [...new Set(values)];
+}
+
 function normalizeGraphDepth(value: number): number {
   return Math.max(1, Math.min(Math.trunc(value), 5));
 }
@@ -1196,6 +1404,26 @@ function toRetrievalPageRecord(
     owner_knowledge_base_id: row.owner_knowledge_base_id,
     upstream_resource_id: row.upstream_resource_id,
     fork_tombstoned_at: row.fork_tombstoned_at,
+  };
+}
+
+function toSystemRetrievalPageRecord(row: SystemPageCandidateRow): RetrievalPageRecord {
+  return {
+    knowledge_base_id: row.knowledge_base_id,
+    page_id: row.id,
+    page_version_id: row.id,
+    title: row.title,
+    type: "system",
+    markdown: row.markdown,
+    frontmatter: {},
+    is_system_page: true,
+    system_page_key: row.system_key,
+    source_refs: [],
+    metadata: {},
+    visibility_origin: "canonical",
+    owner_knowledge_base_id: null,
+    upstream_resource_id: null,
+    fork_tombstoned_at: null,
   };
 }
 
@@ -1361,6 +1589,10 @@ function toRetrievalSourceRef(value: Record<string, unknown>): RetrievalSourceRe
   const warningCodes = readStringArray(value.warning_codes);
   const mediaAssetId = readString(value.media_asset_id);
   const evidenceKind = readEvidenceKind(value.evidence_kind);
+  const name = readString(value.name);
+  const summary = readString(value.summary);
+  const virtualPath = readString(value.virtual_path);
+  const visibilityOrigin = readVisibilityOrigin(value.visibility_origin);
 
   if (parsedContentId !== null) {
     sourceRef.parsed_content_id = parsedContentId;
@@ -1379,8 +1611,50 @@ function toRetrievalSourceRef(value: Record<string, unknown>): RetrievalSourceRe
   if (evidenceKind !== null) {
     sourceRef.evidence_kind = evidenceKind;
   }
+  if (name !== null) {
+    sourceRef.name = name;
+  }
+  if (summary !== null) {
+    sourceRef.summary = summary;
+  }
+  if (virtualPath !== null) {
+    sourceRef.virtual_path = virtualPath;
+  }
+  if (visibilityOrigin !== null) {
+    sourceRef.visibility_origin = visibilityOrigin;
+  }
 
   return [sourceRef];
+}
+
+function toRetrievalMediaEvidence(source: RetrievalSourceRef): RetrievalMediaEvidence | null {
+  if (source.media_asset_id === undefined || source.evidence_kind !== "image_caption") {
+    return null;
+  }
+
+  const locatorStatus =
+    source.locator_status ?? (source.locator === undefined ? "not_provided" : "not_found");
+
+  return {
+    document_id: source.document_id,
+    ...(source.parsed_content_id === undefined
+      ? {}
+      : { parsed_content_id: source.parsed_content_id }),
+    ...(source.source_anchor_id === undefined ? {} : { source_anchor_id: source.source_anchor_id }),
+    ...(source.locator === undefined ? {} : { locator: source.locator }),
+    locator_status: locatorStatus,
+    warning_codes: source.warning_codes ?? [],
+    media_asset_id: source.media_asset_id,
+    evidence_kind: "image_caption",
+    ...(source.summary === undefined ? {} : { caption: source.summary }),
+    ...(source.visibility_origin === undefined || source.visibility_origin === "canonical"
+      ? {}
+      : { visibility_origin: source.visibility_origin }),
+    preview: {
+      available: true,
+      endpoint: `/v1/media-assets/${source.media_asset_id}/preview`,
+    },
+  };
 }
 
 function normalizeSourceRefWarningCodes(
@@ -1437,6 +1711,12 @@ function readLocatorStatus(value: unknown): RetrievalCitationLocatorStatus | nul
 
 function readEvidenceKind(value: unknown): "text" | "image_caption" | "ocr" | null {
   return value === "text" || value === "image_caption" || value === "ocr" ? value : null;
+}
+
+function readVisibilityOrigin(value: unknown): RetrievalVisibilityOrigin | null {
+  return value === "canonical" || value === "upstream_inherited" || value === "fork_owned"
+    ? value
+    : null;
 }
 
 function readEmbeddingObjectType(value: unknown): RetrievalEmbeddingObjectType | null {

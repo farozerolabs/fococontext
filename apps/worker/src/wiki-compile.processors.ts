@@ -22,8 +22,7 @@ import {
   resolveDatasetPromptTemplateFromSnapshot,
 } from "@fococontext/llm";
 import {
-  GraphQueryService,
-  createRequestLocalRetrievalRepository,
+  createGraphInsightsFromRecords,
   type GraphInsightsResponse,
   type RetrievalRelationType,
   type RetrievalVisibilityOrigin,
@@ -2911,48 +2910,14 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     knowledgeBaseId: string,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
   ): Promise<GraphInsightsResponse> {
-    const repository = createRequestLocalRetrievalRepository();
-    const scope = await this.loadGraphInsightKnowledgeBaseScope(knowledgeBaseId, db);
-
-    repository.upsertKnowledgeBaseScope(scope);
-
     const pages = await this.listGraphInsightPages(knowledgeBaseId, db);
     const edges = await this.listGraphInsightEdges(knowledgeBaseId, db);
 
-    for (const page of pages) {
-      repository.upsertPage(page);
-    }
-
-    for (const edge of edges) {
-      repository.upsertEdge(edge);
-    }
-
-    return new GraphQueryService(repository).insights(knowledgeBaseId);
-  }
-
-  private async loadGraphInsightKnowledgeBaseScope(
-    knowledgeBaseId: string,
-    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
-  ) {
-    const result = await sql<{
-      id: string;
-      knowledge_base_type: string;
-      upstream_knowledge_base_id: string | null;
-      upstream_synced_version_id: string | null;
-    }>`
-      select id, knowledge_base_type, upstream_knowledge_base_id, upstream_synced_version_id
-      from knowledge_bases
-      where id = ${knowledgeBaseId}
-      limit 1
-    `.execute(db);
-    const row = result.rows[0];
-
-    return {
-      knowledge_base_id: knowledgeBaseId,
-      knowledge_base_type: row?.knowledge_base_type === "fork" ? "fork" : "canonical",
-      upstream_knowledge_base_id: row?.upstream_knowledge_base_id ?? null,
-      upstream_synced_version_id: row?.upstream_synced_version_id ?? null,
-    } as const;
+    return createGraphInsightsFromRecords({
+      knowledgeBaseId,
+      pages,
+      edges,
+    });
   }
 
   private async listGraphInsightPages(

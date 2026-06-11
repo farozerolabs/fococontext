@@ -5,7 +5,6 @@ import {
   BoundedGraphQueryService,
   BoundedRetrieveExpandEngine,
   RetrieveEngine,
-  createRequestLocalRetrievalRepository,
   type GraphQueryInput,
   type GraphInsightsResponse,
   type GraphInsightStatus,
@@ -15,7 +14,6 @@ import {
   type RetrieveInput,
   type RetrieveResponse,
   type BoundedRetrievalRepository,
-  type RetrievalRepository,
 } from "@fococontext/retrieval";
 
 import {
@@ -85,10 +83,7 @@ export class RetrieveService {
       boundedRepository,
       limits: createRetrievalLimits(this.runtimeConfig),
     };
-    const repository = createRequestLocalRetrievalRepository();
-    ensureRetrievalRepositoryScope(repository, knowledgeBase);
-
-    const engine = new RetrieveEngine(repository, this.embeddingProvider, engineOptions);
+    const engine = new RetrieveEngine(undefined, this.embeddingProvider, engineOptions);
     const startedAt = Date.now();
     const response = await engine.retrieve({
       ...applyDatasetRetrievePreferences(knowledgeBase.retrieval, input),
@@ -834,23 +829,6 @@ function createRetrievalLimits(config: RuntimeConfig) {
     defaultContextBudgetTokens: config.limits.retrieve.defaultContextBudgetTokens,
     maxContextBudgetTokens: config.limits.retrieve.maxContextBudgetTokens,
   };
-}
-
-function ensureRetrievalRepositoryScope(
-  repository: RetrievalRepository,
-  knowledgeBase: {
-    id: string;
-    knowledge_base_type: "canonical" | "fork";
-    upstream_knowledge_base_id: string | null;
-    upstream_synced_version_id: string | null;
-  },
-): void {
-  repository.upsertKnowledgeBaseScope({
-    knowledge_base_id: knowledgeBase.id,
-    knowledge_base_type: knowledgeBase.knowledge_base_type,
-    upstream_knowledge_base_id: knowledgeBase.upstream_knowledge_base_id,
-    upstream_synced_version_id: knowledgeBase.upstream_synced_version_id,
-  });
 }
 
 function applyDatasetRetrievePreferences<TInput extends Partial<RetrieveInput>>(

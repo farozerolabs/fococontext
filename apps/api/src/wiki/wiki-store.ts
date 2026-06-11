@@ -3,7 +3,7 @@ import { ApiError, createResourceId } from "@fococontext/contracts";
 import { requireKnowledgeBaseTenantProject, type DatabaseSchema } from "@fococontext/db";
 import {
   EmbeddingIndexService,
-  createRequestLocalRetrievalRepository,
+  createBoundedRetrievalExecutionContext,
   type GraphInsightsResponse,
   type GraphInsightStatus,
   type RetrievalEmbeddingObjectType,
@@ -2062,7 +2062,7 @@ class PostgresWikiStore implements WikiStore {
   }
 
   async loadRetrievalRepository(knowledgeBaseId: string): Promise<RetrievalRepository> {
-    const repository = createRequestLocalRetrievalRepository();
+    const repository = createBoundedRetrievalExecutionContext();
     const scope = await this.getKnowledgeBaseScope(knowledgeBaseId);
     const pages = await this.listPages(knowledgeBaseId);
     const edges = await this.listEdges(knowledgeBaseId);
