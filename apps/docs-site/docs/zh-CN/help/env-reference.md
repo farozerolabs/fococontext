@@ -23,15 +23,48 @@
 
 ## 管理员和 OpenAPI 访问
 
-| 字段                                    | 说明                       | 建议值                                                                    |
-| --------------------------------------- | -------------------------- | ------------------------------------------------------------------------- |
-| `FOCOCONTEXT_ADMIN_USERNAME`            | 管理员用户名               | 本地可用 `admin`；生产使用不易猜的管理员名                                |
-| `FOCOCONTEXT_ADMIN_PASSWORD`            | 管理员密码                 | 至少 16 位随机密码，不要提交到 Git                                        |
-| `FOCOCONTEXT_ADMIN_SESSION_TTL_SECONDS` | 管理后台会话 TTL 秒数      | 默认 `604800`，即 7 天                                                    |
-| `FOCOCONTEXT_API_KEY`                   | Bearer API Key             | 使用 32 位以上随机值，只保存在服务端                                      |
-| `FOCOCONTEXT_CORS_ORIGINS`              | 逗号分隔 origin            | 本地填 `http://localhost:18081,http://127.0.0.1:18081`；生产只填可信域名  |
-| `FOCOCONTEXT_ADMIN_API_BASE_URL`        | Admin 调用 API 的 base URL | Compose 内本地用 `http://localhost:18080/v1`；反向代理部署填公开 API 路径 |
-| `FOCOCONTEXT_ADMIN_BASE_URL`            | Admin 自身访问地址         | 本地用 `http://localhost:18081`；生产填 HTTPS 域名                        |
+| 字段                                             | 说明                       | 建议值                                                                    |
+| ------------------------------------------------ | -------------------------- | ------------------------------------------------------------------------- |
+| `FOCOCONTEXT_ADMIN_USERNAME`                     | 管理员用户名               | 本地可用 `admin`；生产使用不易猜的管理员名                                |
+| `FOCOCONTEXT_ADMIN_PASSWORD`                     | 管理员密码                 | 至少 16 位随机密码，不要提交到 Git                                        |
+| `FOCOCONTEXT_ADMIN_SESSION_TTL_SECONDS`          | 管理后台会话 TTL 秒数      | 默认 `604800`，即 7 天                                                    |
+| `FOCOCONTEXT_ADMIN_LOGIN_FAILURE_LIMIT`          | 登录失败阈值               | 默认 `5`；重复失败会限流且不暴露账号是否存在                              |
+| `FOCOCONTEXT_ADMIN_LOGIN_FAILURE_WINDOW_SECONDS` | 登录失败统计窗口秒数       | 默认 `300`                                                                |
+| `FOCOCONTEXT_ADMIN_LOGIN_LOCKOUT_SECONDS`        | 登录锁定秒数               | 默认 `900`                                                                |
+| `FOCOCONTEXT_ADMIN_COOKIE_SECURE`                | Admin Cookie Secure 属性   | HTTPS 生产环境使用 `true`                                                 |
+| `FOCOCONTEXT_ADMIN_COOKIE_SAMESITE`              | Admin Cookie SameSite 模式 | 默认 `lax`；按反向代理和域名部署方式调整                                  |
+| `FOCOCONTEXT_API_KEY`                            | Bearer API Key             | 使用 32 位以上随机值，只保存在服务端                                      |
+| `FOCOCONTEXT_CORS_ORIGINS`                       | 逗号分隔 origin            | 本地填 `http://localhost:18081,http://127.0.0.1:18081`；生产只填可信域名  |
+| `FOCOCONTEXT_ADMIN_API_BASE_URL`                 | Admin 调用 API 的 base URL | Compose 内本地用 `http://localhost:18080/v1`；反向代理部署填公开 API 路径 |
+| `FOCOCONTEXT_ADMIN_BASE_URL`                     | Admin 自身访问地址         | 本地用 `http://localhost:18081`；生产填 HTTPS 域名                        |
+
+## 安全响应头、审计与限流
+
+| 字段                                      | 说明                     | 建议值                          |
+| ----------------------------------------- | ------------------------ | ------------------------------- |
+| `SECURITY_HEADERS_ENABLED`                | 是否启用安全响应头       | 默认 `true`                     |
+| `SECURITY_HSTS_ENABLED`                   | 是否启用 HSTS            | HTTPS 稳定后再开启              |
+| `SECURITY_HSTS_MAX_AGE_SECONDS`           | HSTS max age             | 默认 `15552000`                 |
+| `SECURITY_AUDIT_ENABLED`                  | 是否持久化安全审计事件   | 默认 `true`                     |
+| `SECURITY_AUDIT_RETENTION_DAYS`           | 安全审计保留天数         | 默认 `90`                       |
+| `SECURITY_AUDIT_MAX_METADATA_BYTES`       | 审计 metadata 大小上限   | 默认 `4096`                     |
+| `SECURITY_AUDIT_COUNTER_WINDOW_SECONDS`   | Redis 审计计数窗口       | 默认 `300`                      |
+| `SECURITY_AUDIT_COUNTER_TTL_SECONDS`      | Redis 审计计数 TTL       | 默认 `3600`                     |
+| `SECURITY_RATE_LIMIT_ENABLED`             | 是否启用路由限流         | 默认 `true`                     |
+| `SECURITY_RATE_LIMIT_WINDOW_SECONDS`      | 限流窗口秒数             | 默认 `60`                       |
+| `SECURITY_RATE_LIMIT_PUBLIC_HEALTH_MAX`   | public health 窗口上限   | 默认 `120`                      |
+| `SECURITY_RATE_LIMIT_OPENAPI_MAX`         | OpenAPI JSON 窗口上限    | 默认 `30`                       |
+| `SECURITY_RATE_LIMIT_LOGIN_MAX`           | 登录窗口上限             | 默认 `10`                       |
+| `SECURITY_RATE_LIMIT_DIAGNOSTICS_MAX`     | 诊断接口窗口上限         | 默认 `30`                       |
+| `SECURITY_RATE_LIMIT_DEFAULT_API_MAX`     | 默认受保护 API 窗口上限  | 默认 `300`                      |
+| `SECURITY_RATE_LIMIT_RETRIEVE_MAX`        | Retrieve 窗口上限        | 默认 `60`                       |
+| `SECURITY_RATE_LIMIT_SOURCE_EVIDENCE_MAX` | Source Evidence 窗口上限 | 默认 `120`                      |
+| `SECURITY_RATE_LIMIT_UPLOAD_MAX`          | 内置上传窗口上限         | 默认 `30`                       |
+| `SECURITY_RATE_LIMIT_DIRECT_UPLOAD_MAX`   | 直传窗口上限             | 默认 `30`                       |
+| `SECURITY_RATE_LIMIT_EXPORT_MAX`          | 导出窗口上限             | 默认 `10`                       |
+| `SECURITY_RATE_LIMIT_CLEANUP_MAX`         | 清理窗口上限             | 默认 `10`                       |
+| `SECURITY_RATE_LIMIT_WEBHOOK_MAX`         | Webhook 窗口上限         | 默认 `60`                       |
+| `SECURITY_RATE_LIMIT_ADMIN_EXPENSIVE_MAX` | 管理后台昂贵操作窗口上限 | 默认 `30`；可信运维场景谨慎调高 |
 
 ## Source Watch 挂载目录
 
@@ -39,6 +72,14 @@
 | ---------------------------------------- | ---------- | ------------------------------------------------------ |
 | `FOCOCONTEXT_SOURCE_WATCH_HOST_DIR`      | 宿主机目录 | 本地用 `./examples/source-watch`；生产填专门的数据目录 |
 | `FOCOCONTEXT_SOURCE_WATCH_CONTAINER_DIR` | 容器内目录 | 保持 `/source-watch`，创建规则时填该路径或子路径       |
+
+## Source Watch 远程网络安全
+
+| 字段                                     | 说明                     | 建议值                                   |
+| ---------------------------------------- | ------------------------ | ---------------------------------------- |
+| `SOURCE_WATCH_PRIVATE_NETWORK_ENABLED`   | 是否允许私网目标         | 默认 `false`；只在可信内网资料源场景开启 |
+| `SOURCE_WATCH_PRIVATE_NETWORK_ALLOWLIST` | host、IP 或 CIDR 白名单  | 默认留空；开启私网目标时必须显式配置     |
+| `PARSER_REMOTE_IMAGE_FETCHING_ENABLED`   | 是否抓取输入中的远程图片 | 默认 `false`；只有明确出口控制时才开启   |
 
 ## Source Watch URL 列表
 

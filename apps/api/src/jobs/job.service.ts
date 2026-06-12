@@ -359,8 +359,11 @@ export class JobService {
       metadata: {},
       createdAt: retried.createdAt,
     });
+    const queueScope = scope ?? defaultApiResourceScope;
     await this.sourceParseQueue.enqueueSourceParseJob({
       job_id: retried.id,
+      tenant_id: queueScope.tenantId,
+      project_id: queueScope.projectId,
       knowledge_base_id: retried.knowledgeBaseId,
       document_id: document.id,
       content_hash: retried.contentHash,

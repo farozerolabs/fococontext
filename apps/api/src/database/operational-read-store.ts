@@ -354,10 +354,14 @@ export interface OperationalReadStore {
     documentId: string,
   ): Promise<SourceDocumentRecord | null>;
   getUploadSessionById(uploadSessionId: string): Promise<UploadSessionRecord | null>;
-  getUploadSessionByIdempotencyKey(
-    knowledgeBaseId: string,
-    idempotencyKey: string,
-  ): Promise<UploadSessionRecord | null>;
+  getUploadSessionByIdempotencyKey(input: {
+    actorId: string;
+    actorType: string;
+    idempotencyKey: string;
+    knowledgeBaseId: string;
+    projectId: string;
+    tenantId: string;
+  }): Promise<UploadSessionRecord | null>;
   listExpiredCreatedUploadSessions(now: string, limit: number): Promise<UploadSessionRecord[]>;
   getLatestJobByDocumentId(documentId: string): Promise<JobRecord | null>;
   listJobsByDocumentId(documentId: string): Promise<JobRecord[]>;
@@ -1787,6 +1791,12 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     const result = await sql<UploadSessionRow>`
       select
         id,
+        tenant_id,
+        project_id,
+        actor_type,
+        actor_id,
+        actor_source,
+        actor_account_id,
         knowledge_base_id,
         document_id,
         object_key,
@@ -1815,13 +1825,23 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     return row === undefined ? null : toUploadSessionRecord(row);
   }
 
-  async getUploadSessionByIdempotencyKey(
-    knowledgeBaseId: string,
-    idempotencyKey: string,
-  ): Promise<UploadSessionRecord | null> {
+  async getUploadSessionByIdempotencyKey(input: {
+    actorId: string;
+    actorType: string;
+    idempotencyKey: string;
+    knowledgeBaseId: string;
+    projectId: string;
+    tenantId: string;
+  }): Promise<UploadSessionRecord | null> {
     const result = await sql<UploadSessionRow>`
       select
         id,
+        tenant_id,
+        project_id,
+        actor_type,
+        actor_id,
+        actor_source,
+        actor_account_id,
         knowledge_base_id,
         document_id,
         object_key,
@@ -1842,8 +1862,12 @@ class PostgresOperationalReadStore implements OperationalReadStore {
         created_at,
         updated_at
       from upload_sessions
-      where knowledge_base_id = ${knowledgeBaseId}
-        and idempotency_key = ${idempotencyKey}
+      where knowledge_base_id = ${input.knowledgeBaseId}
+        and tenant_id = ${input.tenantId}
+        and project_id = ${input.projectId}
+        and actor_type = ${input.actorType}
+        and actor_id = ${input.actorId}
+        and idempotency_key = ${input.idempotencyKey}
       order by created_at desc, id desc
       limit 1
     `.execute(this.db);
@@ -1859,6 +1883,12 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     const result = await sql<UploadSessionRow>`
       select
         id,
+        tenant_id,
+        project_id,
+        actor_type,
+        actor_id,
+        actor_source,
+        actor_account_id,
         knowledge_base_id,
         document_id,
         object_key,
@@ -3365,6 +3395,12 @@ interface SourceDocumentRow {
 
 interface UploadSessionRow {
   id: string;
+  tenant_id: string;
+  project_id: string;
+  actor_type: string;
+  actor_id: string;
+  actor_source: string;
+  actor_account_id: string | null;
   knowledge_base_id: string;
   document_id: string;
   object_key: string;
@@ -3877,6 +3913,12 @@ function toSourceDocumentRecord(row: SourceDocumentRow): SourceDocumentRecord {
 function toUploadSessionRecord(row: UploadSessionRow): UploadSessionRecord {
   return {
     id: row.id,
+    tenantId: row.tenant_id,
+    projectId: row.project_id,
+    actorType: readUploadSessionActorType(row.actor_type),
+    actorId: row.actor_id,
+    actorSource: row.actor_source,
+    actorAccountId: row.actor_account_id,
     knowledgeBaseId: row.knowledge_base_id,
     documentId: row.document_id,
     objectKey: row.object_key,
@@ -4569,6 +4611,19 @@ function readUploadSessionStatus(value: unknown): UploadSessionRecord["status"] 
   }
 
   return "created";
+}
+
+function readUploadSessionActorType(value: unknown): UploadSessionRecord["actorType"] {
+  if (
+    value === "api_key" ||
+    value === "admin_session" ||
+    value === "system" ||
+    value === "unknown"
+  ) {
+    return value;
+  }
+
+  return "unknown";
 }
 
 function readSourceVisibilityOrigin(value: unknown): SourceVisibilityOrigin {

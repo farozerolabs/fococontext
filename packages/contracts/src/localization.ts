@@ -210,6 +210,22 @@ const apiMessageCatalog = {
     "en-US": "Rate limited.",
     "zh-CN": "请求过于频繁。",
   },
+  "api.error.admission_limited": {
+    "en-US": "Admission limited.",
+    "zh-CN": "系统当前限制接收新的高成本任务。",
+  },
+  "api.error.request_size_limit_exceeded": {
+    "en-US": "Request size limit exceeded.",
+    "zh-CN": "请求大小超过限制。",
+  },
+  "api.error.retrieve_limit_exceeded": {
+    "en-US": "Retrieve limit exceeded.",
+    "zh-CN": "检索请求超过限制。",
+  },
+  "api.error.export_limit_exceeded": {
+    "en-US": "Export limit exceeded.",
+    "zh-CN": "导出请求超过限制。",
+  },
   "api.error.internal_error": {
     "en-US": "Internal error.",
     "zh-CN": "服务内部错误。",
@@ -217,6 +233,10 @@ const apiMessageCatalog = {
   "api.validation.admin_session_required": {
     "en-US": "Admin session required.",
     "zh-CN": "需要管理员会话。",
+  },
+  "api.validation.admin_csrf_required": {
+    "en-US": "Admin CSRF proof required.",
+    "zh-CN": "需要管理员 CSRF 请求证明。",
   },
   "api.validation.openapi_document_auth_required": {
     "en-US":
@@ -230,6 +250,14 @@ const apiMessageCatalog = {
   "api.validation.invalid_admin_credentials": {
     "en-US": "Invalid admin credentials.",
     "zh-CN": "管理员账号或密码无效。",
+  },
+  "api.validation.admin_login_rate_limited": {
+    "en-US": "Too many failed admin login attempts. Try again later.",
+    "zh-CN": "管理员登录失败次数过多，请稍后再试。",
+  },
+  "api.validation.request_boundary_invalid": {
+    "en-US": "Request boundary validation failed.",
+    "zh-CN": "请求边界校验失败。",
   },
   "api.validation.knowledge_base_slug_invalid": {
     "en-US": "Knowledge base slug is invalid.",
@@ -386,6 +414,10 @@ const apiMessageCatalog = {
   "api.validation.source_url_invalid": {
     "en-US": "Source URL is invalid.",
     "zh-CN": "资料 URL 无效。",
+  },
+  "api.validation.remote_source_unsafe": {
+    "en-US": "Remote source URL is not allowed by the configured safety policy.",
+    "zh-CN": "远程资料 URL 未通过当前安全策略。",
   },
   "api.validation.source_upload_failed": {
     "en-US": "Source object upload failed.",

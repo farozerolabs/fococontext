@@ -6,6 +6,8 @@ import remarkMath from "remark-math"
 
 import { cn } from "@/lib/utils.js"
 
+import { sanitizeMarkdownHref } from "./markdown-security.js"
+
 import "katex/dist/katex.min.css"
 
 interface MarkdownRendererProps {
@@ -244,7 +246,7 @@ function MarkdownLink({
   const wikiTarget = readWikilinkHref(href)
   const resolvedHref =
     wikiTarget === null
-      ? sanitizeHref(href ?? "#")
+      ? sanitizeMarkdownHref(href ?? "#")
       : (resolveWikilink?.(wikiTarget.target, wikiTarget.anchor) ?? "#")
   const isExternal =
     resolvedHref.startsWith("http://") || resolvedHref.startsWith("https://")
@@ -253,7 +255,7 @@ function MarkdownLink({
     <a
       className="font-medium text-foreground underline underline-offset-4"
       href={resolvedHref}
-      rel={isExternal ? "noreferrer" : undefined}
+      rel={isExternal ? "noopener noreferrer" : undefined}
       target={isExternal ? "_blank" : undefined}
     >
       {children}
@@ -420,21 +422,7 @@ function resolveMarkdownImageSource(
     return "#"
   }
 
-  return sanitizeHref(resolveMedia?.(src) ?? src)
-}
-
-function sanitizeHref(href: string) {
-  if (
-    href.startsWith("http://") ||
-    href.startsWith("https://") ||
-    href.startsWith("/") ||
-    href.startsWith("#") ||
-    href.startsWith("data:image/")
-  ) {
-    return href
-  }
-
-  return "#"
+  return sanitizeMarkdownHref(resolveMedia?.(src) ?? src)
 }
 
 export function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {

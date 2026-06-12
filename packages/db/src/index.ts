@@ -65,6 +65,7 @@ export const expectedSchemaTables = [
   "webhook_deliveries",
   "page_embeddings",
   "retrieval_traces",
+  "security_audit_events",
   "background_operations",
   "deletion_cleanup_operations",
   "deletion_cleanup_items",

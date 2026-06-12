@@ -23,15 +23,48 @@ Keep `FOCOCONTEXT_*_PORT` values numeric. Put the host bind address in
 
 ## Admin and OpenAPI Access
 
-| Field                                   | Description                  | Recommended Value                                                                                             |
-| --------------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `FOCOCONTEXT_ADMIN_USERNAME`            | Admin username               | `admin` is fine locally; use a less guessable name in production                                              |
-| `FOCOCONTEXT_ADMIN_PASSWORD`            | Admin password               | Random password with at least 16 characters                                                                   |
-| `FOCOCONTEXT_ADMIN_SESSION_TTL_SECONDS` | Admin session TTL in seconds | Default `604800`, 7 days                                                                                      |
-| `FOCOCONTEXT_API_KEY`                   | Bearer API Key               | Random value with at least 32 characters, stored server-side only                                             |
-| `FOCOCONTEXT_CORS_ORIGINS`              | Comma-separated origins      | Local default is `http://localhost:18081,http://127.0.0.1:18081`; production should list trusted domains only |
-| `FOCOCONTEXT_ADMIN_API_BASE_URL`        | API base URL used by Admin   | Compose local value is `http://localhost:18080/v1`; use your public API route behind a proxy                  |
-| `FOCOCONTEXT_ADMIN_BASE_URL`            | Admin base URL               | Local value is `http://localhost:18081`; production should use an HTTPS domain                                |
+| Field                                            | Description                  | Recommended Value                                                                                             |
+| ------------------------------------------------ | ---------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `FOCOCONTEXT_ADMIN_USERNAME`                     | Admin username               | `admin` is fine locally; use a less guessable name in production                                              |
+| `FOCOCONTEXT_ADMIN_PASSWORD`                     | Admin password               | Random password with at least 16 characters                                                                   |
+| `FOCOCONTEXT_ADMIN_SESSION_TTL_SECONDS`          | Admin session TTL in seconds | Default `604800`, 7 days                                                                                      |
+| `FOCOCONTEXT_ADMIN_LOGIN_FAILURE_LIMIT`          | Login failure threshold      | Default `5`; repeated failures are throttled without account enumeration                                      |
+| `FOCOCONTEXT_ADMIN_LOGIN_FAILURE_WINDOW_SECONDS` | Login failure window         | Default `300`                                                                                                 |
+| `FOCOCONTEXT_ADMIN_LOGIN_LOCKOUT_SECONDS`        | Login lockout duration       | Default `900`                                                                                                 |
+| `FOCOCONTEXT_ADMIN_COOKIE_SECURE`                | Secure Admin cookie          | Use `true` for HTTPS production deployments                                                                   |
+| `FOCOCONTEXT_ADMIN_COOKIE_SAMESITE`              | Admin cookie SameSite mode   | Default `lax`; align with your reverse-proxy and domain setup                                                 |
+| `FOCOCONTEXT_API_KEY`                            | Bearer API Key               | Random value with at least 32 characters, stored server-side only                                             |
+| `FOCOCONTEXT_CORS_ORIGINS`                       | Comma-separated origins      | Local default is `http://localhost:18081,http://127.0.0.1:18081`; production should list trusted domains only |
+| `FOCOCONTEXT_ADMIN_API_BASE_URL`                 | API base URL used by Admin   | Compose local value is `http://localhost:18080/v1`; use your public API route behind a proxy                  |
+| `FOCOCONTEXT_ADMIN_BASE_URL`                     | Admin base URL               | Local value is `http://localhost:18081`; production should use an HTTPS domain                                |
+
+## Security Headers, Audit, and Rate Limits
+
+| Field                                     | Description                         | Recommended Value                                           |
+| ----------------------------------------- | ----------------------------------- | ----------------------------------------------------------- |
+| `SECURITY_HEADERS_ENABLED`                | Enable security headers             | Default `true`                                              |
+| `SECURITY_HSTS_ENABLED`                   | Enable HSTS                         | Enable only after HTTPS is stable                           |
+| `SECURITY_HSTS_MAX_AGE_SECONDS`           | HSTS max age                        | Default `15552000`                                          |
+| `SECURITY_AUDIT_ENABLED`                  | Persist security audit events       | Default `true`                                              |
+| `SECURITY_AUDIT_RETENTION_DAYS`           | Security audit retention            | Default `90`                                                |
+| `SECURITY_AUDIT_MAX_METADATA_BYTES`       | Max audit metadata size             | Default `4096`                                              |
+| `SECURITY_AUDIT_COUNTER_WINDOW_SECONDS`   | Redis audit counter window          | Default `300`                                               |
+| `SECURITY_AUDIT_COUNTER_TTL_SECONDS`      | Redis audit counter TTL             | Default `3600`                                              |
+| `SECURITY_RATE_LIMIT_ENABLED`             | Enable route rate limiting          | Default `true`                                              |
+| `SECURITY_RATE_LIMIT_WINDOW_SECONDS`      | Rate-limit window                   | Default `60`                                                |
+| `SECURITY_RATE_LIMIT_PUBLIC_HEALTH_MAX`   | Public health requests per window   | Default `120`                                               |
+| `SECURITY_RATE_LIMIT_OPENAPI_MAX`         | OpenAPI JSON requests per window    | Default `30`                                                |
+| `SECURITY_RATE_LIMIT_LOGIN_MAX`           | Login requests per window           | Default `10`                                                |
+| `SECURITY_RATE_LIMIT_DIAGNOSTICS_MAX`     | Diagnostics requests per window     | Default `30`                                                |
+| `SECURITY_RATE_LIMIT_DEFAULT_API_MAX`     | Default protected API limit         | Default `300`                                               |
+| `SECURITY_RATE_LIMIT_RETRIEVE_MAX`        | Retrieve requests per window        | Default `60`                                                |
+| `SECURITY_RATE_LIMIT_SOURCE_EVIDENCE_MAX` | Source Evidence requests per window | Default `120`                                               |
+| `SECURITY_RATE_LIMIT_UPLOAD_MAX`          | Built-in upload requests per window | Default `30`                                                |
+| `SECURITY_RATE_LIMIT_DIRECT_UPLOAD_MAX`   | Direct upload requests per window   | Default `30`                                                |
+| `SECURITY_RATE_LIMIT_EXPORT_MAX`          | Export requests per window          | Default `10`                                                |
+| `SECURITY_RATE_LIMIT_CLEANUP_MAX`         | Cleanup requests per window         | Default `10`                                                |
+| `SECURITY_RATE_LIMIT_WEBHOOK_MAX`         | Webhook requests per window         | Default `60`                                                |
+| `SECURITY_RATE_LIMIT_ADMIN_EXPENSIVE_MAX` | Expensive Admin requests per window | Default `30`; tune for trusted operator workflows carefully |
 
 ## Source Watch Mounted Directory
 
@@ -39,6 +72,14 @@ Keep `FOCOCONTEXT_*_PORT` values numeric. Put the host bind address in
 | ---------------------------------------- | ------------------- | ----------------------------------------------------------------------------------- |
 | `FOCOCONTEXT_SOURCE_WATCH_HOST_DIR`      | Host directory      | Use `./examples/source-watch` locally; use a dedicated data directory in production |
 | `FOCOCONTEXT_SOURCE_WATCH_CONTAINER_DIR` | Container directory | Keep `/source-watch`; create rules with this path or a child path                   |
+
+## Source Watch Remote Network Safety
+
+| Field                                    | Description                     | Recommended Value                                                                 |
+| ---------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------- |
+| `SOURCE_WATCH_PRIVATE_NETWORK_ENABLED`   | Allow private-network targets   | Default `false`; enable only for trusted intranet ingestion                       |
+| `SOURCE_WATCH_PRIVATE_NETWORK_ALLOWLIST` | Host, IP, or CIDR allowlist     | Empty by default; required when private-network targets are enabled               |
+| `PARSER_REMOTE_IMAGE_FETCHING_ENABLED`   | Fetch remote images from inputs | Default `false`; keep disabled unless the deployment has explicit egress controls |
 
 ## Source Watch URL List
 

@@ -12,6 +12,7 @@ import {
 export { computeCompilePromptLimits, maskSecret } from "./runtime-config-helpers.js";
 export type { CompilePromptLimits } from "./runtime-config-helpers.js";
 export type {
+  SourceWatchRemoteSecurityConfig,
   SourceWatchRuntimeAdapterBase,
   SourceWatchRuntimeAdapters,
 } from "./source-watch-config.js";
@@ -62,6 +63,11 @@ export interface RuntimeConfig {
     publicBaseUrl?: string;
   };
   admin: {
+    cookieSameSite: "lax" | "none" | "strict";
+    cookieSecure: boolean;
+    loginFailureLimit: number;
+    loginFailureWindowSeconds: number;
+    loginLockoutSeconds: number;
     port: number;
     publicBaseUrl?: string;
     sessionTtlSeconds: number;
@@ -132,6 +138,10 @@ export interface RuntimeConfig {
     adapters: SourceWatchRuntimeAdapters;
     containerDir: string;
     hostDir?: string;
+    remoteSecurity: {
+      privateNetworkAllowlist: readonly string[];
+      privateNetworkEnabled: boolean;
+    };
     scheduler: {
       enabled: boolean;
       defaultIntervalSeconds: number;
@@ -146,7 +156,47 @@ export interface RuntimeConfig {
     serviceApiKey?: string;
     languages: string[];
   };
+  security: {
+    headersEnabled: boolean;
+    hstsEnabled: boolean;
+    hstsMaxAgeSeconds: number;
+    audit: RuntimeSecurityAuditConfig;
+    rateLimits: RuntimeSecurityRateLimitConfig;
+  };
   release: ReleaseMetadata;
+}
+
+export interface RuntimeSecurityAuditConfig {
+  counterTtlSeconds: number;
+  counterWindowSeconds: number;
+  enabled: boolean;
+  maxMetadataBytes: number;
+  retentionDays: number;
+}
+
+export type RuntimeSecurityRateLimitClass =
+  | "admin_expensive"
+  | "cleanup"
+  | "default_api"
+  | "direct_upload"
+  | "diagnostics"
+  | "export"
+  | "login"
+  | "openapi"
+  | "public_health"
+  | "retrieve"
+  | "source_evidence"
+  | "upload"
+  | "webhook";
+
+export interface RuntimeSecurityRateLimitClassConfig {
+  max: number;
+  windowSeconds: number;
+}
+
+export interface RuntimeSecurityRateLimitConfig {
+  classes: Record<RuntimeSecurityRateLimitClass, RuntimeSecurityRateLimitClassConfig>;
+  enabled: boolean;
 }
 
 export interface RuntimeConfigLimits {
@@ -443,6 +493,14 @@ const maxSourceEvidenceContextChars = 2000;
 const defaultSourceEvidenceBatchMaxItems = 20;
 const defaultSourceEvidenceBatchTotalOutputMaxChars = 40000;
 const defaultAdminSessionTtlSeconds = 7 * 24 * 60 * 60;
+const defaultAdminLoginFailureLimit = 5;
+const defaultAdminLoginFailureWindowSeconds = 15 * 60;
+const defaultAdminLoginLockoutSeconds = 15 * 60;
+const defaultSecurityHstsMaxAgeSeconds = 15_552_000;
+const defaultSecurityAuditCounterTtlSeconds = 24 * 60 * 60;
+const defaultSecurityAuditCounterWindowSeconds = 300;
+const defaultSecurityAuditMaxMetadataBytes = 2048;
+const defaultSecurityAuditRetentionDays = 90;
 const defaultBackgroundJobBatchSize = 100;
 const defaultBackgroundJobCursorWindowSize = 100;
 const defaultBackgroundJobCheckpointInterval = 1;
@@ -862,6 +920,129 @@ function parseOptionalBoolean(
   return defaultValue;
 }
 
+function parseOptionalAdminCookieSameSite(
+  env: RuntimeEnv,
+  key: string,
+  defaultValue: "lax" | "none" | "strict",
+  invalid: string[],
+): "lax" | "none" | "strict" {
+  const value = readOptional(env, key)?.toLowerCase();
+
+  if (value === undefined) {
+    return defaultValue;
+  }
+
+  if (value === "lax" || value === "none" || value === "strict") {
+    return value;
+  }
+
+  invalid.push(key);
+  return defaultValue;
+}
+
+function parseSecurityRateLimits(
+  env: RuntimeEnv,
+  invalid: string[],
+): RuntimeSecurityRateLimitConfig {
+  const defaultWindowSeconds = parseOptionalPositiveInteger(
+    env,
+    "SECURITY_RATE_LIMIT_WINDOW_SECONDS",
+    60,
+    invalid,
+  );
+
+  return {
+    enabled: parseOptionalBoolean(env, "SECURITY_RATE_LIMIT_ENABLED", true, invalid),
+    classes: {
+      admin_expensive: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 120,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_ADMIN_EXPENSIVE",
+      }),
+      cleanup: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 30,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_CLEANUP",
+      }),
+      default_api: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 600,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_DEFAULT_API",
+      }),
+      direct_upload: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 120,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_DIRECT_UPLOAD",
+      }),
+      diagnostics: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 120,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_DIAGNOSTICS",
+      }),
+      export: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 30,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_EXPORT",
+      }),
+      login: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 30,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_LOGIN",
+      }),
+      openapi: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 120,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_OPENAPI",
+      }),
+      public_health: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 600,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_PUBLIC_HEALTH",
+      }),
+      retrieve: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 120,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_RETRIEVE",
+      }),
+      source_evidence: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 120,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_SOURCE_EVIDENCE",
+      }),
+      upload: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 120,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_UPLOAD",
+      }),
+      webhook: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 120,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_WEBHOOK",
+      }),
+    },
+  };
+}
+
+function parseSecurityRateLimitClass(
+  env: RuntimeEnv,
+  invalid: string[],
+  input: {
+    defaultMax: number;
+    defaultWindowSeconds: number;
+    keyPrefix: string;
+  },
+): RuntimeSecurityRateLimitClassConfig {
+  return {
+    max: parseOptionalPositiveInteger(env, `${input.keyPrefix}_MAX`, input.defaultMax, invalid),
+    windowSeconds: parseOptionalPositiveInteger(
+      env,
+      `${input.keyPrefix}_WINDOW_SECONDS`,
+      input.defaultWindowSeconds,
+      invalid,
+    ),
+  };
+}
+
 export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
   const missing: string[] = requiredEnvKeys.filter((key) => readRequired(env, key) === "");
   const invalid: string[] = [];
@@ -1185,6 +1366,31 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
         env,
         "FOCOCONTEXT_ADMIN_SESSION_TTL_SECONDS",
         defaultAdminSessionTtlSeconds,
+        invalid,
+      ),
+      loginFailureLimit: parseOptionalPositiveInteger(
+        env,
+        "FOCOCONTEXT_ADMIN_LOGIN_FAILURE_LIMIT",
+        defaultAdminLoginFailureLimit,
+        invalid,
+      ),
+      loginFailureWindowSeconds: parseOptionalPositiveInteger(
+        env,
+        "FOCOCONTEXT_ADMIN_LOGIN_FAILURE_WINDOW_SECONDS",
+        defaultAdminLoginFailureWindowSeconds,
+        invalid,
+      ),
+      loginLockoutSeconds: parseOptionalPositiveInteger(
+        env,
+        "FOCOCONTEXT_ADMIN_LOGIN_LOCKOUT_SECONDS",
+        defaultAdminLoginLockoutSeconds,
+        invalid,
+      ),
+      cookieSecure: parseOptionalBoolean(env, "FOCOCONTEXT_ADMIN_COOKIE_SECURE", false, invalid),
+      cookieSameSite: parseOptionalAdminCookieSameSite(
+        env,
+        "FOCOCONTEXT_ADMIN_COOKIE_SAMESITE",
+        "lax",
         invalid,
       ),
       username: readRequired(env, "FOCOCONTEXT_ADMIN_USERNAME"),
@@ -1788,6 +1994,19 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
       },
       containerDir: sourceWatchContainerDir,
       ...(sourceWatchHostDir === undefined ? {} : { hostDir: sourceWatchHostDir }),
+      remoteSecurity: {
+        privateNetworkAllowlist: parseOptionalStringList(
+          env,
+          "SOURCE_WATCH_PRIVATE_NETWORK_ALLOWLIST",
+          [],
+        ),
+        privateNetworkEnabled: parseOptionalBoolean(
+          env,
+          "SOURCE_WATCH_PRIVATE_NETWORK_ENABLED",
+          false,
+          invalid,
+        ),
+      },
       scheduler: {
         defaultIntervalSeconds: sourceWatchScanIntervalSeconds,
         enabled: parseOptionalBoolean(env, "SOURCE_WATCH_SCHEDULER_ENABLED", true, invalid),
@@ -1801,6 +2020,44 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
       ...(ocrServiceBaseUrl === undefined ? {} : { serviceBaseUrl: ocrServiceBaseUrl }),
       ...(ocrServiceApiKey === undefined ? {} : { serviceApiKey: ocrServiceApiKey }),
       languages: ocrLanguages,
+    },
+    security: {
+      headersEnabled: parseOptionalBoolean(env, "SECURITY_HEADERS_ENABLED", true, invalid),
+      hstsEnabled: parseOptionalBoolean(env, "SECURITY_HSTS_ENABLED", false, invalid),
+      hstsMaxAgeSeconds: parseOptionalPositiveInteger(
+        env,
+        "SECURITY_HSTS_MAX_AGE_SECONDS",
+        defaultSecurityHstsMaxAgeSeconds,
+        invalid,
+      ),
+      audit: {
+        counterTtlSeconds: parseOptionalPositiveInteger(
+          env,
+          "SECURITY_AUDIT_COUNTER_TTL_SECONDS",
+          defaultSecurityAuditCounterTtlSeconds,
+          invalid,
+        ),
+        counterWindowSeconds: parseOptionalPositiveInteger(
+          env,
+          "SECURITY_AUDIT_COUNTER_WINDOW_SECONDS",
+          defaultSecurityAuditCounterWindowSeconds,
+          invalid,
+        ),
+        enabled: parseOptionalBoolean(env, "SECURITY_AUDIT_ENABLED", true, invalid),
+        maxMetadataBytes: parseOptionalPositiveInteger(
+          env,
+          "SECURITY_AUDIT_MAX_METADATA_BYTES",
+          defaultSecurityAuditMaxMetadataBytes,
+          invalid,
+        ),
+        retentionDays: parseOptionalPositiveInteger(
+          env,
+          "SECURITY_AUDIT_RETENTION_DAYS",
+          defaultSecurityAuditRetentionDays,
+          invalid,
+        ),
+      },
+      rateLimits: parseSecurityRateLimits(env, invalid),
     },
     release: loadReleaseMetadata(env, "api"),
   };

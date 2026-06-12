@@ -15,10 +15,31 @@ export interface AdminSession {
 
 export interface AdminSessionStore {
   readonly backend: "redis";
+  clearLoginFailure(scope: string): Promise<void>;
   close?(): Promise<void>;
   deleteSession(token: string): Promise<void>;
   getSession(token: string): Promise<AdminSession | undefined>;
+  getLoginFailureLock(scope: string): Promise<LoginFailureLock | undefined>;
+  recordLoginFailure(
+    scope: string,
+    input: LoginFailureRecordInput,
+  ): Promise<LoginFailureLock | undefined>;
   saveSession(session: AdminSession, ttlSeconds: number): Promise<void>;
+}
+
+export interface LoginFailureLock {
+  retryAfterSeconds: number;
+}
+
+export interface LoginFailureRecordInput {
+  failureLimit: number;
+  lockoutSeconds: number;
+  windowSeconds: number;
+}
+
+export interface AdminSessionCookieOptions {
+  sameSite: "lax" | "none" | "strict";
+  secure: boolean;
 }
 
 export const adminSessionStoreToken = Symbol("adminSessionStore");
@@ -40,6 +61,29 @@ export class AdminAuthService implements OnModuleDestroy {
     );
   }
 
+  getLoginFailureScope(username: string, clientAddress: string | undefined): string {
+    const normalizedUsername = normalizeLoginScopePart(username);
+    const normalizedAddress = normalizeLoginScopePart(clientAddress ?? "unknown");
+
+    return `${normalizedAddress}:${normalizedUsername}`;
+  }
+
+  async getLoginFailureLock(scope: string): Promise<LoginFailureLock | undefined> {
+    return this.sessionStore.getLoginFailureLock(scope);
+  }
+
+  async recordLoginFailure(scope: string): Promise<LoginFailureLock | undefined> {
+    return this.sessionStore.recordLoginFailure(scope, {
+      failureLimit: this.config.admin.loginFailureLimit,
+      lockoutSeconds: this.config.admin.loginLockoutSeconds,
+      windowSeconds: this.config.admin.loginFailureWindowSeconds,
+    });
+  }
+
+  async clearLoginFailure(scope: string): Promise<void> {
+    await this.sessionStore.clearLoginFailure(scope);
+  }
+
   async createSession(username: string): Promise<AdminSession> {
     const session: AdminSession = {
       token: randomBytes(32).toString("base64url"),
@@ -49,6 +93,13 @@ export class AdminAuthService implements OnModuleDestroy {
     await this.sessionStore.saveSession(session, this.config.admin.sessionTtlSeconds);
 
     return session;
+  }
+
+  getSessionCookieOptions(): AdminSessionCookieOptions {
+    return {
+      sameSite: this.config.admin.cookieSameSite,
+      secure: this.config.admin.cookieSecure,
+    };
   }
 
   async getSession(token: string): Promise<AdminSession | undefined> {
@@ -109,14 +160,79 @@ class RedisAdminSessionStore implements AdminSessionStore {
 
     await client.runCommand("del", [createAdminSessionKey(token)]);
   }
+
+  async getLoginFailureLock(scope: string): Promise<LoginFailureLock | undefined> {
+    const client = await this.connection.client;
+    const ttlMs = await client.runCommand("pttl", [createAdminLoginLockKey(scope)]);
+
+    if (typeof ttlMs !== "number" || ttlMs <= 0) {
+      return undefined;
+    }
+
+    return { retryAfterSeconds: Math.ceil(ttlMs / 1000) };
+  }
+
+  async recordLoginFailure(
+    scope: string,
+    input: LoginFailureRecordInput,
+  ): Promise<LoginFailureLock | undefined> {
+    const existingLock = await this.getLoginFailureLock(scope);
+
+    if (existingLock !== undefined) {
+      return existingLock;
+    }
+
+    const client = await this.connection.client;
+    const failureKey = createAdminLoginFailureKey(scope);
+    const count = await client.runCommand("incr", [failureKey]);
+
+    if (count === 1) {
+      await client.runCommand("expire", [failureKey, String(input.windowSeconds)]);
+    }
+
+    if (typeof count === "number" && count >= input.failureLimit) {
+      await client.runCommand("set", [
+        createAdminLoginLockKey(scope),
+        "1",
+        "EX",
+        String(input.lockoutSeconds),
+      ]);
+      await client.runCommand("del", [failureKey]);
+
+      return { retryAfterSeconds: input.lockoutSeconds };
+    }
+
+    return undefined;
+  }
+
+  async clearLoginFailure(scope: string): Promise<void> {
+    const client = await this.connection.client;
+
+    await client.runCommand("del", [
+      createAdminLoginFailureKey(scope),
+      createAdminLoginLockKey(scope),
+    ]);
+  }
 }
 
-export function serializeAdminSessionCookie(token: string): string {
-  return `${adminSessionCookieName}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax`;
+export function serializeAdminSessionCookie(
+  token: string,
+  options: AdminSessionCookieOptions = { sameSite: "lax", secure: false },
+): string {
+  return [
+    `${adminSessionCookieName}=${encodeURIComponent(token)}`,
+    ...createAdminSessionCookieAttributes(options),
+  ].join("; ");
 }
 
-export function expireAdminSessionCookie(): string {
-  return `${adminSessionCookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
+export function expireAdminSessionCookie(
+  options: AdminSessionCookieOptions = { sameSite: "lax", secure: false },
+): string {
+  return [
+    `${adminSessionCookieName}=`,
+    ...createAdminSessionCookieAttributes(options),
+    "Max-Age=0",
+  ].join("; ");
 }
 
 function safeEqual(left: string, right: string): boolean {
@@ -129,6 +245,41 @@ function safeEqual(left: string, right: string): boolean {
 
 function createAdminSessionKey(token: string): string {
   return `fococontext:admin-session:${encodeURIComponent(token)}`;
+}
+
+function createAdminLoginFailureKey(scope: string): string {
+  return `fococontext:admin-login-failure:${encodeURIComponent(scope)}`;
+}
+
+function createAdminLoginLockKey(scope: string): string {
+  return `fococontext:admin-login-lock:${encodeURIComponent(scope)}`;
+}
+
+function normalizeLoginScopePart(value: string): string {
+  const normalized = value.trim().toLowerCase();
+
+  return normalized.length === 0 ? "unknown" : normalized;
+}
+
+function createAdminSessionCookieAttributes(options: AdminSessionCookieOptions): string[] {
+  return [
+    "Path=/",
+    "HttpOnly",
+    `SameSite=${formatCookieSameSite(options.sameSite)}`,
+    ...(options.secure ? ["Secure"] : []),
+  ];
+}
+
+function formatCookieSameSite(value: AdminSessionCookieOptions["sameSite"]): string {
+  if (value === "none") {
+    return "None";
+  }
+
+  if (value === "strict") {
+    return "Strict";
+  }
+
+  return "Lax";
 }
 
 function parseAdminSessionValue(token: string, value: string): AdminSession | undefined {

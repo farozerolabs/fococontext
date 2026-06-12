@@ -284,6 +284,22 @@ export const apiErrorDefinitions = {
     httpStatus: 429,
     message: "Rate limited.",
   },
+  admission_limited: {
+    httpStatus: 429,
+    message: "Admission limited.",
+  },
+  request_size_limit_exceeded: {
+    httpStatus: 413,
+    message: "Request size limit exceeded.",
+  },
+  retrieve_limit_exceeded: {
+    httpStatus: 413,
+    message: "Retrieve limit exceeded.",
+  },
+  export_limit_exceeded: {
+    httpStatus: 413,
+    message: "Export limit exceeded.",
+  },
   internal_error: {
     httpStatus: 500,
     message: "Internal error.",
@@ -673,10 +689,42 @@ function createLocalizedApiErrorPayload(
   }
 
   if (error.details !== undefined) {
-    payload.details = error.details;
+    payload.details = redactSensitiveDetails(error.details);
   }
 
   return payload;
+}
+
+const redactedValue = "[redacted]";
+const sensitiveDetailKeyPattern =
+  /(?:api[_-]?key|authorization|cookie|password|secret|session|token|credential|private[_-]?key)/iu;
+
+function redactSensitiveDetails(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (Array.isArray(value)) {
+    if (seen.has(value)) {
+      return "[circular]";
+    }
+
+    seen.add(value);
+    return value.map((item) => redactSensitiveDetails(item, seen));
+  }
+
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+
+  if (seen.has(value)) {
+    return "[circular]";
+  }
+
+  seen.add(value);
+
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+      key,
+      sensitiveDetailKeyPattern.test(key) ? redactedValue : redactSensitiveDetails(item, seen),
+    ]),
+  );
 }
 
 export function mapUnknownErrorToResponse(
@@ -792,6 +840,15 @@ const standardErrorResponses = {
   },
   "409": {
     $ref: "#/components/responses/Conflict",
+  },
+  "413": {
+    $ref: "#/components/responses/PayloadTooLarge",
+  },
+  "429": {
+    $ref: "#/components/responses/TooManyRequests",
+  },
+  "503": {
+    $ref: "#/components/responses/ServiceUnavailable",
   },
   "500": {
     $ref: "#/components/responses/InternalServerError",
@@ -945,6 +1002,39 @@ export const openApiComponents = {
     Conflict: {
       description:
         "A scoped uniqueness constraint or idempotency boundary rejected the request. Duplicate natural keys use `resource_conflict` with structured `error.details`.",
+      content: {
+        "application/json": {
+          schema: {
+            $ref: "#/components/schemas/ErrorEnvelope",
+          },
+        },
+      },
+    },
+    PayloadTooLarge: {
+      description:
+        "The request, upload, retrieve response, source evidence response, parser output, or export exceeds a configured request or output limit.",
+      content: {
+        "application/json": {
+          schema: {
+            $ref: "#/components/schemas/ErrorEnvelope",
+          },
+        },
+      },
+    },
+    TooManyRequests: {
+      description:
+        "The caller exceeded a configured route, admission, queue, upload, retrieve, source evidence, or export limit. `error.details` may include safe retry metadata.",
+      content: {
+        "application/json": {
+          schema: {
+            $ref: "#/components/schemas/ErrorEnvelope",
+          },
+        },
+      },
+    },
+    ServiceUnavailable: {
+      description:
+        "A durable backend, queue or provider dependency is unavailable or over pressure. Use `request_id` and retry metadata for support correlation.",
       content: {
         "application/json": {
           schema: {
@@ -5114,7 +5204,7 @@ export const openApiComponents = {
   },
 } as const;
 
-export const openApiPaths = {
+const openApiPathDefinitions = {
   "/dataset-configuration-presets": {
     get: {
       summary: "List dataset configuration presets",
@@ -6476,6 +6566,40 @@ export const openApiPaths = {
   },
 } as const;
 
+type OpenApiHttpMethod = "delete" | "get" | "patch" | "post" | "put";
+
+export interface OpenApiSecurityMetadata {
+  auditClass: string;
+  authMode: "bearer_api_key";
+  permission: string;
+  rateLimitClass: string;
+  redactionClass: string;
+  tier: "developer-api";
+}
+
+type OpenApiOperationLike = {
+  operationId: string;
+  [key: string]: unknown;
+};
+
+type OpenApiPathDefinitions = Record<
+  string,
+  Partial<Record<OpenApiHttpMethod, OpenApiOperationLike>>
+>;
+
+type SecuredOpenApiPaths<T extends OpenApiPathDefinitions> = {
+  readonly [Path in keyof T]: {
+    readonly [Method in keyof T[Path]]: T[Path][Method] extends OpenApiOperationLike
+      ? T[Path][Method] & {
+          readonly security: readonly [{ readonly bearerAuth: readonly [] }];
+          readonly "x-fococontext-security": OpenApiSecurityMetadata;
+        }
+      : T[Path][Method];
+  };
+};
+
+export const openApiPaths = withOpenApiSecurityMetadata(openApiPathDefinitions);
+
 export const openApiDocument = {
   openapi: "3.1.0",
   info: {
@@ -6523,3 +6647,125 @@ export const openApiDocument = {
     },
   ],
 } as const;
+
+function withOpenApiSecurityMetadata<T extends OpenApiPathDefinitions>(
+  paths: T,
+): SecuredOpenApiPaths<T> {
+  const securedEntries = Object.entries(paths).map(([path, pathItem]) => [
+    path,
+    Object.fromEntries(
+      Object.entries(pathItem).map(([method, operation]) => {
+        if (operation === undefined) {
+          return [method, operation];
+        }
+
+        const normalizedMethod = method as OpenApiHttpMethod;
+        const security = classifyOpenApiOperation(normalizedMethod, path);
+
+        return [
+          method,
+          {
+            ...operation,
+            security: [{ bearerAuth: [] }],
+            "x-fococontext-security": security,
+          },
+        ];
+      }),
+    ),
+  ]);
+
+  return Object.fromEntries(securedEntries) as SecuredOpenApiPaths<T>;
+}
+
+function classifyOpenApiOperation(
+  method: OpenApiHttpMethod,
+  path: string,
+): OpenApiSecurityMetadata {
+  const access = method === "get" ? "read" : "write";
+
+  if (path === "/dataset-configuration-presets") {
+    return developerApiSecurity("dataset_configuration:read", "standard_read", "standard", "read");
+  }
+  if (path === "/api-keys") {
+    return developerApiSecurity("api_keys:write", "admin_mutation", "secret_masked", "security");
+  }
+  if (path.includes("/retrieve")) {
+    return developerApiSecurity("retrieve:read", "retrieve", "source_evidence", "read");
+  }
+  if (path.startsWith("/source-evidence")) {
+    return developerApiSecurity("documents:read", "source_evidence", "source_evidence", "read");
+  }
+  if (path.includes("/upload-sessions")) {
+    return developerApiSecurity("documents:write", "upload_session", "storage_scoped", "write");
+  }
+  if (path.startsWith("/documents") || path.includes("/documents")) {
+    return developerApiSecurity(`documents:${access}`, "document", "source_scoped", access);
+  }
+  if (path.startsWith("/media-assets")) {
+    return developerApiSecurity(`documents:${access}`, "media_preview", "source_scoped", access);
+  }
+  if (path.startsWith("/jobs") || path.includes("/jobs")) {
+    return developerApiSecurity(
+      path === "/jobs/batch" ? "jobs:read" : method === "post" ? "jobs:write" : "jobs:read",
+      "job",
+      "standard",
+      access,
+    );
+  }
+  if (path.includes("/graph")) {
+    return developerApiSecurity("graph:read", "graph", "standard", "read");
+  }
+  if (path.includes("/source-watch-rules") || path.includes("/scheduled-import-jobs")) {
+    return developerApiSecurity(`source_watch:${access}`, "source_watch", "source_scoped", access);
+  }
+  if (path.startsWith("/webhooks")) {
+    return developerApiSecurity(`webhooks:${access}`, "webhook", "secret_masked", access);
+  }
+  if (path.startsWith("/cleanup-operations")) {
+    return developerApiSecurity(`cleanup:${access}`, "cleanup", "source_scoped", access);
+  }
+  if (path.includes("/imports")) {
+    return developerApiSecurity("imports:write", "import", "source_scoped", "write");
+  }
+  if (path.includes("/knowledge-checks")) {
+    return developerApiSecurity(
+      `knowledge_checks:${access}`,
+      "knowledge_check",
+      "standard",
+      access,
+    );
+  }
+  if (
+    path.includes("/wiki-drafts") ||
+    path.includes("/pages") ||
+    path.includes("/versions") ||
+    path.includes("/change-sets") ||
+    path.includes("/rollback")
+  ) {
+    return developerApiSecurity(`wiki:${access}`, "wiki", "source_scoped", access);
+  }
+  if (path.startsWith("/forks") || path.includes("/forks")) {
+    return developerApiSecurity(`forks:${access}`, "fork", "standard", access);
+  }
+  if (path.startsWith("/knowledge-bases")) {
+    return developerApiSecurity(`knowledge_bases:${access}`, "knowledge_base", "standard", access);
+  }
+
+  throw new Error(`Unclassified OpenAPI route security metadata: ${method.toUpperCase()} ${path}`);
+}
+
+function developerApiSecurity(
+  permission: string,
+  rateLimitClass: string,
+  redactionClass: string,
+  auditClass: string,
+): OpenApiSecurityMetadata {
+  return {
+    auditClass,
+    authMode: "bearer_api_key",
+    permission,
+    rateLimitClass,
+    redactionClass,
+    tier: "developer-api",
+  };
+}

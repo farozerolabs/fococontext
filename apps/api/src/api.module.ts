@@ -165,6 +165,20 @@ import {
 } from "./runtime/runtime-api-metrics.js";
 import { runtimeConfigToken } from "./runtime-config.provider.js";
 import {
+  createRedisSecurityAuditCounterStore,
+  securityAuditCounterStoreToken,
+  SecurityAuditService,
+  securityAuditStoreToken,
+  type SecurityAuditCounterStore,
+  type SecurityAuditStore,
+} from "./security/security-audit.js";
+import {
+  createRedisSecurityRateLimitStore,
+  securityRateLimitStoreToken,
+  SecurityRateLimitGuard,
+  type SecurityRateLimitStore,
+} from "./security/security-rate-limit.js";
+import {
   KnowledgeBaseSourceWatchController,
   ScheduledImportJobController,
   SourceWatchRuleController,
@@ -227,6 +241,9 @@ export interface ApiModuleOptions {
   runtimeApiMetricsStore?: RuntimeApiMetricsStore;
   runtimeQueuePressureRecorder?: RuntimeQueuePressureRecorder;
   retrievalQualityMetricsStore?: RetrievalQualityMetricsStore;
+  securityAuditCounterStore?: SecurityAuditCounterStore;
+  securityAuditStore?: SecurityAuditStore;
+  securityRateLimitStore?: SecurityRateLimitStore;
 }
 
 @Module({})
@@ -334,6 +351,19 @@ export class ApiModule implements NestModule {
           provide: runtimeQueuePressureRecorderToken,
           useValue:
             options.runtimeQueuePressureRecorder ?? createRedisRuntimeQueuePressureRecorder(config),
+        },
+        {
+          provide: securityAuditStoreToken,
+          useValue: requireProductionDependency("securityAuditStore", options.securityAuditStore),
+        },
+        {
+          provide: securityAuditCounterStoreToken,
+          useValue:
+            options.securityAuditCounterStore ?? createRedisSecurityAuditCounterStore(config),
+        },
+        {
+          provide: securityRateLimitStoreToken,
+          useValue: options.securityRateLimitStore ?? createRedisSecurityRateLimitStore(config),
         },
         {
           provide: objectStorageToken,
@@ -482,6 +512,7 @@ export class ApiModule implements NestModule {
         },
         AdminAuthService,
         AdminSessionMiddleware,
+        SecurityAuditService,
         KnowledgeBaseService,
         UploadAdmissionService,
         DeletionCleanupManifestCollector,
@@ -507,6 +538,7 @@ export class ApiModule implements NestModule {
             objectStorageOperationRecorder: RedisObjectStorageOperationRecorder,
             retrievalQualityMetricsStore: RetrievalQualityMetricsStore,
             runtimeQueuePressureRecorder: RuntimeQueuePressureRecorder,
+            securityAuditCounterStore: SecurityAuditCounterStore,
           ) =>
             new SystemStatusService(
               config,
@@ -518,6 +550,7 @@ export class ApiModule implements NestModule {
               objectStorageOperationRecorder,
               retrievalQualityMetricsStore,
               runtimeQueuePressureRecorder,
+              securityAuditCounterStore,
             ),
           inject: [
             UploadAdmissionService,
@@ -527,7 +560,12 @@ export class ApiModule implements NestModule {
             objectStorageOperationRecorderToken,
             retrievalQualityMetricsStoreToken,
             runtimeQueuePressureRecorderToken,
+            securityAuditCounterStoreToken,
           ],
+        },
+        {
+          provide: APP_GUARD,
+          useClass: SecurityRateLimitGuard,
         },
         {
           provide: APP_GUARD,

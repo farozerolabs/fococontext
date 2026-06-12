@@ -1258,12 +1258,18 @@ export const zhCNMessages = {
   },
   apiError: {
     forbidden: "无权访问。",
+    admission_limited: "请求被准入控制限制。",
+    export_limit_exceeded: "导出请求超过限制。",
+    evidence_limit_exceeded: "资料证据返回量超过限制。",
     internal_error: "服务内部错误。",
     invalid_api_key: "API Key 无效。",
     invalid_request: "请求参数错误。",
     knowledge_base_not_found: "知识库不存在。",
+    rate_limited: "请求过多，请稍后再试。",
+    request_size_limit_exceeded: "请求大小超过限制。",
     resource_cleanup_pending: "资源清理中。",
     resource_deleted: "资源已删除。",
+    retrieve_limit_exceeded: "检索请求超过限制。",
   },
   version: {
     addedPages: "新增页面",

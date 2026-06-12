@@ -92,6 +92,10 @@ export const apiErrorCodes = [
   "resource_conflict",
   "ingest_lock_conflict",
   "rate_limited",
+  "admission_limited",
+  "request_size_limit_exceeded",
+  "retrieve_limit_exceeded",
+  "export_limit_exceeded",
   "internal_error",
 ] as const;
 

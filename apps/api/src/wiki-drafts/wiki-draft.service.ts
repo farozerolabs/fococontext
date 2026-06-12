@@ -13,7 +13,7 @@ import {
   type SourceParseQueue,
   type SourceParseQueuePayload,
 } from "../queues/source-parse.queue.js";
-import type { ApiResourceScope } from "../auth/api-key.guard.js";
+import { defaultApiResourceScope, type ApiResourceScope } from "../auth/api-key.guard.js";
 import { WebhookService } from "../webhooks/webhook.service.js";
 import type {
   SubmitWikiDraftInput,
@@ -119,8 +119,11 @@ export class WikiDraftService {
       document.knowledgeBaseId,
       scope,
     );
+    const queueScope = scope ?? defaultApiResourceScope;
     const payload: SourceParseQueuePayload = {
       job_id: job.id,
+      tenant_id: queueScope.tenantId,
+      project_id: queueScope.projectId,
       knowledge_base_id: job.knowledgeBaseId,
       document_id: document.id,
       content_hash: job.contentHash,

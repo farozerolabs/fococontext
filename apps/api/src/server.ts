@@ -8,6 +8,7 @@ import {
   createPostgresApiKeyResolver,
   upsertEnvBootstrapApiKey,
 } from "./auth/persisted-api-key.resolver.js";
+import { createPostgresSecurityAuditStore } from "./security/security-audit.js";
 import { createPostgresWikiStore } from "./wiki/wiki-store.js";
 import { createApiApp } from "./app.js";
 
@@ -24,6 +25,7 @@ async function main(): Promise<void> {
     apiDatabaseMirror: createPostgresApiDatabaseMirror(db, identity),
     boundedRetrievalRepository: createPostgresBoundedRetrievalRepository(db),
     operationalReadStore: createPostgresOperationalReadStore(db),
+    securityAuditStore: createPostgresSecurityAuditStore(db),
     defaultIdentity: identity,
     wikiStore: createPostgresWikiStore(db),
   });

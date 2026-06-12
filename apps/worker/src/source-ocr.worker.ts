@@ -260,6 +260,8 @@ export class SourceOcrProcessor {
       jobId: payload.job_id,
       knowledgeBaseId: payload.knowledge_base_id,
       inputSnapshotId: payload.input_snapshot_id,
+      tenantId: payload.tenant_id,
+      projectId: payload.project_id,
       sourceDocumentId: payload.document_id,
     });
 
@@ -444,6 +446,8 @@ export class SourceOcrProcessor {
             jobId: payload.job_id,
             knowledgeBaseId: payload.knowledge_base_id,
             inputSnapshotId: payload.input_snapshot_id,
+            tenantId: payload.tenant_id,
+            projectId: payload.project_id,
             sourceDocumentId: payload.document_id,
           });
 
@@ -786,6 +790,8 @@ export class SourceOcrProcessor {
     if (this.captionQueue !== undefined && context.mediaAssetIds.length > 0) {
       await this.captionQueue.enqueueMediaCaptionJob({
         job_id: payload.job_id,
+        tenant_id: payload.tenant_id,
+        project_id: payload.project_id,
         knowledge_base_id: payload.knowledge_base_id,
         document_id: payload.document_id,
         parsed_content_id: payload.parsed_content_id,
@@ -816,6 +822,8 @@ export class SourceOcrProcessor {
 
     await this.compileQueue?.enqueueWikiAnalyzeJob({
       job_id: payload.job_id,
+      tenant_id: payload.tenant_id,
+      project_id: payload.project_id,
       knowledge_base_id: payload.knowledge_base_id,
       document_id: payload.document_id,
       parsed_content_id: payload.parsed_content_id,
@@ -863,6 +871,8 @@ export class SourceOcrProcessor {
       jobId: payload.job_id,
       knowledgeBaseId: payload.knowledge_base_id,
       inputSnapshotId: payload.input_snapshot_id,
+      tenantId: payload.tenant_id,
+      projectId: payload.project_id,
       sourceDocumentId: payload.document_id,
     });
 

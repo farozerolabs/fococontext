@@ -6,6 +6,9 @@ export interface FococontextApiClientOptions {
   locale?: string | (() => string | undefined)
 }
 
+const adminCsrfHeaderName = "x-fococontext-csrf"
+const adminCsrfHeaderValue = "1"
+
 export interface ListOptions {
   cursor?: string
   limit?: number
@@ -2804,6 +2807,10 @@ function createHeaders(
     headers.set("content-type", "application/json")
   }
 
+  if (requiresAdminCsrfProof(init.method)) {
+    headers.set(adminCsrfHeaderName, adminCsrfHeaderValue)
+  }
+
   if (options.apiKey !== undefined && options.apiKey.length > 0) {
     headers.set("authorization", `Bearer ${options.apiKey}`)
   }
@@ -2816,6 +2823,12 @@ function createHeaders(
   }
 
   return headers
+}
+
+function requiresAdminCsrfProof(method: string | undefined): boolean {
+  const normalizedMethod = (method ?? "GET").toUpperCase()
+
+  return !["GET", "HEAD", "OPTIONS"].includes(normalizedMethod)
 }
 
 function resolveClientLocale(options: FococontextApiClientOptions) {

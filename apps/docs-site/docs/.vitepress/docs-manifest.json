@@ -60,6 +60,14 @@
           }
         },
         {
+          "id": "help-security-deployment",
+          "slug": "security-deployment",
+          "title": {
+            "en-US": "Security Deployment",
+            "zh-CN": "安全部署"
+          }
+        },
+        {
           "id": "help-knowledge-bases",
           "slug": "knowledge-bases",
           "title": {

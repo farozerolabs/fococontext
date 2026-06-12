@@ -12,7 +12,11 @@ import type {
   DatasetConfigurationResponse,
   KnowledgeBaseResponse,
 } from "../knowledge-bases/knowledge-base.types.js";
-import { defaultApiResourceScope, type ApiResourceScope } from "../auth/api-key.guard.js";
+import {
+  defaultApiResourceScope,
+  type ApiKeyScope,
+  type ApiResourceScope,
+} from "../auth/api-key.guard.js";
 import { objectStorageToken } from "../object-storage.provider.js";
 import { apiDatabaseMirrorToken, type ApiDatabaseMirror } from "../database/api-database-mirror.js";
 import {
@@ -47,6 +51,10 @@ import {
 import { runtimeConfigToken } from "../runtime-config.provider.js";
 import { WebhookService } from "../webhooks/webhook.service.js";
 import { wikiStoreToken, type WikiStore } from "../wiki/wiki-store.js";
+import {
+  createRemoteSourceSecurityPolicy,
+  validateRemoteSourceUrl,
+} from "../source-watch/remote-source-security.js";
 import type { DeletionCleanupOperationRecord } from "../deletion-cleanup/deletion-cleanup.types.js";
 import { sourceEvidenceKinds } from "./document.types.js";
 import type {
@@ -169,6 +177,15 @@ interface CreateUploadSessionInput {
 
 interface FinalizeUploadSessionInput {
   content_hash?: string;
+}
+
+interface UploadSessionActorScope {
+  actorAccountId: string | null;
+  actorId: string;
+  actorSource: string;
+  actorType: UploadSessionRecord["actorType"];
+  projectId: string;
+  tenantId: string;
 }
 
 interface RetryOcrInput {
@@ -341,7 +358,7 @@ export class DocumentService {
     const replayed =
       normalizedKey === undefined
         ? undefined
-        : await this.findUploadSessionByIdempotencyKey(knowledgeBaseId, normalizedKey);
+        : await this.findUploadSessionByIdempotencyKey(knowledgeBaseId, normalizedKey, scope);
 
     if (replayed !== undefined) {
       return this.createUploadSessionResponse(replayed);
@@ -363,6 +380,7 @@ export class DocumentService {
     )}`;
     const session: UploadSessionRecord = {
       id: createResourceId("uploadSession"),
+      ...createUploadSessionActorScope(scope),
       knowledgeBaseId,
       documentId,
       objectKey,
@@ -398,7 +416,7 @@ export class DocumentService {
     const knowledgeBase = await this.getReadableKnowledgeBase(knowledgeBaseId, scope);
     await this.expireCreatedUploadSessions(new Date().toISOString());
 
-    const session = await this.requireUploadSession(knowledgeBaseId, uploadSessionId);
+    const session = await this.requireUploadSession(knowledgeBaseId, uploadSessionId, scope);
     const replayed = await this.findFinalizedUploadSessionResult(session);
 
     if (replayed !== undefined) {
@@ -567,7 +585,7 @@ export class DocumentService {
       return replayed;
     }
 
-    const sourceUrl = readValidUrl(input.url);
+    const sourceUrl = readValidUrl(input.url, this.runtimeConfig);
     const name = input.name?.trim() || sourceUrl;
     const uploadedFile = await this.uploadBuffer(knowledgeBaseId, {
       name,
@@ -1260,9 +1278,12 @@ export class DocumentService {
       document.knowledgeBaseId,
       scope,
     );
+    const actorScope = createUploadSessionActorScope(scope);
 
     await this.mediaCaptionQueue.enqueueMediaCaptionJob({
       job_id: latestJob.id,
+      tenant_id: actorScope.tenantId,
+      project_id: actorScope.projectId,
       knowledge_base_id: document.knowledgeBaseId,
       document_id: document.id,
       parsed_content_id: mediaAsset.parsedContentId ?? parsedContent.id,
@@ -1349,8 +1370,9 @@ export class DocumentService {
     await this.databaseMirror.updateSourceDocument(updatedDocument);
     await this.databaseMirror.saveJob(job);
     await this.databaseMirror.appendJobEvent(createQueuedJobEvent(job));
+    const actorScope = createUploadSessionActorScope(scope);
     await this.sourceOcrQueue.enqueueSourceOcrJob(
-      createSourceOcrRetryPayload(document, parsedContent, job, pageNumbers),
+      createSourceOcrRetryPayload(document, parsedContent, job, pageNumbers, actorScope),
     );
 
     return toJobResponse(job);
@@ -1904,11 +1926,17 @@ export class DocumentService {
   private async findUploadSessionByIdempotencyKey(
     knowledgeBaseId: string,
     idempotencyKey: string,
+    scope?: ApiResourceScope,
   ): Promise<UploadSessionRecord | undefined> {
-    const session = await this.operationalReadStore.getUploadSessionByIdempotencyKey(
-      knowledgeBaseId,
+    const actorScope = createUploadSessionActorScope(scope);
+    const session = await this.operationalReadStore.getUploadSessionByIdempotencyKey({
+      actorId: actorScope.actorId,
+      actorType: actorScope.actorType,
       idempotencyKey,
-    );
+      knowledgeBaseId,
+      projectId: actorScope.projectId,
+      tenantId: actorScope.tenantId,
+    });
 
     return session ?? undefined;
   }
@@ -1916,10 +1944,16 @@ export class DocumentService {
   private async requireUploadSession(
     knowledgeBaseId: string,
     uploadSessionId: string,
+    scope?: ApiResourceScope,
   ): Promise<UploadSessionRecord> {
     const session = await this.operationalReadStore.getUploadSessionById(uploadSessionId);
 
-    if (session === undefined || session === null || session.knowledgeBaseId !== knowledgeBaseId) {
+    if (
+      session === undefined ||
+      session === null ||
+      session.knowledgeBaseId !== knowledgeBaseId ||
+      !isUploadSessionScopeMatch(session, createUploadSessionActorScope(scope))
+    ) {
       throw new ApiError("upload_session_not_found");
     }
 
@@ -2013,8 +2047,11 @@ export class DocumentService {
       document.knowledgeBaseId,
       scope,
     );
+    const actorScope = createUploadSessionActorScope(scope);
     const payload: SourceParseQueuePayload = {
       job_id: job.id,
+      tenant_id: actorScope.tenantId,
+      project_id: actorScope.projectId,
       knowledge_base_id: job.knowledgeBaseId,
       document_id: document.id,
       content_hash: job.contentHash,
@@ -2383,9 +2420,12 @@ function createSourceOcrRetryPayload(
   parsedContent: ParsedContentRecord,
   job: JobRecord,
   pageNumbers: readonly number[],
+  scope: UploadSessionActorScope,
 ): SourceOcrQueuePayload {
   return {
     job_id: job.id,
+    tenant_id: scope.tenantId,
+    project_id: scope.projectId,
     knowledge_base_id: job.knowledgeBaseId,
     document_id: document.id,
     parsed_content_id: parsedContent.id,
@@ -3216,6 +3256,42 @@ function toUploadSessionResponse(record: UploadSessionRecord): UploadSessionResp
   return response;
 }
 
+function createUploadSessionActorScope(
+  scope?: ApiResourceScope,
+): Pick<
+  UploadSessionRecord,
+  "actorAccountId" | "actorId" | "actorSource" | "actorType" | "projectId" | "tenantId"
+> {
+  const scopedActor = scope as Partial<ApiKeyScope> | undefined;
+  const apiKeyId = scopedActor?.apiKeyId;
+  const actorType: UploadSessionRecord["actorType"] =
+    apiKeyId === "admin_session" ? "admin_session" : apiKeyId === undefined ? "system" : "api_key";
+
+  return {
+    actorAccountId:
+      typeof scopedActor?.accountId === "string" && scopedActor.accountId.length > 0
+        ? scopedActor.accountId
+        : null,
+    actorId: apiKeyId ?? "system",
+    actorSource: scopedActor?.source ?? "system",
+    actorType,
+    projectId: scope?.projectId ?? defaultApiResourceScope.projectId,
+    tenantId: scope?.tenantId ?? defaultApiResourceScope.tenantId,
+  };
+}
+
+function isUploadSessionScopeMatch(
+  session: UploadSessionRecord,
+  actorScope: UploadSessionActorScope,
+): boolean {
+  return (
+    session.tenantId === actorScope.tenantId &&
+    session.projectId === actorScope.projectId &&
+    session.actorType === actorScope.actorType &&
+    session.actorId === actorScope.actorId
+  );
+}
+
 export function toJobResponse(record: JobRecord): JobResponse {
   const progressState = resolveJobProgressState({
     progress: record.progress,
@@ -3710,12 +3786,19 @@ function createObjectStorageValidationMetadata(input: {
   };
 }
 
-function readValidUrl(value: string | undefined): string {
+function readValidUrl(value: string | undefined, config: RuntimeConfig): string {
   const rawUrl = readRequiredString(value, "url");
 
   try {
-    return new URL(rawUrl).toString();
+    return validateRemoteSourceUrl(
+      rawUrl,
+      createRemoteSourceSecurityPolicy(config, ["http", "https"]),
+    ).toString();
   } catch (error) {
+    if (error instanceof ApiError) {
+      throw error;
+    }
+
     throw new ApiError("invalid_request", {
       messageKey: "api.validation.source_url_invalid",
       details: {

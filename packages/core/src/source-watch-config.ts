@@ -36,3 +36,8 @@ export interface SourceWatchRuntimeAdapters {
     redirectLimit: number;
   };
 }
+
+export interface SourceWatchRemoteSecurityConfig {
+  privateNetworkAllowlist: readonly string[];
+  privateNetworkEnabled: boolean;
+}

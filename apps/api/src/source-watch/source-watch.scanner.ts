@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { lstat, mkdir, mkdtemp, opendir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { RuntimeConfig } from "@fococontext/core";
 import {
@@ -21,6 +21,12 @@ import type {
   SourceWatchScanStageItem,
   SourceWatchSkippedSource,
 } from "./source-watch.types.js";
+import {
+  createRemoteSourceSecurityPolicy,
+  inspectRemoteSourceUrl,
+  validateRemoteSourceUrlWithDns,
+  type RemoteSourceSecurityPolicy,
+} from "./remote-source-security.js";
 
 export const sourceWatchScannerToken = Symbol("sourceWatchScanner");
 const execFileAsync = promisify(execFile);
@@ -209,7 +215,12 @@ async function scanUrlList(
   }
 
   const skipped: SourceWatchSkippedSource[] = [];
-  const sources = collectUrlListSources(rule, adapter, skipped);
+  const sources = collectUrlListSources(
+    rule,
+    adapter,
+    createRemoteSourceSecurityPolicy(config, adapter.allowedProtocols),
+    skipped,
+  );
   await stageSourceWatchItems(options, runtimeOptions, rule, [
     ...toSourceWatchStageItems("discovered", sources),
     ...toSourceWatchSkippedStageItems(skipped),
@@ -241,6 +252,7 @@ async function scanUrlList(
 function collectUrlListSources(
   rule: SourceWatchRuleRecord,
   adapter: RuntimeConfig["sourceWatch"]["adapters"]["urlList"],
+  policy: RemoteSourceSecurityPolicy,
   skipped: SourceWatchSkippedSource[],
 ): SourceWatchDiscoveredSource[] {
   const values = rule.location
@@ -262,29 +274,20 @@ function collectUrlListSources(
       return;
     }
 
-    const parsed = parseUrl(value);
+    const inspected = inspectRemoteSourceUrl(value, policy);
 
-    if (parsed === null) {
+    if (!inspected.ok) {
       skipped.push({
         source_path: value,
-        reason: "invalid_url",
-      });
-      return;
-    }
-
-    const protocol = parsed.protocol.replace(/:$/u, "");
-
-    if (!adapter.allowedProtocols.includes(protocol)) {
-      skipped.push({
-        source_path: value,
-        reason: "unsupported_protocol",
+        reason: inspected.reason,
         metadata: {
-          allowed_protocols: [...adapter.allowedProtocols],
+          remote_source_error: inspected.details,
         },
       });
       return;
     }
 
+    const parsed = inspected.url;
     const normalizedUrl = parsed.toString();
 
     if (seenUrls.has(normalizedUrl)) {
@@ -569,14 +572,12 @@ async function scanGitRepository(
     return createDisabledDiscovery("source_watch_adapter_disabled");
   }
 
-  const parsedUrl = parseUrl(rule.location);
-  const protocol = parsedUrl?.protocol.replace(/:$/u, "");
-
-  if (
-    parsedUrl === null ||
-    parsedUrl === undefined ||
-    !adapter.allowedProtocols.includes(protocol ?? "")
-  ) {
+  try {
+    await validateRemoteSourceUrlWithDns(
+      rule.location,
+      createRemoteSourceSecurityPolicy(config, adapter.allowedProtocols),
+    );
+  } catch {
     return createFailedDiscovery(rule.location, "invalid_git_repository");
   }
 
@@ -1032,14 +1033,6 @@ function createUrlSourceName(url: URL): string {
   return lastSegment === undefined ? url.hostname : lastSegment;
 }
 
-function parseUrl(value: string): URL | null {
-  try {
-    return new URL(value);
-  } catch {
-    return null;
-  }
-}
-
 function parseS3Location(
   value: string,
   fallbackBucket: string | undefined,
@@ -1111,7 +1104,7 @@ async function writeTemporaryIngestFile(
   content: Buffer,
 ): Promise<{ cleanupPath: string; filePath: string }> {
   const tempRoot = await mkdtemp(join(tmpdir(), "fococontext-source-watch-ingest-"));
-  const filePath = join(tempRoot, normalizeSourcePath(sourcePath));
+  const filePath = resolveSafeTemporaryIngestPath(tempRoot, sourcePath);
 
   await mkdir(dirname(filePath), { recursive: true });
   await writeFile(filePath, content);
@@ -1232,6 +1225,27 @@ function createSourceWatchSourceIdentity(source: SourceWatchDiscoveredSource): s
 
 function normalizeSourcePath(value: string): string {
   return value.split(sep).join("/").replace(/^\/+/u, "");
+}
+
+export function resolveSafeTemporaryIngestPath(tempRoot: string, sourcePath: string): string {
+  if (isAbsolute(sourcePath) || /^[a-z]:[\\/]/iu.test(sourcePath)) {
+    throw new Error("Source watch source path must be relative.");
+  }
+
+  const normalizedPath = normalizeSourcePath(sourcePath).trim();
+
+  if (normalizedPath.length === 0) {
+    throw new Error("Source watch source path is required.");
+  }
+
+  const root = resolve(tempRoot);
+  const target = resolve(root, normalizedPath);
+
+  if (target !== root && target.startsWith(`${root}${sep}`)) {
+    return target;
+  }
+
+  throw new Error("Source watch source path escapes the temporary ingest directory.");
 }
 
 function readOptionalCursorString(value: unknown): string | undefined {

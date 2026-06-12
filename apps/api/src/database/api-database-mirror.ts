@@ -646,6 +646,12 @@ class PostgresApiDatabaseMirror implements ApiDatabaseMirror {
     await sql`
       insert into upload_sessions (
         id,
+        tenant_id,
+        project_id,
+        actor_type,
+        actor_id,
+        actor_source,
+        actor_account_id,
         knowledge_base_id,
         document_id,
         object_key,
@@ -668,6 +674,12 @@ class PostgresApiDatabaseMirror implements ApiDatabaseMirror {
       )
       values (
         ${record.id},
+        ${record.tenantId},
+        ${record.projectId},
+        ${record.actorType},
+        ${record.actorId},
+        ${record.actorSource},
+        ${record.actorAccountId},
         ${record.knowledgeBaseId},
         ${record.documentId},
         ${record.objectKey},
@@ -689,6 +701,12 @@ class PostgresApiDatabaseMirror implements ApiDatabaseMirror {
         ${record.updatedAt}
       )
       on conflict (id) do update set
+        tenant_id = excluded.tenant_id,
+        project_id = excluded.project_id,
+        actor_type = excluded.actor_type,
+        actor_id = excluded.actor_id,
+        actor_source = excluded.actor_source,
+        actor_account_id = excluded.actor_account_id,
         object_key = excluded.object_key,
         file_name = excluded.file_name,
         display_name = excluded.display_name,

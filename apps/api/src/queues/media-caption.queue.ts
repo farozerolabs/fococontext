@@ -9,6 +9,8 @@ export const mediaCaptionJobName = "media.caption.document";
 
 export interface MediaCaptionQueuePayload {
   job_id: string;
+  tenant_id: string;
+  project_id: string;
   knowledge_base_id: string;
   document_id: string;
   parsed_content_id: string;

@@ -6,6 +6,10 @@ import type { FastifyRequest } from "fastify";
 
 import { runtimeConfigToken } from "../runtime-config.provider.js";
 import type { AdminSessionCarrier } from "./admin-session.middleware.js";
+import {
+  createSecurityAuditActorFromRequest,
+  SecurityAuditService,
+} from "../security/security-audit.js";
 
 export const apiKeyResolverToken = Symbol("apiKeyResolver");
 export const adminSessionApiScopeToken = Symbol("adminSessionApiScope");
@@ -57,6 +61,8 @@ export class ApiKeyGuard implements CanActivate {
     @Optional()
     @Inject(adminSessionApiScopeToken)
     private readonly adminSessionApiScope: ApiKeyScope = createAdminSessionApiScope(),
+    @Optional()
+    private readonly auditService?: SecurityAuditService,
   ) {}
 
   canActivate(context: ExecutionContext): boolean | Promise<boolean> {
@@ -68,6 +74,11 @@ export class ApiKeyGuard implements CanActivate {
       }
 
       if (extractBearerApiKey(request.headers.authorization) === undefined) {
+        this.recordAudit(request, {
+          eventType: "openapi_document_auth_failed",
+          reasonCode: "missing_bearer_token",
+          routeGroup: "openapi",
+        });
         throw new ApiError("forbidden", {
           messageKey: "api.validation.openapi_document_auth_required",
         });
@@ -75,6 +86,11 @@ export class ApiKeyGuard implements CanActivate {
 
       return this.withResolvedBearerScope(request, (scope) => {
         if (!hasApiKeyPermission(scope, "openapi:read")) {
+          this.recordAudit(request, {
+            eventType: "openapi_document_auth_failed",
+            reasonCode: "missing_openapi_permission",
+            routeGroup: "openapi",
+          });
           throw new ApiError("forbidden", {
             messageKey: "api.validation.openapi_document_auth_required",
           });
@@ -96,7 +112,23 @@ export class ApiKeyGuard implements CanActivate {
       }
 
       return this.withResolvedBearerScope(request, (scope) => {
-        assertApiKeyRoutePermission(scope, request.method, request.url);
+        const permission = requiredApiKeyRoutePermission(request.method, request.url);
+
+        if (permission !== undefined && !hasApiKeyPermission(scope, permission)) {
+          request.apiKeyScope = scope;
+          this.recordAudit(request, {
+            eventType: "api_key_authorization_failed",
+            reasonCode: "missing_permission",
+            routeGroup: "developer_api",
+          });
+          throw new ApiError("forbidden", {
+            messageKey: "api.validation.api_key_permission_required",
+            details: {
+              permission,
+            },
+          });
+        }
+
         request.apiKeyScope = scope;
         request.apiKeyAuthenticated = true;
 
@@ -125,18 +157,33 @@ export class ApiKeyGuard implements CanActivate {
     const resolver = this.apiKeyResolver ?? createEnvApiKeyResolver(this.config);
 
     if (token === undefined) {
+      this.recordAudit(request, {
+        eventType: "api_key_auth_failed",
+        reasonCode: "missing_bearer_token",
+        routeGroup: "developer_api",
+      });
       throw new ApiError("invalid_api_key");
     }
 
     const scope = resolver.resolveApiKey(token);
 
     if (scope === undefined) {
+      this.recordAudit(request, {
+        eventType: "api_key_auth_failed",
+        reasonCode: "invalid_api_key",
+        routeGroup: "developer_api",
+      });
       throw new ApiError("invalid_api_key");
     }
 
     if (isPromiseLike(scope)) {
       return scope.then((resolved) => {
         if (resolved === undefined) {
+          this.recordAudit(request, {
+            eventType: "api_key_auth_failed",
+            reasonCode: "invalid_api_key",
+            routeGroup: "developer_api",
+          });
           throw new ApiError("invalid_api_key");
         }
 
@@ -145,6 +192,28 @@ export class ApiKeyGuard implements CanActivate {
     }
 
     return scope;
+  }
+
+  private recordAudit(
+    request: ApiKeyRequest,
+    input: {
+      eventType: string;
+      reasonCode: string;
+      routeGroup: string;
+    },
+  ): void {
+    void this.auditService
+      ?.record({
+        actor: createSecurityAuditActorFromRequest(request),
+        eventType: input.eventType,
+        outcome: "failure",
+        reasonCode: input.reasonCode,
+        requestId: null,
+        routeGroup: input.routeGroup,
+      })
+      .catch((error: unknown) => {
+        console.warn("Security audit recording failed.", error);
+      });
   }
 }
 
@@ -254,6 +323,18 @@ export function requiredApiKeyRoutePermission(
   if (pathname === "/v1/openapi.json") {
     return "openapi:read";
   }
+  if (pathname === "/v1/runtime/status" || pathname.startsWith("/v1/runtime/")) {
+    return "runtime:read";
+  }
+  if (pathname === "/v1/dataset-configuration-presets") {
+    return "dataset_configuration:read";
+  }
+  if (pathname === "/v1/api-keys") {
+    return "api_keys:write";
+  }
+  if (pathname === "/v1/source-evidence/resolve") {
+    return "documents:read";
+  }
   if (
     pathname === "/v1/retrieve" ||
     pathname === "/v1/retrieve/expand" ||
@@ -297,7 +378,11 @@ export function requiredApiKeyRoutePermission(
   if (pathname.includes("/wiki-drafts") || pathname.includes("/pages")) {
     return `wiki:${access}`;
   }
-  if (pathname.includes("/versions") || pathname.includes("/change-sets")) {
+  if (
+    pathname.includes("/versions") ||
+    pathname.includes("/change-sets") ||
+    pathname.includes("/rollback")
+  ) {
     return `wiki:${access}`;
   }
   if (pathname.startsWith("/v1/forks") || pathname.includes("/forks")) {

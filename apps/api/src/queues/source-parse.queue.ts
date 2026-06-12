@@ -9,6 +9,8 @@ export const sourceParseJobName = "source.parse.document";
 
 export interface SourceParseQueuePayload {
   job_id: string;
+  tenant_id: string;
+  project_id: string;
   knowledge_base_id: string;
   document_id: string;
   content_hash: string;

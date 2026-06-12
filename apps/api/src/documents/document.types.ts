@@ -97,6 +97,12 @@ export interface SourceDocumentRecord {
 
 export interface UploadSessionRecord {
   id: string;
+  tenantId: string;
+  projectId: string;
+  actorType: "api_key" | "admin_session" | "system" | "unknown";
+  actorId: string;
+  actorSource: string;
+  actorAccountId: string | null;
   knowledgeBaseId: string;
   documentId: string;
   objectKey: string;

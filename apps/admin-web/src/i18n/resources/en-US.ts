@@ -1290,12 +1290,18 @@ export const enUSMessages = {
   },
   apiError: {
     forbidden: "Forbidden.",
+    admission_limited: "The request was limited by admission control.",
+    export_limit_exceeded: "Export limit exceeded.",
+    evidence_limit_exceeded: "Source evidence limit exceeded.",
     internal_error: "Internal error.",
     invalid_api_key: "Invalid API key.",
     invalid_request: "Invalid request.",
     knowledge_base_not_found: "Knowledge base not found.",
+    rate_limited: "Too many requests. Try again later.",
+    request_size_limit_exceeded: "Request size limit exceeded.",
     resource_cleanup_pending: "Resource cleanup is pending.",
     resource_deleted: "Resource has been deleted.",
+    retrieve_limit_exceeded: "Retrieve limit exceeded.",
   },
   version: {
     addedPages: "Added pages",

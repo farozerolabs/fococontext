@@ -820,6 +820,8 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
       jobId: payload.job_id,
       knowledgeBaseId: payload.knowledge_base_id,
       inputSnapshotId: payload.input_snapshot_id,
+      tenantId: payload.tenant_id,
+      projectId: payload.project_id,
       sourceDocumentId: payload.document_id,
     });
 
@@ -1009,6 +1011,8 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
       });
       await this.generateQueue.enqueueWikiGenerateJob({
         job_id: payload.job_id,
+        tenant_id: payload.tenant_id,
+        project_id: payload.project_id,
         knowledge_base_id: payload.knowledge_base_id,
         analysis_result_id: analysisResult.id,
         source_document_ids: [payload.document_id],
@@ -1211,6 +1215,8 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
         });
         await this.generateQueue.enqueueWikiGenerateJob({
           job_id: payload.job_id,
+          tenant_id: payload.tenant_id,
+          project_id: payload.project_id,
           knowledge_base_id: payload.knowledge_base_id,
           analysis_result_id: analysisResult.id,
           source_document_ids: [payload.document_id],
@@ -1466,6 +1472,8 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
       jobId: payload.job_id,
       knowledgeBaseId: payload.knowledge_base_id,
       inputSnapshotId: payload.input_snapshot_id,
+      tenantId: payload.tenant_id,
+      projectId: payload.project_id,
       sourceDocumentId: payload.source_document_ids[0] ?? null,
     });
 
@@ -1614,6 +1622,8 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
 
         await this.mergeQueue.enqueueWikiMergeJob({
           job_id: payload.job_id,
+          tenant_id: payload.tenant_id,
+          project_id: payload.project_id,
           knowledge_base_id: payload.knowledge_base_id,
           wiki_draft_id: saved.id,
           target_page_id: null,
@@ -1891,6 +1901,8 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
 
     await this.mergeQueue.enqueueWikiMergeJob({
       job_id: input.payload.job_id,
+      tenant_id: input.payload.tenant_id,
+      project_id: input.payload.project_id,
       knowledge_base_id: input.payload.knowledge_base_id,
       wiki_draft_id: saved.id,
       target_page_id: null,
@@ -2037,6 +2049,8 @@ export class WikiMergeProcessorService implements WikiMergeProcessor {
       jobId: payload.job_id,
       knowledgeBaseId: payload.knowledge_base_id,
       inputSnapshotId: payload.input_snapshot_id,
+      tenantId: payload.tenant_id,
+      projectId: payload.project_id,
     });
     const resolvedPrompt = resolveDatasetPromptTemplateFromSnapshot({
       purpose: "merge",

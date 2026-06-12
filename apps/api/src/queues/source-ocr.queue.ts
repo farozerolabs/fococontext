@@ -9,6 +9,8 @@ export const sourceOcrJobName = "source.ocr.document";
 
 export interface SourceOcrQueuePayload {
   job_id: string;
+  tenant_id: string;
+  project_id: string;
   knowledge_base_id: string;
   document_id: string;
   parsed_content_id: string;

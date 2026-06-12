@@ -47,13 +47,16 @@ export type WorkerJobGuardReason =
   | "job_canceled"
   | "stale_input_snapshot"
   | "knowledge_base_deleted"
-  | "source_deleted";
+  | "source_deleted"
+  | "scope_mismatch";
 
 export interface WorkerJobGuardInput {
   jobId: string;
   knowledgeBaseId: string;
   inputSnapshotId: string;
+  projectId?: string;
   sourceDocumentId?: string | null;
+  tenantId?: string;
 }
 
 export interface WorkerJobGuardResult {
@@ -76,19 +79,31 @@ export class PostgresWorkerJobProgressWriter
 
   async canContinueJob(input: WorkerJobGuardInput): Promise<WorkerJobGuardResult> {
     const result = await sql<{
+      jobProjectId: string | null;
+      jobTenantId: string | null;
       status: string;
       inputSnapshotId: string | null;
+      knowledgeBaseProjectId: string | null;
       knowledgeBaseStatus: string | null;
+      knowledgeBaseTenantId: string | null;
       knowledgeBaseDeletedAt: Date | string | null;
+      sourceProjectId: string | null;
       sourceStatus: string | null;
+      sourceTenantId: string | null;
       sourceLifecycleStatus: string | null;
     }>`
       select
+        jobs.project_id as "jobProjectId",
+        jobs.tenant_id as "jobTenantId",
         jobs.status,
         jobs.metadata ->> 'input_snapshot_id' as "inputSnapshotId",
+        knowledge_bases.project_id as "knowledgeBaseProjectId",
         knowledge_bases.status as "knowledgeBaseStatus",
+        knowledge_bases.tenant_id as "knowledgeBaseTenantId",
         knowledge_bases.deleted_at as "knowledgeBaseDeletedAt",
+        source_documents.project_id as "sourceProjectId",
         source_documents.status as "sourceStatus",
+        source_documents.tenant_id as "sourceTenantId",
         source_documents.lifecycle_status as "sourceLifecycleStatus"
       from jobs
       left join knowledge_bases on knowledge_bases.id = jobs.knowledge_base_id
@@ -103,6 +118,19 @@ export class PostgresWorkerJobProgressWriter
     }
     if (row.status === "canceled") {
       return { canContinue: false, reason: "job_canceled" };
+    }
+    if (
+      input.tenantId !== undefined &&
+      input.projectId !== undefined &&
+      (row.jobTenantId !== input.tenantId ||
+        row.jobProjectId !== input.projectId ||
+        row.knowledgeBaseTenantId !== input.tenantId ||
+        row.knowledgeBaseProjectId !== input.projectId ||
+        (input.sourceDocumentId !== undefined &&
+          input.sourceDocumentId !== null &&
+          (row.sourceTenantId !== input.tenantId || row.sourceProjectId !== input.projectId)))
+    ) {
+      return { canContinue: false, reason: "scope_mismatch" };
     }
     if (row.inputSnapshotId !== input.inputSnapshotId) {
       return { canContinue: false, reason: "stale_input_snapshot" };

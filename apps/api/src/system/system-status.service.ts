@@ -32,34 +32,17 @@ import type {
   RuntimeApiMetricSummary,
   RuntimeApiMetricsStore,
 } from "../runtime/runtime-api-metrics.js";
-
-export interface RuntimeMetricsStatus {
-  api: RuntimeApiMetricSummary;
-  backends: {
-    api: "redis" | "unavailable";
-    cache: "redis" | "unavailable";
-    objectStorageOperations: "redis" | "unavailable";
-    queuePressure: "redis" | "unavailable";
-    retrievalQuality: "redis" | "unavailable";
-    sourceJobs: "postgresql";
-  };
-  cache: RuntimeCacheMetricSummary;
-  compile: {
-    activeJobs: number;
-    depth: number;
-    retryCount: number;
-    stageDurations: Record<string, DurationSummary>;
-  };
-  objectStorageOperations: ReturnType<typeof summarizeObjectStorageOperations>;
-  queue: {
-    activeJobs: number;
-    depth: number;
-    retryCount: number;
-  };
-  queuePressure: RuntimeQueuePressureSummary;
-  retrievalQuality: RetrieveQualityMetricSummary;
-  sourceJobs: RuntimeSourceJobSummary;
-}
+import type {
+  SecurityAuditCounterSnapshot,
+  SecurityAuditCounterStore,
+} from "../security/security-audit.js";
+import type {
+  DurationSummary,
+  ObjectStorageOperationMetricSummary,
+  ObjectStorageOperationPressureState,
+  PressureState,
+  RuntimeMetricsStatus,
+} from "./system-status.types.js";
 
 @Injectable()
 export class SystemStatusService {
@@ -73,9 +56,19 @@ export class SystemStatusService {
     private readonly objectStorageOperationRecorder?: RedisObjectStorageOperationRecorder,
     private readonly retrievalQualityMetricsStore?: RetrievalQualityMetricsStore,
     private readonly runtimeQueuePressureRecorder?: RuntimeQueuePressureRecorder,
+    private readonly securityAuditCounterStore?: SecurityAuditCounterStore,
   ) {}
 
-  async getHealthStatus() {
+  getHealthStatus() {
+    return {
+      service: "api",
+      status: "ready",
+      readiness: "ready",
+      degraded: false,
+    };
+  }
+
+  async getRuntimeDiagnosticsStatus() {
     return {
       status: "ready",
       runtime: this.getRuntimeStatus(),
@@ -280,6 +273,7 @@ export class SystemStatusService {
       },
       sourceWatch: this.getSourceWatchRuntimeStatus(),
       objectStorageOperations: this.config.limits.objectStorageOperations,
+      security: this.config.security,
     };
   }
 
@@ -315,6 +309,7 @@ export class SystemStatusService {
         objectStorageOperations: this.objectStorageOperationRecorder?.backend ?? "unavailable",
         queuePressure: this.runtimeQueuePressureRecorder === undefined ? "unavailable" : "redis",
         retrievalQuality: this.retrievalQualityMetricsStore?.backend ?? "unavailable",
+        securityAudit: this.securityAuditCounterStore?.backend ?? "unavailable",
         sourceJobs: "postgresql",
       },
       cache:
@@ -327,6 +322,12 @@ export class SystemStatusService {
         this.retrievalQualityMetricsStore === undefined
           ? emptyRetrievalQualityMetrics()
           : await this.retrievalQualityMetricsStore.snapshot(),
+      securityAudit:
+        this.securityAuditCounterStore === undefined
+          ? emptySecurityAuditCounters()
+          : await this.securityAuditCounterStore.snapshot(
+              this.config.security.audit.counterWindowSeconds,
+            ),
       queue: {
         depth: sourceJobs.queueDepth,
         activeJobs: sourceJobs.activeJobs,
@@ -647,6 +648,16 @@ export class SystemStatusService {
         concurrency: adapters.gitRepo.concurrency,
         maxRetries: adapters.gitRepo.maxRetries,
       },
+      remoteSecurity: {
+        privateNetworkEnabled: this.config.sourceWatch.remoteSecurity.privateNetworkEnabled,
+        privateNetworkAllowlistConfigured:
+          this.config.sourceWatch.remoteSecurity.privateNetworkAllowlist.length > 0,
+        warnings:
+          this.config.sourceWatch.remoteSecurity.privateNetworkEnabled &&
+          this.config.sourceWatch.remoteSecurity.privateNetworkAllowlist.length > 0
+            ? ["private_network_source_ingestion_enabled"]
+            : [],
+      },
       scheduler: {
         enabled: this.config.sourceWatch.scheduler.enabled,
         defaultIntervalSeconds: this.config.sourceWatch.scheduler.defaultIntervalSeconds,
@@ -819,35 +830,6 @@ function maskEndpoint(value: string): string {
   } catch {
     return "Configured";
   }
-}
-
-export type PressureState = "normal" | "degraded" | "saturated";
-export type ObjectStorageOperationPressureState = "normal" | "degraded" | "disabled";
-
-export interface DurationSummary {
-  count: number;
-  avgMs: number;
-  maxMs: number;
-  minMs: number;
-  latestMs: number;
-}
-
-export interface ObjectStorageOperationMetricSummary {
-  countsByCaller: Record<string, number>;
-  countsByClass: Record<ObjectStorageOperationClass, number>;
-  countsByOperation: Record<string, number>;
-  countsByStatus: Record<ObjectStorageOperationStatus, number>;
-  enabled: boolean;
-  hotCallers: Array<{ caller: string; count: number; classA: number; classB: number }>;
-  hotOperations: Array<{
-    operation: string;
-    count: number;
-    operationClass: ObjectStorageOperationClass;
-  }>;
-  latency: DurationSummary | null;
-  retryCount: number;
-  total: number;
-  windowSeconds: number;
 }
 
 function summarizeObjectStorageOperations(
@@ -1135,6 +1117,17 @@ function emptyRetrievalQualityMetrics(): RetrieveQualityMetricSummary {
     },
     traceStageCounts: {},
     warningCounts: {},
+    total: 0,
+    windowSeconds: 300,
+  };
+}
+
+function emptySecurityAuditCounters(): SecurityAuditCounterSnapshot {
+  return {
+    byEventType: {},
+    byOutcome: {},
+    byReasonCode: {},
+    byRouteGroup: {},
     total: 0,
     windowSeconds: 300,
   };

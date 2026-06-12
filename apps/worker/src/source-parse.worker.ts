@@ -38,12 +38,17 @@ import type {
   DatasetConfigurationSnapshotPayload,
   WikiAnalyzeQueue,
 } from "./wiki-compile.worker.js";
+import { runSourceThreatScan, type SourceThreatScanner } from "./source-threat-scan.js";
+
+export type { SourceThreatScanner } from "./source-threat-scan.js";
 
 export const sourceParseQueueName = "source.parse";
 export const sourceParseJobName = "source.parse.document";
 
 export interface SourceParsePayload {
   job_id: string;
+  tenant_id: string;
+  project_id: string;
   knowledge_base_id: string;
   document_id: string;
   content_hash: string;
@@ -100,6 +105,8 @@ export interface SourceOcrQueue {
 
 export interface SourceOcrPayload {
   job_id: string;
+  tenant_id: string;
+  project_id: string;
   knowledge_base_id: string;
   document_id: string;
   parsed_content_id: string;
@@ -131,6 +138,7 @@ export interface SourceParseProcessorOptions {
   parserRegistry?: ParserRegistry;
   parserCache?: ParserCache;
   parserLimits?: ParserLimitConfig;
+  threatScanner?: SourceThreatScanner;
   mediaAssetUploadConcurrency?: number;
   previewMaxChars?: number;
   processingStateMarkdownWindowChars?: number;
@@ -162,6 +170,7 @@ export class SourceParseProcessor {
   private readonly parserRegistry: ParserRegistry;
   private readonly parserCache: ParserCache;
   private readonly parserLimits: ParserLimitConfig | undefined;
+  private readonly threatScanner: SourceThreatScanner | undefined;
   private readonly mediaAssetUploadConcurrency: number;
   private readonly previewMaxChars: number;
   private readonly processingStateMarkdownWindowChars: number;
@@ -178,6 +187,7 @@ export class SourceParseProcessor {
     this.parserRegistry = options.parserRegistry ?? createDefaultParserRegistry();
     this.parserCache = options.parserCache ?? createNoopParserCache();
     this.parserLimits = options.parserLimits;
+    this.threatScanner = options.threatScanner;
     this.mediaAssetUploadConcurrency = normalizePositiveInteger(
       options.mediaAssetUploadConcurrency,
       4,
@@ -198,6 +208,19 @@ export class SourceParseProcessor {
     }
 
     const fileName = basename(payload.object_key);
+    const threatScanResult = await runSourceThreatScan({
+      fileName,
+      payload,
+      processingState: this.processingState,
+      threatScanner: this.threatScanner,
+    });
+
+    if (threatScanResult.kind === "fatal") {
+      await this.markParsingFailed(payload, threatScanResult.error);
+
+      return this.createFailedResult(payload, threatScanResult.error);
+    }
+
     const resolution = this.parserRegistry.resolve({
       fileName,
       mimeType: payload.mime_type,
@@ -420,6 +443,8 @@ export class SourceParseProcessor {
     if (ocrDecision.kind === "enqueue") {
       await this.ocrQueue?.enqueueSourceOcrJob({
         job_id: payload.job_id,
+        tenant_id: payload.tenant_id,
+        project_id: payload.project_id,
         knowledge_base_id: payload.knowledge_base_id,
         document_id: payload.document_id,
         parsed_content_id: parsedContentId,
@@ -500,6 +525,8 @@ export class SourceParseProcessor {
     if (this.captionQueue !== undefined && mediaAssets.length > 0) {
       await this.captionQueue.enqueueMediaCaptionJob({
         job_id: payload.job_id,
+        tenant_id: payload.tenant_id,
+        project_id: payload.project_id,
         knowledge_base_id: payload.knowledge_base_id,
         document_id: payload.document_id,
         parsed_content_id: parsedContentId,
@@ -547,6 +574,8 @@ export class SourceParseProcessor {
 
     await this.compileQueue?.enqueueWikiAnalyzeJob({
       job_id: payload.job_id,
+      tenant_id: payload.tenant_id,
+      project_id: payload.project_id,
       knowledge_base_id: payload.knowledge_base_id,
       document_id: payload.document_id,
       parsed_content_id: parsedContentId,
@@ -798,6 +827,8 @@ export class SourceParseProcessor {
       jobId: payload.job_id,
       knowledgeBaseId: payload.knowledge_base_id,
       inputSnapshotId: payload.input_snapshot_id,
+      tenantId: payload.tenant_id,
+      projectId: payload.project_id,
       sourceDocumentId: payload.document_id,
     });
 
