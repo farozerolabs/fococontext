@@ -11,6 +11,12 @@ import type {
 import { resolveDatasetPromptTemplateFromSnapshot } from "@fococontext/llm";
 import type { ObjectStorageAdapter } from "@fococontext/storage";
 import { createMarkdownPreview, defaultParsedMarkdownPreviewMaxChars } from "./parsed-preview.js";
+import {
+  createDocumentProcessingDedupeKey,
+  createShortConfigHash,
+  type DocumentProcessingStateStore,
+  type DocumentProcessingUnitInput,
+} from "./document-processing-state.js";
 
 import type {
   WorkerJobProgressWriter,
@@ -163,6 +169,7 @@ export interface MediaCaptionProcessorOptions {
   jobProgress?: WorkerJobProgressWriter;
   modelCallRecorder?: ModelCallRecorder;
   objectStorage: ObjectStorageAdapter;
+  processingState?: DocumentProcessingStateStore;
   repository: MediaCaptionRepository;
   sleep?: (milliseconds: number) => Promise<void>;
   visionProvider: VisionCaptionProvider;
@@ -257,6 +264,7 @@ export class MediaCaptionProcessor {
   private readonly jobProgress: WorkerJobProgressWriter | undefined;
   private readonly modelCallRecorder: ModelCallRecorder | undefined;
   private readonly objectStorage: ObjectStorageAdapter;
+  private readonly processingState: DocumentProcessingStateStore | undefined;
   private readonly repository: MediaCaptionRepository;
   private readonly sleep: (milliseconds: number) => Promise<void>;
   private readonly visionProvider: VisionCaptionProvider;
@@ -269,6 +277,7 @@ export class MediaCaptionProcessor {
     this.jobProgress = options.jobProgress;
     this.modelCallRecorder = options.modelCallRecorder;
     this.objectStorage = options.objectStorage;
+    this.processingState = options.processingState;
     this.repository = options.repository;
     this.sleep = options.sleep ?? sleepFor;
     this.visionProvider = options.visionProvider;
@@ -313,18 +322,87 @@ export class MediaCaptionProcessor {
       purpose: "vision_caption",
       datasetConfigurationSnapshot: payload.dataset_configuration_snapshot,
     });
+    const captionConfigHash = createCaptionConfigHash(this.config, resolvedPrompt.prompt.id);
     const requestedAssets = await this.repository.listMediaAssetsByIds(payload.media_asset_ids);
-    const eligibleAssets = requestedAssets.filter(isCaptionEligibleImage);
-    const assets = eligibleAssets.slice(0, this.config.maxImagesPerDocument);
+    const candidateAssets = requestedAssets.filter(isCaptionWorkCandidateImage);
+    const assets = candidateAssets.slice(0, this.config.maxImagesPerDocument);
     const selectedAssetIds = new Set(assets.map((asset) => asset.id));
-    const skippedAssets = requestedAssets.filter((asset) => !selectedAssetIds.has(asset.id));
+    const skippedAssets = candidateAssets.filter((asset) => !selectedAssetIds.has(asset.id));
+    const unsupportedPendingAssets = requestedAssets.filter(
+      (asset) =>
+        (asset.caption_status === "pending" || asset.caption_status === "failed") &&
+        !isCaptionEligibleImage(asset),
+    );
+    const terminalAssets = requestedAssets.filter(
+      (asset) => asset.caption_status === "generated" || asset.caption_status === "skipped",
+    );
     const beforeWriteGuard = await this.canContinue(payload);
 
     if (!beforeWriteGuard.canContinue) {
       return this.createStoppedResult(payload);
     }
 
-    await this.markAssetsSkipped(skippedAssets);
+    await this.processingState?.upsertUnits([
+      ...assets.map(
+        (asset, index): DocumentProcessingUnitInput =>
+          toCaptionProcessingUnit(payload, asset, {
+            configHash: captionConfigHash,
+            model: this.config.model,
+            promptVersion: resolvedPrompt.prompt.id,
+            providerName: this.config.providerName,
+            status: "pending",
+            unitIndex: index,
+          }),
+      ),
+      ...skippedAssets.map(
+        (asset, index): DocumentProcessingUnitInput =>
+          toCaptionProcessingUnit(payload, asset, {
+            configHash: captionConfigHash,
+            metadata: {
+              reason: "not_selected",
+            },
+            model: this.config.model,
+            promptVersion: resolvedPrompt.prompt.id,
+            providerName: this.config.providerName,
+            status: "skipped",
+            unitIndex: assets.length + index,
+          }),
+      ),
+      ...unsupportedPendingAssets.map(
+        (asset, index): DocumentProcessingUnitInput =>
+          toCaptionProcessingUnit(payload, asset, {
+            configHash: captionConfigHash,
+            metadata: {
+              reason: "unsupported_media",
+            },
+            model: this.config.model,
+            promptVersion: resolvedPrompt.prompt.id,
+            providerName: this.config.providerName,
+            status: "skipped",
+            unitIndex: assets.length + skippedAssets.length + index,
+          }),
+      ),
+      ...terminalAssets.map(
+        (asset, index): DocumentProcessingUnitInput =>
+          toCaptionProcessingUnit(payload, asset, {
+            configHash: captionConfigHash,
+            metadata: {
+              reason: "terminal_status",
+            },
+            model: this.config.model,
+            promptVersion: resolvedPrompt.prompt.id,
+            providerName: this.config.providerName,
+            status: asset.caption_status === "generated" ? "succeeded" : "skipped",
+            unitIndex:
+              assets.length + skippedAssets.length + unsupportedPendingAssets.length + index,
+          }),
+      ),
+    ]);
+    await this.markAssetsSkipped(
+      payload,
+      [...skippedAssets, ...unsupportedPendingAssets],
+      captionConfigHash,
+    );
 
     if (assets.length === 0) {
       await this.enqueueAnalyze(payload, payload.normalized_markdown_object_key, {
@@ -363,6 +441,33 @@ export class MediaCaptionProcessor {
     const assetWindows = chunkArray(assets, this.config.windowSize);
 
     for (const [windowIndex, assetWindow] of assetWindows.entries()) {
+      await this.processingState?.upsertCheckpoint({
+        checkpointKey: "caption-assets",
+        configHash: captionConfigHash,
+        cursor: {
+          next_window_index: windowIndex,
+          processed_asset_count: captions.length + failedCount,
+          total_window_count: assetWindows.length,
+        },
+        jobId: payload.job_id,
+        parsedContentId: payload.parsed_content_id,
+        sourceDocumentId: payload.document_id,
+        stage: "captioning",
+        status: "running",
+      });
+      await this.processingState?.upsertUnits(
+        assetWindow.map(
+          (asset, index): DocumentProcessingUnitInput =>
+            toCaptionProcessingUnit(payload, asset, {
+              configHash: captionConfigHash,
+              model: this.config.model,
+              promptVersion: resolvedPrompt.prompt.id,
+              providerName: this.config.providerName,
+              status: "running",
+              unitIndex: windowIndex * this.config.windowSize + index,
+            }),
+        ),
+      );
       const captionGroups = this.groupAssetsByCaptionCacheKey(
         assetWindow,
         resolvedPrompt.prompt.id,
@@ -383,6 +488,25 @@ export class MediaCaptionProcessor {
         providerCallCount += result.providerCallCount;
         captions.push(...result.captions);
       }
+      await this.processingState?.upsertCheckpoint({
+        checkpointKey: "caption-assets",
+        configHash: captionConfigHash,
+        cursor: {
+          completed_window_index: windowIndex,
+          processed_asset_count: cacheHitCount + generatedCount + failedCount,
+          total_window_count: assetWindows.length,
+        },
+        jobId: payload.job_id,
+        parsedContentId: payload.parsed_content_id,
+        sourceDocumentId: payload.document_id,
+        stage: "captioning",
+        status: "running",
+        summary: {
+          cache_hit_count: cacheHitCount,
+          failed_count: failedCount,
+          generated_count: generatedCount,
+        },
+      });
 
       if ((windowIndex + 1) % this.config.checkpointInterval === 0) {
         await this.jobProgress?.updateJobProgress({
@@ -451,6 +575,26 @@ export class MediaCaptionProcessor {
         provider_call_count: providerCallCount,
       },
     );
+    await this.processingState?.upsertCheckpoint({
+      checkpointKey: "caption-assets",
+      configHash: captionConfigHash,
+      cursor: {
+        completed_asset_count: cacheHitCount + generatedCount + failedCount,
+        total_asset_count: assets.length,
+      },
+      jobId: payload.job_id,
+      parsedContentId: payload.parsed_content_id,
+      sourceDocumentId: payload.document_id,
+      stage: "captioning",
+      status: "completed",
+      summary: {
+        cache_hit_count: cacheHitCount,
+        captioned_markdown_object_key: captionedObjectKey,
+        failed_count: failedCount,
+        generated_count: generatedCount,
+        provider_call_count: providerCallCount,
+      },
+    });
 
     return this.createCompletedResult(payload, {
       cacheHitCount,
@@ -502,7 +646,7 @@ export class MediaCaptionProcessor {
 
       await Promise.all(
         group.assets.map((asset) =>
-          this.markAssetGenerated(asset, cacheRecord.caption, {
+          this.markAssetGenerated(payload, asset, cacheRecord.caption, {
             attemptCount: 0,
             cacheHit: true,
             modelCallId: null,
@@ -554,7 +698,7 @@ export class MediaCaptionProcessor {
       }
 
       await this.repository.upsertCaptionCache(cacheWrite);
-      await this.markAssetGenerated(primaryAsset, result.caption, {
+      await this.markAssetGenerated(payload, primaryAsset, result.caption, {
         attemptCount: result.attemptCount,
         cacheHit: false,
         modelCallId: result.modelCallId,
@@ -562,7 +706,7 @@ export class MediaCaptionProcessor {
       });
       await Promise.all(
         duplicateAssets.map((asset) =>
-          this.markAssetGenerated(asset, result.caption, {
+          this.markAssetGenerated(payload, asset, result.caption, {
             attemptCount: 0,
             cacheHit: true,
             modelCallId: null,
@@ -591,7 +735,7 @@ export class MediaCaptionProcessor {
 
       await Promise.all(
         group.assets.map((asset) =>
-          this.markAssetFailed(asset, error, modelCallId, resolvedPrompt.prompt.id),
+          this.markAssetFailed(payload, asset, error, modelCallId, resolvedPrompt.prompt.id),
         ),
       );
 
@@ -738,6 +882,7 @@ export class MediaCaptionProcessor {
   }
 
   private async markAssetGenerated(
+    payload: MediaCaptionPayload,
     asset: MediaCaptionAssetRecord,
     caption: string,
     options: {
@@ -758,9 +903,26 @@ export class MediaCaptionProcessor {
       caption_provider_name: this.config.providerName,
       caption_status: "generated",
     });
+    await this.processingState?.upsertUnit(
+      toCaptionProcessingUnit(payload, asset, {
+        configHash: createCaptionConfigHash(this.config, options.promptVersion),
+        counters: {
+          attempt_count: options.attemptCount,
+        },
+        metadata: {
+          cache_hit: options.cacheHit,
+          model_call_id: options.modelCallId,
+        },
+        model: this.config.model,
+        promptVersion: options.promptVersion,
+        providerName: this.config.providerName,
+        status: "succeeded",
+      }),
+    );
   }
 
   private async markAssetFailed(
+    payload: MediaCaptionPayload,
     asset: MediaCaptionAssetRecord,
     error: unknown,
     modelCallId: string | null,
@@ -780,9 +942,33 @@ export class MediaCaptionProcessor {
       caption_provider_name: this.config.providerName,
       caption_status: "failed",
     });
+    await this.processingState?.upsertUnit(
+      toCaptionProcessingUnit(payload, asset, {
+        configHash: createCaptionConfigHash(this.config, promptVersion),
+        counters: {
+          attempt_count: this.config.requestMaxRetries + 1,
+        },
+        metadata: {
+          model_call_id: modelCallId,
+        },
+        model: this.config.model,
+        promptVersion,
+        providerName: this.config.providerName,
+        retryEligible: true,
+        safeError: {
+          code: "vision_caption_failed",
+          message: error instanceof Error ? error.message : "Vision caption failed.",
+        },
+        status: "failed",
+      }),
+    );
   }
 
-  private async markAssetsSkipped(assets: readonly MediaCaptionAssetRecord[]): Promise<void> {
+  private async markAssetsSkipped(
+    payload: MediaCaptionPayload,
+    assets: readonly MediaCaptionAssetRecord[],
+    configHash: string,
+  ): Promise<void> {
     await Promise.all(
       assets
         .filter((asset) => asset.caption_status === "pending")
@@ -798,6 +984,22 @@ export class MediaCaptionProcessor {
             caption_provider_name: null,
             caption_status: "skipped",
           }),
+        ),
+    );
+    await this.processingState?.upsertUnits(
+      assets
+        .filter((asset) => asset.caption_status === "pending")
+        .map(
+          (asset): DocumentProcessingUnitInput =>
+            toCaptionProcessingUnit(payload, asset, {
+              configHash,
+              metadata: {
+                reason: "not_selected",
+              },
+              model: this.config.model,
+              providerName: this.config.providerName,
+              status: "skipped",
+            }),
         ),
     );
   }
@@ -1144,6 +1346,7 @@ export class PostgresMediaCaptionRepository implements MediaCaptionRepository {
         end,
         updated_at = now()
       where id = ${id}
+        and caption_status in ('pending', 'failed')
     `.execute(this.db);
   }
 
@@ -1194,6 +1397,79 @@ export function createCaptionCacheKey(input: MediaCaptionCacheLookupInput): stri
     sanitizeCacheKeyPart(input.model),
     sanitizeCacheKeyPart(input.promptVersion),
   ].join(":");
+}
+
+function createCaptionConfigHash(
+  config: MediaCaptionProcessorConfig,
+  promptVersion: string,
+): string {
+  return createShortConfigHash({
+    contextChars: config.contextChars,
+    maxImageBytes: config.maxImageBytes,
+    maxOutputTokens: config.maxOutputTokens,
+    model: config.model,
+    promptVersion,
+    providerName: config.providerName,
+    timeoutSeconds: config.timeoutSeconds,
+    windowSize: config.windowSize,
+  });
+}
+
+function createCaptionAssetDedupeKey(asset: MediaCaptionAssetRecord, configHash: string): string {
+  return createDocumentProcessingDedupeKey({
+    configHash,
+    contentHash: asset.sha256,
+    stage: "captioning",
+    unitKey: asset.id,
+    unitType: "media_asset",
+  });
+}
+
+function toCaptionProcessingUnit(
+  payload: MediaCaptionPayload,
+  asset: MediaCaptionAssetRecord,
+  input: {
+    configHash: string;
+    counters?: Record<string, unknown>;
+    metadata?: Record<string, unknown>;
+    model?: string | null;
+    promptVersion?: string | null;
+    providerName?: string | null;
+    retryEligible?: boolean;
+    safeError?: Record<string, unknown> | null;
+    status: DocumentProcessingUnitInput["status"];
+    unitIndex?: number;
+  },
+): DocumentProcessingUnitInput {
+  return {
+    configHash: input.configHash,
+    contentHash: asset.sha256,
+    counters: {
+      height: asset.height,
+      width: asset.width,
+      ...input.counters,
+    },
+    dedupeKey: createCaptionAssetDedupeKey(asset, input.configHash),
+    jobId: payload.job_id,
+    locator: asset.locator,
+    metadata: {
+      mime_type: asset.mime_type,
+      ...input.metadata,
+    },
+    model: input.model ?? null,
+    objectKey: asset.object_key,
+    parsedContentId: payload.parsed_content_id,
+    promptVersion: input.promptVersion ?? null,
+    providerName: input.providerName ?? null,
+    retryEligible: input.retryEligible ?? false,
+    safeError: input.safeError ?? null,
+    sourceDocumentId: payload.document_id,
+    stage: "captioning",
+    status: input.status,
+    unitIndex: input.unitIndex ?? null,
+    unitKey: asset.id,
+    unitType: "media_asset",
+  };
 }
 
 export function normalizeVisionCaptionOutput(value: string): string | null {
@@ -1321,6 +1597,13 @@ function isCaptionEligibleImage(asset: MediaCaptionAssetRecord): boolean {
     asset.width > 0 &&
     typeof asset.height === "number" &&
     asset.height > 0
+  );
+}
+
+function isCaptionWorkCandidateImage(asset: MediaCaptionAssetRecord): boolean {
+  return (
+    (asset.caption_status === "pending" || asset.caption_status === "failed") &&
+    isCaptionEligibleImage(asset)
   );
 }
 

@@ -238,46 +238,90 @@ Rerank 使用全有或全无配置规则。所有 `RERANK_*` 都留空时禁用 
 | `PARSER_REMOTE_IMAGE_FETCHING_ENABLED`       | Markdown/HTML 远程图片抓取     | 默认 `false`                         |
 | `PARSER_PDF_SNAPSHOT_MIN_TEXT_CHARS`         | PDF 低文本页快照阈值           | 默认 `80`                            |
 
+## 文档处理中间状态
+
+| 字段                                           | 说明                            | 建议值       |
+| ---------------------------------------------- | ------------------------------- | ------------ |
+| `DOCUMENT_PROCESSING_MARKDOWN_WINDOW_CHARS`    | Markdown window artifact 字符数 | 默认 `64000` |
+| `DOCUMENT_PROCESSING_DETAIL_DEFAULT_PAGE_SIZE` | processing detail 默认分页大小  | 默认 `50`    |
+| `DOCUMENT_PROCESSING_DETAIL_MAX_PAGE_SIZE`     | processing detail 最大分页大小  | 默认 `200`   |
+| `DOCUMENT_PROCESSING_CLEANUP_BATCH_SIZE`       | 过期中间状态清理批大小          | 默认 `500`   |
+| `DOCUMENT_PROCESSING_SUCCESS_RETENTION_DAYS`   | 成功中间状态保留天数            | 默认 `7`     |
+| `DOCUMENT_PROCESSING_FAILURE_RETENTION_DAYS`   | 失败中间状态保留天数            | 默认 `30`    |
+
 ## 队列、编译和 Retrieve
 
-| 字段                                           | 说明                  | 建议值                                                                      |
-| ---------------------------------------------- | --------------------- | --------------------------------------------------------------------------- |
-| `FOCOCONTEXT_QUEUE_CONCURRENCY`                | 默认队列并发          | 默认 `2`                                                                    |
-| `BATCH_IMPORT_CONCURRENCY`                     | 批量导入并发          | 默认 `2`                                                                    |
-| `SOURCE_WATCH_SCAN_CONCURRENCY`                | Source Watch 扫描并发 | 默认 `2`                                                                    |
-| `BACKGROUND_REINDEX_*`                         | 重建索引后台控制      | 批大小、游标窗口、checkpoint 间隔、重试延迟和并发                           |
-| `BACKGROUND_GRAPH_INSIGHTS_*`                  | 图谱洞察刷新控制      | 批大小、游标窗口、checkpoint 间隔、重试延迟和并发                           |
-| `BACKGROUND_KNOWLEDGE_CHECK_*`                 | Knowledge Check 控制  | 批大小、游标窗口、checkpoint 间隔、重试延迟和并发                           |
-| `BACKGROUND_SOURCE_WATCH_*`                    | Source Watch 后台控制 | 批大小、游标窗口、checkpoint 间隔、重试延迟和并发                           |
-| `BACKGROUND_OCR_*`                             | OCR 后台 worker 控制  | worker 批处理和 checkpoint；页级处理使用 `OCR_PAGE_CONCURRENCY`             |
-| `BACKGROUND_MEDIA_CAPTION_*`                   | 媒体 caption 后台控制 | worker 批处理和 checkpoint；图片调用使用 `VISION_CAPTION_IMAGE_CONCURRENCY` |
-| `BACKGROUND_CLEANUP_*`                         | 清理后台控制          | 批大小、游标窗口、checkpoint 间隔、重试延迟和并发                           |
-| `RESIDUAL_GRAPH_INSIGHTS_*`                    | 图谱洞察残余工作上限  | summary 窗口和 checkpoint 间隔；默认继承图谱洞察后台限制                    |
-| `RESIDUAL_SOURCE_WATCH_*`                      | Source Watch 对比上限 | 对比窗口、checkpoint 间隔和小 URL 列表上限                                  |
-| `RESIDUAL_OCR_*`                               | OCR 页级残余工作上限  | 页窗口和 checkpoint 间隔；默认继承 OCR 后台限制                             |
-| `RESIDUAL_MEDIA_CAPTION_*`                     | 媒体 caption 残余上限 | 资产窗口和 checkpoint 间隔；默认继承媒体 caption 后台限制                   |
-| `SOURCE_WATCH_SCHEDULER_ENABLED`               | 是否启用定时扫描      | 默认 `true`                                                                 |
-| `SOURCE_WATCH_SCAN_INTERVAL_SECONDS`           | 定时扫描间隔          | 默认 `3600`                                                                 |
-| `SOURCE_WATCH_SCAN_MAX_RETRIES`                | 扫描失败重试次数      | 默认 `2`                                                                    |
-| `SOURCE_WATCH_SCAN_RETRY_BASE_DELAY_MS`        | 扫描重试基础延迟      | 默认 `1000`                                                                 |
-| `WIKI_ANALYZE_CONCURRENCY`                     | 分析阶段并发          | 默认 `2`；受 Chat provider 限流影响                                         |
-| `WIKI_GENERATE_CONCURRENCY`                    | 生成阶段并发          | 默认 `2`                                                                    |
-| `WIKI_MERGE_CONCURRENCY`                       | 合并阶段并发          | 默认 `2`                                                                    |
-| `COMPILE_MAX_CONTEXT_CHARS`                    | 编译 prompt 字符预算  | 默认 `24000`；大文档可按模型上下文调高                                      |
-| `RETRIEVE_DEFAULT_TOP_K`                       | 默认候选数            | 默认 `10`                                                                   |
-| `RETRIEVE_MAX_TOP_K`                           | 最大候选数            | 默认 `20`                                                                   |
-| `RETRIEVE_DEFAULT_GRAPH_DEPTH`                 | 默认图谱深度          | 默认 `1`                                                                    |
-| `RETRIEVE_MAX_GRAPH_DEPTH`                     | 最大图谱深度          | 默认 `3`                                                                    |
-| `RETRIEVE_DEFAULT_GRAPH_LIMIT_PER_RESULT`      | 每结果默认图谱扩展数  | 默认 `5`                                                                    |
-| `RETRIEVE_MAX_GRAPH_LIMIT_PER_RESULT`          | 每结果最大图谱扩展数  | 默认 `10`                                                                   |
-| `RETRIEVE_DEFAULT_CONTEXT_BUDGET_TOKENS`       | 默认上下文预算        | 默认 `4000`                                                                 |
-| `RETRIEVE_MAX_CONTEXT_BUDGET_TOKENS`           | 最大上下文预算        | 默认 `12000`                                                                |
-| `SOURCE_EVIDENCE_DEFAULT_MAX_CHARS`            | 默认资料证据文本上限  | 默认 `4000`                                                                 |
-| `SOURCE_EVIDENCE_MAX_CHARS`                    | 最大资料证据文本上限  | 默认 `12000`                                                                |
-| `SOURCE_EVIDENCE_DEFAULT_CONTEXT_CHARS`        | 默认资料证据上下文    | 默认 `800`                                                                  |
-| `SOURCE_EVIDENCE_MAX_CONTEXT_CHARS`            | 最大资料证据上下文    | 默认 `2000`                                                                 |
-| `SOURCE_EVIDENCE_BATCH_MAX_ITEMS`              | 批量证据最大条数      | 默认 `20`                                                                   |
-| `SOURCE_EVIDENCE_BATCH_TOTAL_OUTPUT_MAX_CHARS` | 批量证据总输出上限    | 默认 `40000`                                                                |
+| 字段                                             | 说明                              | 建议值                                    |
+| ------------------------------------------------ | --------------------------------- | ----------------------------------------- |
+| `FOCOCONTEXT_QUEUE_CONCURRENCY`                  | 默认队列并发                      | 默认 `2`                                  |
+| `BATCH_IMPORT_CONCURRENCY`                       | 批量导入并发                      | 默认 `2`                                  |
+| `SOURCE_WATCH_SCAN_CONCURRENCY`                  | Source Watch 扫描并发             | 默认 `2`                                  |
+| `BACKGROUND_REINDEX_BATCH_SIZE`                  | 重建索引批大小                    | 默认 `100`                                |
+| `BACKGROUND_REINDEX_CURSOR_WINDOW_SIZE`          | 重建索引游标窗口                  | 默认 `100`                                |
+| `BACKGROUND_REINDEX_CHECKPOINT_INTERVAL`         | 重建索引 checkpoint 间隔          | 默认 `1`                                  |
+| `BACKGROUND_REINDEX_RETRY_BASE_DELAY_MS`         | 重建索引重试基础延迟              | 默认 `1000`                               |
+| `BACKGROUND_REINDEX_CONCURRENCY`                 | 重建索引并发                      | 默认继承 `FOCOCONTEXT_QUEUE_CONCURRENCY`  |
+| `BACKGROUND_GRAPH_INSIGHTS_BATCH_SIZE`           | 图谱洞察批大小                    | 默认 `100`                                |
+| `BACKGROUND_GRAPH_INSIGHTS_CURSOR_WINDOW_SIZE`   | 图谱洞察游标窗口                  | 默认 `100`                                |
+| `BACKGROUND_GRAPH_INSIGHTS_CHECKPOINT_INTERVAL`  | 图谱洞察 checkpoint 间隔          | 默认 `1`                                  |
+| `BACKGROUND_GRAPH_INSIGHTS_RETRY_BASE_DELAY_MS`  | 图谱洞察重试基础延迟              | 默认 `1000`                               |
+| `BACKGROUND_GRAPH_INSIGHTS_CONCURRENCY`          | 图谱洞察并发                      | 默认继承 `FOCOCONTEXT_QUEUE_CONCURRENCY`  |
+| `BACKGROUND_KNOWLEDGE_CHECK_BATCH_SIZE`          | Knowledge Check 批大小            | 默认 `100`                                |
+| `BACKGROUND_KNOWLEDGE_CHECK_CURSOR_WINDOW_SIZE`  | Knowledge Check 游标窗口          | 默认 `100`                                |
+| `BACKGROUND_KNOWLEDGE_CHECK_CHECKPOINT_INTERVAL` | Knowledge Check checkpoint 间隔   | 默认 `1`                                  |
+| `BACKGROUND_KNOWLEDGE_CHECK_RETRY_BASE_DELAY_MS` | Knowledge Check 重试基础延迟      | 默认 `1000`                               |
+| `BACKGROUND_KNOWLEDGE_CHECK_CONCURRENCY`         | Knowledge Check 并发              | 默认继承 `FOCOCONTEXT_QUEUE_CONCURRENCY`  |
+| `BACKGROUND_SOURCE_WATCH_BATCH_SIZE`             | Source Watch 后台批大小           | 默认 `100`                                |
+| `BACKGROUND_SOURCE_WATCH_CURSOR_WINDOW_SIZE`     | Source Watch 后台游标窗口         | 默认 `100`                                |
+| `BACKGROUND_SOURCE_WATCH_CHECKPOINT_INTERVAL`    | Source Watch 后台 checkpoint 间隔 | 默认 `1`                                  |
+| `BACKGROUND_SOURCE_WATCH_RETRY_BASE_DELAY_MS`    | Source Watch 后台重试基础延迟     | 默认 `1000`                               |
+| `BACKGROUND_SOURCE_WATCH_CONCURRENCY`            | Source Watch 后台并发             | 默认继承 `FOCOCONTEXT_QUEUE_CONCURRENCY`  |
+| `BACKGROUND_OCR_BATCH_SIZE`                      | OCR 后台批大小                    | 默认 `100`                                |
+| `BACKGROUND_OCR_CURSOR_WINDOW_SIZE`              | OCR 后台游标窗口                  | 默认 `100`                                |
+| `BACKGROUND_OCR_CHECKPOINT_INTERVAL`             | OCR 后台 checkpoint 间隔          | 默认 `1`                                  |
+| `BACKGROUND_OCR_RETRY_BASE_DELAY_MS`             | OCR 后台重试基础延迟              | 默认 `1000`                               |
+| `BACKGROUND_OCR_CONCURRENCY`                     | OCR 后台并发                      | 默认继承 `FOCOCONTEXT_QUEUE_CONCURRENCY`  |
+| `BACKGROUND_MEDIA_CAPTION_BATCH_SIZE`            | 媒体 caption 后台批大小           | 默认 `100`                                |
+| `BACKGROUND_MEDIA_CAPTION_CURSOR_WINDOW_SIZE`    | 媒体 caption 后台游标窗口         | 默认 `100`                                |
+| `BACKGROUND_MEDIA_CAPTION_CHECKPOINT_INTERVAL`   | 媒体 caption 后台 checkpoint 间隔 | 默认 `1`                                  |
+| `BACKGROUND_MEDIA_CAPTION_RETRY_BASE_DELAY_MS`   | 媒体 caption 后台重试基础延迟     | 默认 `1000`                               |
+| `BACKGROUND_MEDIA_CAPTION_CONCURRENCY`           | 媒体 caption 后台并发             | 默认继承 `FOCOCONTEXT_QUEUE_CONCURRENCY`  |
+| `BACKGROUND_CLEANUP_BATCH_SIZE`                  | 清理批大小                        | 默认 `100`                                |
+| `BACKGROUND_CLEANUP_CURSOR_WINDOW_SIZE`          | 清理游标窗口                      | 默认 `100`                                |
+| `BACKGROUND_CLEANUP_CHECKPOINT_INTERVAL`         | 清理 checkpoint 间隔              | 默认 `1`                                  |
+| `BACKGROUND_CLEANUP_RETRY_BASE_DELAY_MS`         | 清理重试基础延迟                  | 默认 `1000`                               |
+| `BACKGROUND_CLEANUP_CONCURRENCY`                 | 清理并发                          | 默认继承 `FOCOCONTEXT_QUEUE_CONCURRENCY`  |
+| `RESIDUAL_GRAPH_INSIGHTS_SUMMARY_WINDOW_SIZE`    | 图谱洞察残余 summary 窗口         | 默认 `100`                                |
+| `RESIDUAL_GRAPH_INSIGHTS_CHECKPOINT_INTERVAL`    | 图谱洞察残余 checkpoint 间隔      | 默认 `1`                                  |
+| `RESIDUAL_SOURCE_WATCH_COMPARISON_WINDOW_SIZE`   | Source Watch 残余对比窗口         | 默认 `100`                                |
+| `RESIDUAL_SOURCE_WATCH_CHECKPOINT_INTERVAL`      | Source Watch 残余 checkpoint 间隔 | 默认 `1`                                  |
+| `RESIDUAL_SOURCE_WATCH_SMALL_URL_LIST_LIMIT`     | Source Watch 小 URL 列表上限      | 默认继承 `SOURCE_WATCH_URL_LIST_MAX_URLS` |
+| `RESIDUAL_OCR_PAGE_WINDOW_SIZE`                  | OCR 残余页窗口                    | 默认 `100`                                |
+| `RESIDUAL_OCR_CHECKPOINT_INTERVAL`               | OCR 残余 checkpoint 间隔          | 默认 `1`                                  |
+| `RESIDUAL_MEDIA_CAPTION_ASSET_WINDOW_SIZE`       | 媒体 caption 残余资产窗口         | 默认 `100`                                |
+| `RESIDUAL_MEDIA_CAPTION_CHECKPOINT_INTERVAL`     | 媒体 caption 残余 checkpoint 间隔 | 默认 `1`                                  |
+| `SOURCE_WATCH_SCHEDULER_ENABLED`                 | 是否启用定时扫描                  | 默认 `true`                               |
+| `SOURCE_WATCH_SCAN_INTERVAL_SECONDS`             | 定时扫描间隔                      | 默认 `3600`                               |
+| `SOURCE_WATCH_SCAN_MAX_RETRIES`                  | 扫描失败重试次数                  | 默认 `2`                                  |
+| `SOURCE_WATCH_SCAN_RETRY_BASE_DELAY_MS`          | 扫描重试基础延迟                  | 默认 `1000`                               |
+| `WIKI_ANALYZE_CONCURRENCY`                       | 分析阶段并发                      | 默认 `2`；受 Chat provider 限流影响       |
+| `WIKI_GENERATE_CONCURRENCY`                      | 生成阶段并发                      | 默认 `2`                                  |
+| `WIKI_MERGE_CONCURRENCY`                         | 合并阶段并发                      | 默认 `2`                                  |
+| `COMPILE_MAX_CONTEXT_CHARS`                      | 编译 prompt 字符预算              | 默认 `24000`；大文档可按模型上下文调高    |
+| `RETRIEVE_DEFAULT_TOP_K`                         | 默认候选数                        | 默认 `10`                                 |
+| `RETRIEVE_MAX_TOP_K`                             | 最大候选数                        | 默认 `20`                                 |
+| `RETRIEVE_DEFAULT_GRAPH_DEPTH`                   | 默认图谱深度                      | 默认 `1`                                  |
+| `RETRIEVE_MAX_GRAPH_DEPTH`                       | 最大图谱深度                      | 默认 `3`                                  |
+| `RETRIEVE_DEFAULT_GRAPH_LIMIT_PER_RESULT`        | 每结果默认图谱扩展数              | 默认 `5`                                  |
+| `RETRIEVE_MAX_GRAPH_LIMIT_PER_RESULT`            | 每结果最大图谱扩展数              | 默认 `10`                                 |
+| `RETRIEVE_DEFAULT_CONTEXT_BUDGET_TOKENS`         | 默认上下文预算                    | 默认 `4000`                               |
+| `RETRIEVE_MAX_CONTEXT_BUDGET_TOKENS`             | 最大上下文预算                    | 默认 `12000`                              |
+| `SOURCE_EVIDENCE_DEFAULT_MAX_CHARS`              | 默认资料证据文本上限              | 默认 `4000`                               |
+| `SOURCE_EVIDENCE_MAX_CHARS`                      | 最大资料证据文本上限              | 默认 `12000`                              |
+| `SOURCE_EVIDENCE_DEFAULT_CONTEXT_CHARS`          | 默认资料证据上下文                | 默认 `800`                                |
+| `SOURCE_EVIDENCE_MAX_CONTEXT_CHARS`              | 最大资料证据上下文                | 默认 `2000`                               |
+| `SOURCE_EVIDENCE_BATCH_MAX_ITEMS`                | 批量证据最大条数                  | 默认 `20`                                 |
+| `SOURCE_EVIDENCE_BATCH_TOTAL_OUTPUT_MAX_CHARS`   | 批量证据总输出上限                | 默认 `40000`                              |
 
 ## Webhook
 

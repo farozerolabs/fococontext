@@ -22,6 +22,12 @@ export interface SourceWatchScanItemListOptions extends ListOptions {
   itemKind?: SourceWatchScanItemKind
 }
 
+export interface DocumentProcessingUnitListOptions extends ListOptions {
+  jobId?: string
+  stage?: DocumentProcessingUnitStage
+  status?: DocumentProcessingUnitStatus
+}
+
 export interface FococontextApiClient {
   cancelJob(jobId: string): Promise<JobDetail>
   createKnowledgeCheck(
@@ -129,6 +135,10 @@ export interface FococontextApiClient {
     knowledgeBaseId: string,
     options?: ListOptions
   ): Promise<SourceDocumentListResult>
+  listDocumentProcessingUnits(
+    documentId: string,
+    options?: DocumentProcessingUnitListOptions
+  ): Promise<DocumentProcessingUnitListResult>
   listSourceWatchRules(
     knowledgeBaseId: string,
     options?: ListOptions
@@ -786,6 +796,51 @@ export interface MediaAsset {
   sha256: string
   updated_at: string
   width: number | null
+}
+
+export type DocumentProcessingUnitStage =
+  | "parsing"
+  | "ocr"
+  | "media_extraction"
+  | "captioning"
+  | "parsed_artifact"
+
+export type DocumentProcessingUnitStatus =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "skipped"
+  | "canceled"
+
+export interface DocumentProcessingUnit {
+  attempt_scope: string
+  completed_at: string | null
+  content_hash: string | null
+  counters: Record<string, unknown>
+  dedupe_key: string
+  id: string
+  job_id: string
+  locator: Record<string, unknown>
+  metadata: Record<string, unknown>
+  object_key: string | null
+  object_refs: readonly Record<string, unknown>[]
+  parsed_content_id: string | null
+  retry_eligible: boolean
+  safe_error: Record<string, unknown> | null
+  source_document_id: string
+  stage: DocumentProcessingUnitStage
+  status: DocumentProcessingUnitStatus
+  unit_index: number | null
+  unit_key: string
+  unit_type: string
+  updated_at: string
+  warnings: readonly Record<string, unknown>[]
+}
+
+export interface DocumentProcessingUnitListResult {
+  data: DocumentProcessingUnit[]
+  pagination: Pagination
 }
 
 export interface SourceDocumentDetail {
@@ -2266,6 +2321,16 @@ export function createFococontextApiClient(
         ),
         options
       ),
+    listDocumentProcessingUnits: (documentId, listOptions = {}) =>
+      requestListJson(
+        fetchFn,
+        baseUrl,
+        appendDocumentProcessingUnitListQuery(
+          `/documents/${encodeURIComponent(documentId)}/processing-units`,
+          listOptions
+        ),
+        options
+      ),
     listSourceWatchRules: (knowledgeBaseId, listOptions = {}) =>
       requestListJson(
         fetchFn,
@@ -2639,6 +2704,32 @@ function appendSourceWatchScanItemListQuery(
   return `${basePath}${basePath.includes("?") ? "&" : "?"}item_kind=${encodeURIComponent(
     options.itemKind
   )}`
+}
+
+function appendDocumentProcessingUnitListQuery(
+  path: string,
+  options: DocumentProcessingUnitListOptions
+): string {
+  const basePath = appendListQuery(path, options)
+  const params = new URLSearchParams()
+
+  if (options.jobId !== undefined) {
+    params.set("job_id", options.jobId)
+  }
+  if (options.stage !== undefined) {
+    params.set("stage", options.stage)
+  }
+  if (options.status !== undefined) {
+    params.set("status", options.status)
+  }
+
+  const query = params.toString()
+
+  if (query.length === 0) {
+    return basePath
+  }
+
+  return `${basePath}${basePath.includes("?") ? "&" : "?"}${query}`
 }
 
 function appendCleanupItemQuery(

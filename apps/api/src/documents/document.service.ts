@@ -54,6 +54,10 @@ import type {
   DocumentUploadResponse,
   CreateUploadSessionResponse,
   DeleteImpactPreviewResponse,
+  DocumentProcessingStage,
+  DocumentProcessingUnitRecord,
+  DocumentProcessingUnitResponse,
+  DocumentProcessingUnitStatus,
   JobRecord,
   JobResponse,
   ListMediaAssetsInput,
@@ -1177,6 +1181,42 @@ export class DocumentService {
         preview_url: previewUrl,
         expires_at: new Date(Date.now() + expiresInSeconds * 1000).toISOString(),
       },
+    };
+  }
+
+  async listDocumentProcessingUnits(
+    documentId: string,
+    input: {
+      jobId?: string;
+      page: number;
+      pageSize: number;
+      stage?: DocumentProcessingStage;
+      status?: DocumentProcessingUnitStatus;
+    },
+    scope?: ApiResourceScope,
+  ): Promise<{
+    items: DocumentProcessingUnitResponse[];
+    page: number;
+    pageSize: number;
+    total: number;
+    hasMore: boolean;
+  }> {
+    await this.requireOperationalLiveDocument(
+      documentId,
+      await this.operationalReadStore.getSourceDocumentById(documentId),
+      scope,
+    );
+    const dbResult = await this.operationalReadStore.listDocumentProcessingUnitsByDocumentId(
+      documentId,
+      input,
+    );
+
+    return {
+      items: dbResult?.items.map(toDocumentProcessingUnitResponse) ?? [],
+      page: input.page,
+      pageSize: input.pageSize,
+      total: dbResult?.total ?? 0,
+      hasMore: dbResult?.hasMore ?? false,
     };
   }
 
@@ -3481,6 +3521,38 @@ function toMediaAssetResponse(record: MediaAssetRecord): MediaAssetResponse {
         : (JSON.parse(JSON.stringify(record.captionError)) as Record<string, unknown>),
     caption_generated_at: record.captionGeneratedAt,
     created_at: record.createdAt,
+    updated_at: record.updatedAt,
+  };
+}
+
+function toDocumentProcessingUnitResponse(
+  record: DocumentProcessingUnitRecord,
+): DocumentProcessingUnitResponse {
+  return {
+    id: record.id,
+    source_document_id: record.sourceDocumentId,
+    job_id: record.jobId,
+    parsed_content_id: record.parsedContentId,
+    stage: record.stage,
+    unit_type: record.unitType,
+    unit_key: record.unitKey,
+    unit_index: record.unitIndex,
+    attempt_scope: record.attemptScope,
+    status: record.status,
+    content_hash: record.contentHash,
+    dedupe_key: record.dedupeKey,
+    object_key: record.objectKey,
+    object_refs: cloneJsonArray(record.objectRefs),
+    locator: JSON.parse(JSON.stringify(record.locator)) as Record<string, unknown>,
+    counters: JSON.parse(JSON.stringify(record.counters)) as Record<string, unknown>,
+    warnings: cloneJsonArray(record.warnings),
+    safe_error:
+      record.safeError === null
+        ? null
+        : (JSON.parse(JSON.stringify(record.safeError)) as Record<string, unknown>),
+    metadata: JSON.parse(JSON.stringify(record.metadata)) as Record<string, unknown>,
+    retry_eligible: record.retryEligible,
+    completed_at: record.completedAt,
     updated_at: record.updatedAt,
   };
 }

@@ -351,6 +351,14 @@ const apiMessageCatalog = {
     "en-US": "Media caption retry requires parsed content and an ingest job.",
     "zh-CN": "重试图片说明需要已有解析内容和入库任务。",
   },
+  "api.validation.document_processing_stage_filter_invalid": {
+    "en-US": "Document processing stage filter is invalid.",
+    "zh-CN": "资料处理阶段筛选无效。",
+  },
+  "api.validation.document_processing_status_filter_invalid": {
+    "en-US": "Document processing status filter is invalid.",
+    "zh-CN": "资料处理状态筛选无效。",
+  },
   "api.validation.ocr_pdf_required": {
     "en-US": "OCR retry requires a PDF source document.",
     "zh-CN": "OCR 重试需要 PDF 资料。",

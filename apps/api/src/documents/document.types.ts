@@ -10,6 +10,21 @@ export const sourceDocumentStatuses = [
 ] as const;
 export const sourceTypes = ["file", "text", "url", "wiki_draft"] as const;
 export const sourceEvidenceKinds = ["text", "image_caption", "ocr"] as const;
+export const documentProcessingStages = [
+  "parsing",
+  "ocr",
+  "media_extraction",
+  "captioning",
+  "parsed_artifact",
+] as const;
+export const documentProcessingUnitStatuses = [
+  "pending",
+  "running",
+  "succeeded",
+  "failed",
+  "skipped",
+  "canceled",
+] as const;
 export const sourceEvidenceLocatorStatuses = [
   "resolved",
   "not_provided",
@@ -25,6 +40,19 @@ export type SourceEvidenceLocatorStatus = (typeof sourceEvidenceLocatorStatuses)
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "canceled";
 export type UploadSessionStatus = "created" | "finalized" | "expired" | "canceled";
 export type SourceVisibilityOrigin = "canonical" | "upstream_inherited" | "fork_owned";
+export type DocumentProcessingStage =
+  | "parsing"
+  | "ocr"
+  | "media_extraction"
+  | "captioning"
+  | "parsed_artifact";
+export type DocumentProcessingUnitStatus =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "skipped"
+  | "canceled";
 
 export interface DocumentKnowledgeBaseScopeRecord {
   knowledgeBaseId: string;
@@ -173,6 +201,31 @@ export interface MediaAssetRecord {
   updatedAt: string;
 }
 
+export interface DocumentProcessingUnitRecord {
+  id: string;
+  sourceDocumentId: string;
+  jobId: string;
+  parsedContentId: string | null;
+  stage: DocumentProcessingStage;
+  unitType: string;
+  unitKey: string;
+  unitIndex: number | null;
+  attemptScope: string;
+  status: DocumentProcessingUnitStatus;
+  contentHash: string | null;
+  dedupeKey: string;
+  objectKey: string | null;
+  objectRefs: readonly Record<string, unknown>[];
+  locator: Record<string, unknown>;
+  counters: Record<string, unknown>;
+  warnings: readonly Record<string, unknown>[];
+  safeError: Record<string, unknown> | null;
+  metadata: Record<string, unknown>;
+  retryEligible: boolean;
+  completedAt: string | null;
+  updatedAt: string;
+}
+
 export interface SourceDocumentResponse {
   id: string;
   knowledge_base_id: string;
@@ -194,6 +247,31 @@ export interface SourceDocumentResponse {
   upstream_resource_id?: string | null;
   fork_tombstoned_at?: string | null;
   created_at: string;
+  updated_at: string;
+}
+
+export interface DocumentProcessingUnitResponse {
+  id: string;
+  source_document_id: string;
+  job_id: string;
+  parsed_content_id: string | null;
+  stage: DocumentProcessingStage;
+  unit_type: string;
+  unit_key: string;
+  unit_index: number | null;
+  attempt_scope: string;
+  status: DocumentProcessingUnitStatus;
+  content_hash: string | null;
+  dedupe_key: string;
+  object_key: string | null;
+  object_refs: readonly Record<string, unknown>[];
+  locator: Record<string, unknown>;
+  counters: Record<string, unknown>;
+  warnings: readonly Record<string, unknown>[];
+  safe_error: Record<string, unknown> | null;
+  metadata: Record<string, unknown>;
+  retry_eligible: boolean;
+  completed_at: string | null;
   updated_at: string;
 }
 

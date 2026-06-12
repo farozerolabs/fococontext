@@ -2114,6 +2114,108 @@ export const openApiComponents = {
       },
       additionalProperties: true,
     },
+    DocumentProcessingUnit: {
+      type: "object",
+      required: [
+        "id",
+        "source_document_id",
+        "job_id",
+        "stage",
+        "unit_type",
+        "unit_key",
+        "attempt_scope",
+        "status",
+        "locator",
+        "counters",
+        "warnings",
+        "metadata",
+        "retry_eligible",
+        "updated_at",
+      ],
+      properties: {
+        id: {
+          type: "string",
+          pattern: "^dpu_[a-zA-Z0-9]+$",
+        },
+        source_document_id: {
+          $ref: "#/components/schemas/SourceDocumentId",
+        },
+        job_id: {
+          $ref: "#/components/schemas/IngestJobId",
+        },
+        parsed_content_id: {
+          oneOf: [{ $ref: "#/components/schemas/ParsedContentId" }, { type: "null" }],
+        },
+        stage: {
+          type: "string",
+          enum: ["parsing", "ocr", "media_extraction", "captioning", "parsed_artifact"],
+        },
+        unit_type: {
+          type: "string",
+        },
+        unit_key: {
+          type: "string",
+        },
+        unit_index: {
+          type: ["integer", "null"],
+        },
+        attempt_scope: {
+          type: "string",
+        },
+        status: {
+          type: "string",
+          enum: ["pending", "running", "succeeded", "failed", "skipped", "canceled"],
+        },
+        content_hash: {
+          type: ["string", "null"],
+        },
+        dedupe_key: {
+          type: "string",
+        },
+        object_key: {
+          type: ["string", "null"],
+        },
+        object_refs: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: true,
+          },
+        },
+        locator: {
+          type: "object",
+          additionalProperties: true,
+        },
+        counters: {
+          type: "object",
+          additionalProperties: true,
+        },
+        warnings: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: true,
+          },
+        },
+        safe_error: {
+          oneOf: [{ type: "object", additionalProperties: true }, { type: "null" }],
+        },
+        metadata: {
+          type: "object",
+          additionalProperties: true,
+        },
+        retry_eligible: {
+          type: "boolean",
+        },
+        completed_at: {
+          oneOf: [{ $ref: "#/components/schemas/Timestamp" }, { type: "null" }],
+        },
+        updated_at: {
+          $ref: "#/components/schemas/Timestamp",
+        },
+      },
+      additionalProperties: true,
+    },
     ParsedContent: {
       type: "object",
       required: [
@@ -5451,6 +5553,76 @@ export const openApiPaths = {
             },
             request_id: "req_example",
           },
+        ),
+        ...standardErrorResponses,
+      },
+    },
+  },
+  "/documents/{document_id}/processing-units": {
+    get: {
+      summary: "List source document processing units",
+      description:
+        "Returns paginated parser, OCR, media extraction, caption, and parsed artifact processing details for diagnostics and Admin progress views.",
+      operationId: "listSourceDocumentProcessingUnits",
+      parameters: [
+        {
+          name: "document_id",
+          in: "path",
+          required: true,
+          schema: {
+            $ref: "#/components/schemas/SourceDocumentId",
+          },
+        },
+        {
+          name: "job_id",
+          in: "query",
+          required: false,
+          schema: {
+            $ref: "#/components/schemas/IngestJobId",
+          },
+        },
+        {
+          name: "stage",
+          in: "query",
+          required: false,
+          schema: {
+            type: "string",
+            enum: ["parsing", "ocr", "media_extraction", "captioning", "parsed_artifact"],
+          },
+        },
+        {
+          name: "status",
+          in: "query",
+          required: false,
+          schema: {
+            type: "string",
+            enum: ["pending", "running", "succeeded", "failed", "skipped", "canceled"],
+          },
+        },
+        {
+          name: "page",
+          in: "query",
+          required: false,
+          schema: {
+            type: "integer",
+            minimum: 1,
+          },
+        },
+        {
+          name: "page_size",
+          in: "query",
+          required: false,
+          schema: {
+            type: "integer",
+            minimum: 1,
+            maximum: 100,
+          },
+        },
+      ],
+      responses: {
+        "200": listJsonResponse(
+          "Source document processing units.",
+          "#/components/schemas/DocumentProcessingUnit",
         ),
         ...standardErrorResponses,
       },

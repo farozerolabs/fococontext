@@ -8,6 +8,9 @@ import type {
   JobStage,
   JobStatus,
   BackgroundOperationRecord,
+  DocumentProcessingStage,
+  DocumentProcessingUnitRecord,
+  DocumentProcessingUnitStatus,
   MediaAssetRecord,
   ParsedContentRecord,
   SourceDocumentRecord,
@@ -145,6 +148,21 @@ export interface PaginatedSourceDocumentReadResult {
 
 export interface PaginatedMediaAssetReadResult {
   items: MediaAssetRecord[];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface DocumentProcessingUnitReadInput extends Omit<
+  PaginatedReadInput,
+  "knowledgeBaseId"
+> {
+  jobId?: string;
+  stage?: DocumentProcessingStage;
+  status?: DocumentProcessingUnitStatus;
+}
+
+export interface PaginatedDocumentProcessingUnitReadResult {
+  items: DocumentProcessingUnitRecord[];
   total: number;
   hasMore: boolean;
 }
@@ -352,6 +370,10 @@ export interface OperationalReadStore {
     documentId: string,
     input: Omit<PaginatedReadInput, "knowledgeBaseId">,
   ): Promise<PaginatedMediaAssetReadResult | null>;
+  listDocumentProcessingUnitsByDocumentId(
+    documentId: string,
+    input: DocumentProcessingUnitReadInput,
+  ): Promise<PaginatedDocumentProcessingUnitReadResult | null>;
   getMediaAssetById(mediaAssetId: string): Promise<MediaAssetRecord | null>;
   findReferencedObjectKeys(input: ReferencedObjectKeyReadInput): Promise<Set<string>>;
   listWikiPageRecordsBySourceDocumentId(
@@ -492,6 +514,9 @@ export function createNoopOperationalReadStore(): OperationalReadStore {
       return null;
     },
     async listMediaAssetsByDocumentId() {
+      return null;
+    },
+    async listDocumentProcessingUnitsByDocumentId() {
       return null;
     },
     async getMediaAssetById() {
@@ -2060,6 +2085,63 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     };
   }
 
+  async listDocumentProcessingUnitsByDocumentId(
+    documentId: string,
+    input: DocumentProcessingUnitReadInput,
+  ): Promise<PaginatedDocumentProcessingUnitReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<DocumentProcessingUnitRow>`
+        select
+          id,
+          source_document_id,
+          job_id,
+          parsed_content_id,
+          stage,
+          unit_type,
+          unit_key,
+          unit_index,
+          attempt_scope,
+          status,
+          content_hash,
+          dedupe_key,
+          object_key,
+          object_refs,
+          locator,
+          counters,
+          warnings,
+          safe_error,
+          metadata,
+          retry_eligible,
+          completed_at,
+          updated_at
+        from document_processing_units
+        where source_document_id = ${documentId}
+          and (${input.jobId === undefined} or job_id = ${input.jobId ?? "__none__"})
+          and (${input.stage === undefined} or stage = ${input.stage ?? "parsing"})
+          and (${input.status === undefined} or status = ${input.status ?? "pending"})
+        order by updated_at desc, id desc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from document_processing_units
+        where source_document_id = ${documentId}
+          and (${input.jobId === undefined} or job_id = ${input.jobId ?? "__none__"})
+          and (${input.stage === undefined} or stage = ${input.stage ?? "parsing"})
+          and (${input.status === undefined} or status = ${input.status ?? "pending"})
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items: itemsResult.rows.map(toDocumentProcessingUnitRecord),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
   async getMediaAssetById(mediaAssetId: string): Promise<MediaAssetRecord | null> {
     const result = await sql<MediaAssetRow>`
       select
@@ -3355,6 +3437,31 @@ interface MediaAssetRow {
   updated_at: unknown;
 }
 
+interface DocumentProcessingUnitRow {
+  id: string;
+  source_document_id: string;
+  job_id: string;
+  parsed_content_id: string | null;
+  stage: string;
+  unit_type: string;
+  unit_key: string;
+  unit_index: number | null;
+  attempt_scope: string;
+  status: string;
+  content_hash: string | null;
+  dedupe_key: string;
+  object_key: string | null;
+  object_refs: unknown;
+  locator: unknown;
+  counters: unknown;
+  warnings: unknown;
+  safe_error: unknown;
+  metadata: unknown;
+  retry_eligible: boolean;
+  completed_at: unknown;
+  updated_at: unknown;
+}
+
 interface WikiPageRecordRow {
   id: string;
   knowledge_base_id: string;
@@ -3849,6 +3956,35 @@ function toMediaAssetRecord(row: MediaAssetRow): MediaAssetRecord {
     captionError: normalizeNullableJsonObject(row.caption_error),
     captionGeneratedAt: normalizeNullableTimestamp(row.caption_generated_at),
     createdAt: normalizeTimestamp(row.created_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toDocumentProcessingUnitRecord(
+  row: DocumentProcessingUnitRow,
+): DocumentProcessingUnitRecord {
+  return {
+    id: row.id,
+    sourceDocumentId: row.source_document_id,
+    jobId: row.job_id,
+    parsedContentId: row.parsed_content_id,
+    stage: readDocumentProcessingStage(row.stage),
+    unitType: row.unit_type,
+    unitKey: row.unit_key,
+    unitIndex: row.unit_index,
+    attemptScope: row.attempt_scope,
+    status: readDocumentProcessingUnitStatus(row.status),
+    contentHash: row.content_hash,
+    dedupeKey: row.dedupe_key,
+    objectKey: row.object_key,
+    objectRefs: readJsonObjectArray(row.object_refs),
+    locator: normalizeJsonObject(row.locator),
+    counters: normalizeJsonObject(row.counters),
+    warnings: readJsonObjectArray(row.warnings),
+    safeError: normalizeNullableJsonObject(row.safe_error),
+    metadata: normalizeJsonObject(row.metadata),
+    retryEligible: row.retry_eligible,
+    completedAt: normalizeNullableTimestamp(row.completed_at),
     updatedAt: normalizeTimestamp(row.updated_at),
   };
 }
@@ -4455,6 +4591,35 @@ function readMediaCaptionStatus(value: unknown): MediaAssetRecord["captionStatus
   }
 
   return "not_configured";
+}
+
+function readDocumentProcessingStage(value: unknown): DocumentProcessingStage {
+  if (
+    value === "parsing" ||
+    value === "ocr" ||
+    value === "media_extraction" ||
+    value === "captioning" ||
+    value === "parsed_artifact"
+  ) {
+    return value;
+  }
+
+  return "parsing";
+}
+
+function readDocumentProcessingUnitStatus(value: unknown): DocumentProcessingUnitStatus {
+  if (
+    value === "pending" ||
+    value === "running" ||
+    value === "succeeded" ||
+    value === "failed" ||
+    value === "skipped" ||
+    value === "canceled"
+  ) {
+    return value;
+  }
+
+  return "pending";
 }
 
 function readJobStage(value: unknown): JobStage {

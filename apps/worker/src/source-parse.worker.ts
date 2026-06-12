@@ -23,8 +23,17 @@ import type {
   WorkerJobProgressWriter,
   WorkerJobStateGuard,
 } from "./job-progress.postgres-writer.js";
+import type { DocumentProcessingStateStore } from "./document-processing-state.js";
 import type { MediaCaptionQueue } from "./media-caption.worker.js";
 import { createMarkdownPreview, defaultParsedMarkdownPreviewMaxChars } from "./parsed-preview.js";
+import {
+  createMarkdownWindows,
+  createMediaExtractionProcessingUnits,
+  createParserConfigHash,
+  createParserProcessingUnits,
+  createParserUnitDedupeKey,
+  type ParserMarkdownWindow,
+} from "./source-parse-processing-state.js";
 import type {
   DatasetConfigurationSnapshotPayload,
   WikiAnalyzeQueue,
@@ -124,6 +133,8 @@ export interface SourceParseProcessorOptions {
   parserLimits?: ParserLimitConfig;
   mediaAssetUploadConcurrency?: number;
   previewMaxChars?: number;
+  processingStateMarkdownWindowChars?: number;
+  processingState?: DocumentProcessingStateStore;
 }
 
 export interface SourceParseProcessorResult {
@@ -153,6 +164,8 @@ export class SourceParseProcessor {
   private readonly parserLimits: ParserLimitConfig | undefined;
   private readonly mediaAssetUploadConcurrency: number;
   private readonly previewMaxChars: number;
+  private readonly processingStateMarkdownWindowChars: number;
+  private readonly processingState: DocumentProcessingStateStore | undefined;
 
   constructor(options: SourceParseProcessorOptions) {
     this.objectStorage = options.objectStorage;
@@ -170,6 +183,11 @@ export class SourceParseProcessor {
       4,
     );
     this.previewMaxChars = options.previewMaxChars ?? defaultParsedMarkdownPreviewMaxChars;
+    this.processingStateMarkdownWindowChars = normalizePositiveInteger(
+      options.processingStateMarkdownWindowChars,
+      64_000,
+    );
+    this.processingState = options.processingState;
   }
 
   async process(payload: SourceParsePayload): Promise<SourceParseProcessorResult> {
@@ -191,6 +209,48 @@ export class SourceParseProcessor {
       return this.createFailedResult(payload, resolution.error);
     }
 
+    const parserConfigHash = createParserConfigHash(payload, resolution.parser);
+    const parserDedupeKey = createParserUnitDedupeKey(payload, parserConfigHash);
+    const completedCheckpoint = await this.processingState?.findCheckpoint({
+      checkpointKey: parserDedupeKey,
+      jobId: payload.job_id,
+      sourceDocumentId: payload.document_id,
+      stage: "parsing",
+    });
+
+    if (completedCheckpoint?.status === "completed") {
+      const parsedContentId = readString(completedCheckpoint.summary.parsed_content_id);
+
+      if (parsedContentId !== null) {
+        return {
+          status: "completed",
+          should_continue: true,
+          document_id: payload.document_id,
+          parsed_content_id: parsedContentId,
+          error: null,
+        };
+      }
+    }
+
+    await this.processingState?.upsertUnit({
+      configHash: parserConfigHash,
+      contentHash: payload.content_hash,
+      dedupeKey: parserDedupeKey,
+      jobId: payload.job_id,
+      metadata: {
+        mime_type: payload.mime_type,
+        source_type: payload.source_type,
+      },
+      objectKey: payload.object_key,
+      parserName: resolution.parser.name,
+      parserVersion: resolution.parser.version,
+      sourceDocumentId: payload.document_id,
+      stage: "parsing",
+      status: "running",
+      unitKey: payload.object_key,
+      unitType: "source_object",
+    });
+
     const original = await this.objectStorage.getObject({
       key: payload.object_key,
     });
@@ -203,6 +263,12 @@ export class SourceParseProcessor {
     );
 
     if (contentResult.kind === "fatal") {
+      await this.markParsingUnitFailed(
+        payload,
+        parserConfigHash,
+        parserDedupeKey,
+        contentResult.error,
+      );
       await this.markParsingFailed(payload, contentResult.error);
 
       return this.createFailedResult(payload, contentResult.error);
@@ -226,6 +292,7 @@ export class SourceParseProcessor {
     );
 
     if (result.kind === "fatal") {
+      await this.markParsingUnitFailed(payload, parserConfigHash, parserDedupeKey, result.error);
       await this.markParsingFailed(payload, result.error);
 
       return this.createFailedResult(payload, result.error);
@@ -234,12 +301,23 @@ export class SourceParseProcessor {
     const postParseGuardError = await this.createStaleJobError(payload);
 
     if (postParseGuardError !== undefined) {
+      await this.markParsingUnitFailed(
+        payload,
+        parserConfigHash,
+        parserDedupeKey,
+        postParseGuardError,
+      );
       await this.markParsingFailed(payload, postParseGuardError);
 
       return this.createFailedResult(payload, postParseGuardError);
     }
 
     const normalizedMarkdownObjectKey = createNormalizedMarkdownObjectKey(payload);
+    const markdownWindows = createMarkdownWindows({
+      markdown: result.parsedContent.normalizedMarkdown,
+      maxChars: this.processingStateMarkdownWindowChars,
+      payload,
+    });
 
     await this.objectStorage.putObject({
       key: normalizedMarkdownObjectKey,
@@ -250,6 +328,7 @@ export class SourceParseProcessor {
         parsedContentId,
       },
     });
+    await this.writeMarkdownWindowObjects(markdownWindows, payload, parsedContentId);
     await this.writer.saveParsedContent({
       id: parsedContentId,
       document_id: payload.document_id,
@@ -273,6 +352,64 @@ export class SourceParseProcessor {
 
     await this.writeMediaAssetObjects(result.parsedContent.mediaAssets, payload, parsedContentId);
     await this.writer.saveMediaAssets(mediaAssets);
+    await this.processingState?.upsertUnits(
+      createParserProcessingUnits({
+        configHash: parserConfigHash,
+        markdownWindows,
+        parsedContent: result.parsedContent,
+        parsedContentId,
+        payload,
+      }),
+    );
+    await this.processingState?.upsertUnit({
+      configHash: parserConfigHash,
+      contentHash: payload.content_hash,
+      counters: {
+        locator_count: result.parsedContent.locators.length,
+        markdown_chars: result.parsedContent.normalizedMarkdown.length,
+        media_asset_count: result.parsedContent.mediaAssets.length,
+        table_count: result.parsedContent.tables.length,
+        warning_count: result.parsedContent.warnings.length,
+      },
+      jobId: payload.job_id,
+      objectKey: normalizedMarkdownObjectKey,
+      parsedContentId,
+      parserName: result.parsedContent.parserName,
+      parserVersion: result.parsedContent.parserVersion,
+      sourceDocumentId: payload.document_id,
+      stage: "parsed_artifact",
+      status: "succeeded",
+      unitKey: "normalized_markdown",
+      unitType: "normalized_markdown",
+      warnings: result.parsedContent.warnings.map(toJsonObject),
+    });
+    await this.processingState?.upsertUnits(
+      createMediaExtractionProcessingUnits({
+        mediaAssets,
+        parsedContentId,
+        payload,
+      }),
+    );
+    await this.processingState?.upsertUnit({
+      configHash: parserConfigHash,
+      contentHash: payload.content_hash,
+      counters: {
+        content_bytes: Buffer.isBuffer(contentResult.content)
+          ? contentResult.content.byteLength
+          : undefined,
+      },
+      dedupeKey: parserDedupeKey,
+      jobId: payload.job_id,
+      objectKey: payload.object_key,
+      parsedContentId,
+      parserName: result.parsedContent.parserName,
+      parserVersion: result.parsedContent.parserVersion,
+      sourceDocumentId: payload.document_id,
+      stage: "parsing",
+      status: "succeeded",
+      unitKey: payload.object_key,
+      unitType: "source_object",
+    });
 
     const ocrDecision = evaluateSourceOcrDecision({
       payload,
@@ -310,6 +447,14 @@ export class SourceParseProcessor {
           parser_cache: result.cache,
         },
       });
+      await this.markParsingCheckpointCompleted(payload, {
+        checkpointKey: parserDedupeKey,
+        configHash: parserConfigHash,
+        downstreamStage: "ocr",
+        normalizedMarkdownObjectKey,
+        parsedContentId,
+        parserCache: result.cache,
+      });
 
       return {
         status: "completed",
@@ -326,6 +471,11 @@ export class SourceParseProcessor {
         const error = createOcrRequiredError(ocrDecision.reason);
 
         await this.markParsingFailed(payload, error);
+        await this.markParsingCheckpointFailed(payload, {
+          checkpointKey: parserDedupeKey,
+          configHash: parserConfigHash,
+          error,
+        });
 
         return this.createFailedResult(payload, error);
       }
@@ -376,6 +526,14 @@ export class SourceParseProcessor {
           parser_cache: result.cache,
         },
       });
+      await this.markParsingCheckpointCompleted(payload, {
+        checkpointKey: parserDedupeKey,
+        configHash: parserConfigHash,
+        downstreamStage: "captioning",
+        normalizedMarkdownObjectKey,
+        parsedContentId,
+        parserCache: result.cache,
+      });
 
       return {
         status: "completed",
@@ -411,6 +569,14 @@ export class SourceParseProcessor {
       metadata: {
         parser_cache: result.cache,
       },
+    });
+    await this.markParsingCheckpointCompleted(payload, {
+      checkpointKey: parserDedupeKey,
+      configHash: parserConfigHash,
+      downstreamStage: "analyzing",
+      normalizedMarkdownObjectKey,
+      parsedContentId,
+      parserCache: result.cache,
     });
 
     return {
@@ -502,6 +668,25 @@ export class SourceParseProcessor {
     );
   }
 
+  private async writeMarkdownWindowObjects(
+    windows: readonly ParserMarkdownWindow[],
+    payload: SourceParsePayload,
+    parsedContentId: string,
+  ): Promise<void> {
+    await mapWithConcurrency(windows, this.mediaAssetUploadConcurrency, (window) =>
+      this.objectStorage.putObject({
+        key: window.objectKey,
+        body: Buffer.from(window.content),
+        contentType: "text/markdown",
+        metadata: {
+          documentId: payload.document_id,
+          parsedContentId,
+          sha256: window.sha256,
+        },
+      }),
+    );
+  }
+
   private async createFailedResult(
     payload: SourceParsePayload,
     error: ParserFatalError,
@@ -530,6 +715,78 @@ export class SourceParseProcessor {
       error: {
         code: "source_parse_failed",
         parser_error: error,
+      },
+    });
+  }
+
+  private async markParsingUnitFailed(
+    payload: SourceParsePayload,
+    configHash: string,
+    dedupeKey: string,
+    error: ParserFatalError,
+  ): Promise<void> {
+    await this.processingState?.upsertUnit({
+      configHash,
+      contentHash: payload.content_hash,
+      dedupeKey,
+      jobId: payload.job_id,
+      objectKey: payload.object_key,
+      retryEligible: error.retryable,
+      safeError: toJsonObject(error),
+      sourceDocumentId: payload.document_id,
+      stage: "parsing",
+      status: "failed",
+      unitKey: payload.object_key,
+      unitType: "source_object",
+    });
+  }
+
+  private async markParsingCheckpointCompleted(
+    payload: SourceParsePayload,
+    input: {
+      checkpointKey: string;
+      configHash: string;
+      downstreamStage: "ocr" | "captioning" | "analyzing";
+      normalizedMarkdownObjectKey: string;
+      parsedContentId: string;
+      parserCache?: ParserCacheMetadata;
+    },
+  ): Promise<void> {
+    await this.processingState?.upsertCheckpoint({
+      checkpointKey: input.checkpointKey,
+      configHash: input.configHash,
+      jobId: payload.job_id,
+      parsedContentId: input.parsedContentId,
+      sourceDocumentId: payload.document_id,
+      stage: "parsing",
+      status: "completed",
+      summary: {
+        downstream_stage: input.downstreamStage,
+        normalized_markdown_object_key: input.normalizedMarkdownObjectKey,
+        parsed_content_id: input.parsedContentId,
+        parser_cache: input.parserCache ?? {},
+      },
+    });
+  }
+
+  private async markParsingCheckpointFailed(
+    payload: SourceParsePayload,
+    input: {
+      checkpointKey: string;
+      configHash: string;
+      error: ParserFatalError;
+    },
+  ): Promise<void> {
+    await this.processingState?.upsertCheckpoint({
+      checkpointKey: input.checkpointKey,
+      configHash: input.configHash,
+      jobId: payload.job_id,
+      safeError: toJsonObject(input.error),
+      sourceDocumentId: payload.document_id,
+      stage: "parsing",
+      status: "failed",
+      summary: {
+        retryable: input.error.retryable,
       },
     });
   }
@@ -746,6 +1003,10 @@ function createNormalizedMarkdownObjectKey(payload: SourceParsePayload): string 
   return `parsed/${payload.document_id}/${sanitizeObjectKeySegment(
     payload.content_hash,
   )}/normalized.md`;
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 function createSkippedParseError(reason: WorkerJobGuardReason | undefined): ParserFatalError {

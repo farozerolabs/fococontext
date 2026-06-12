@@ -487,6 +487,14 @@ export const zhCNMessages = {
       status: "状态",
       updated: "更新时间",
     },
+    processing: {
+      empty: "暂无处理单元记录",
+      error: "错误",
+      stage: "阶段",
+      status: "状态",
+      unit: "单元",
+      updated: "更新时间",
+    },
     ingestProgressSummary:
       "{{completed}}/{{total}} 个任务已完成 · 阶段平均进度 {{progress}}%",
     loadFailedDescription: "任务加载失败。请重试以重新请求当前页。",
@@ -506,6 +514,7 @@ export const zhCNMessages = {
       logs: "日志",
       ocr: "OCR",
       parser: "解析器",
+      processingUnits: "处理单元",
       summary: "摘要",
       timeline: "时间线",
     },

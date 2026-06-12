@@ -2279,9 +2279,7 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     await input.assertCanContinue?.();
 
     const applied = await this.db.transaction().execute(async (trx) => {
-      await sql`
-        select pg_advisory_xact_lock(hashtext(${`wiki.merge:${input.draft.knowledgeBaseId}`}))
-      `.execute(trx);
+      await this.lockKnowledgeBaseGraphWrites(input.draft.knowledgeBaseId, trx);
 
       return this.applyDraftTransaction(input, trx);
     });
@@ -2748,6 +2746,7 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
       let graphInsights: GraphInsightsResponse | null = null;
 
       await this.db.transaction().execute(async (trx) => {
+        await this.lockKnowledgeBaseGraphWrites(knowledgeBaseId, trx);
         await this.insertDerivedGraphSignalEdges(
           knowledgeBaseId,
           changeSetId,
@@ -2818,6 +2817,7 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
 
       if (input.skipDerivedGraphSignals !== true) {
         await this.db.transaction().execute(async (trx) => {
+          await this.lockKnowledgeBaseGraphWrites(input.knowledgeBaseId, trx);
           await this.insertDerivedGraphSignalEdges(
             input.knowledgeBaseId,
             refreshContext.changeSetId,
@@ -3804,8 +3804,11 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     );
     const constrainedEdges = constrainResolvedEdgeSourcesToDocuments(edges, validSourceDocumentIds);
     const visibility = await this.createWriteVisibilityMetadata(knowledgeBaseId, db);
+    const orderedEdges = [...constrainedEdges].sort((left, right) =>
+      left.edgeId.localeCompare(right.edgeId),
+    );
 
-    for (const edge of constrainedEdges) {
+    for (const edge of orderedEdges) {
       await sql`
         insert into wiki_edges (
           id,
@@ -3895,6 +3898,15 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
         `.execute(db);
       }
     }
+  }
+
+  private async lockKnowledgeBaseGraphWrites(
+    knowledgeBaseId: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema>,
+  ): Promise<void> {
+    await sql`
+      select pg_advisory_xact_lock(hashtext(${`wiki.merge:${knowledgeBaseId}`}))
+    `.execute(db);
   }
 
   private async loadValidSourceDocumentIds(

@@ -56,6 +56,16 @@ export const adminQueryKeys = {
       "documents",
       ...(options === undefined ? [] : [options]),
     ] as const,
+  documentProcessingUnits: (
+    documentId: string,
+    options?: Record<string, unknown>
+  ) =>
+    [
+      "documents",
+      documentId,
+      "processing-units",
+      ...(options === undefined ? [] : [options]),
+    ] as const,
   sourceWatchRules: (
     knowledgeBaseId: string,
     options?: Record<string, unknown>

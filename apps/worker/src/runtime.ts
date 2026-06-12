@@ -27,7 +27,12 @@ import {
   PostgresDeletionCleanupRepository,
   PostgresDeletionCleanupTargetGuard,
 } from "./deletion-cleanup.worker.js";
+import { DocumentProcessingIntermediateCleaner } from "./document-processing-cleanup.js";
 import { PostgresModelCallRecorder } from "./model-call.postgres-recorder.js";
+import {
+  DocumentProcessingRetentionDelegate,
+  PostgresDocumentProcessingStateStore,
+} from "./document-processing-state.js";
 import { createRedisObjectStorageOperationRecorder } from "./redis-object-storage-operation-recorder.js";
 import { createRedisRuntimeQueuePressureRecorder } from "./redis-runtime-queue-pressure.js";
 import { PostgresSourceParseWriter } from "./source-parse.postgres-writer.js";
@@ -61,9 +66,9 @@ import {
 import {
   BullMqSourceOcrQueue,
   BullMqSourceOcrWorker,
-  PostgresSourceOcrRepository,
   SourceOcrProcessor,
 } from "./source-ocr.worker.js";
+import { PostgresSourceOcrRepository } from "./source-ocr.postgres-repository.js";
 import {
   BullMqWebhookDispatchWorker,
   PostgresWebhookEventEmitter,
@@ -110,6 +115,22 @@ async function main(): Promise<void> {
   });
   const artifactRepository = createPostgresCompileArtifactRepository(db);
   const backgroundOperationCheckpoints = createPostgresBackgroundOperationCheckpointRepository(db);
+  const documentProcessingState = new DocumentProcessingRetentionDelegate(
+    new PostgresDocumentProcessingStateStore(db),
+    {
+      failureRetentionDays: config.limits.documentProcessing.failureRetentionDays,
+      successRetentionDays: config.limits.documentProcessing.successRetentionDays,
+    },
+  );
+  await new DocumentProcessingIntermediateCleaner({
+    batchSize: config.limits.documentProcessing.cleanupBatchSize,
+    objectStorage,
+    stateStore: documentProcessingState,
+  })
+    .cleanupExpired()
+    .catch((error: unknown) => {
+      console.warn("Document processing intermediate cleanup failed.", error);
+    });
   const modelCallRecorder = new PostgresModelCallRecorder(artifactRepository);
   const modelProfiles = resolveModelProviderProfiles(config.models);
   const chatProvider = createOpenAICompatibleChatProvider(modelProfiles.chat);
@@ -183,6 +204,7 @@ async function main(): Promise<void> {
             jobProgress,
             modelCallRecorder,
             objectStorage,
+            processingState: documentProcessingState,
             repository: new PostgresMediaCaptionRepository(db),
             visionProvider: createOpenAICompatibleVisionCaptionProvider(
               modelProfiles.visionCaption,
@@ -199,6 +221,8 @@ async function main(): Promise<void> {
       jobProgress,
       objectStorage,
       parserLimits: createParserLimitConfig(config.limits.parser),
+      processingState: documentProcessingState,
+      processingStateMarkdownWindowChars: config.limits.documentProcessing.markdownWindowChars,
       mediaAssetUploadConcurrency: config.limits.parser.mediaUploadConcurrency,
       previewMaxChars: config.limits.objectStorageOperations.previewMaxChars,
       writer: new PostgresSourceParseWriter(db),
@@ -240,6 +264,7 @@ async function main(): Promise<void> {
             repository: new PostgresSourceOcrRepository(db, {
               writeBatchSize: config.limits.backgroundJobs.ocr.batchSize,
             }),
+            processingState: documentProcessingState,
           }),
         )
       : undefined;

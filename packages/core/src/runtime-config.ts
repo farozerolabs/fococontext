@@ -170,6 +170,14 @@ export interface RuntimeConfigLimits {
     remoteImageFetchingEnabled: boolean;
     pdfSnapshotMinTextChars: number;
   };
+  documentProcessing: {
+    cleanupBatchSize: number;
+    detailDefaultPageSize: number;
+    detailMaxPageSize: number;
+    failureRetentionDays: number;
+    markdownWindowChars: number;
+    successRetentionDays: number;
+  };
   queue: {
     concurrency: number;
     sourceParseConcurrency: number;
@@ -1288,6 +1296,44 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
           env,
           "PARSER_PDF_SNAPSHOT_MIN_TEXT_CHARS",
           80,
+          invalid,
+        ),
+      },
+      documentProcessing: {
+        cleanupBatchSize: parseOptionalPositiveInteger(
+          env,
+          "DOCUMENT_PROCESSING_CLEANUP_BATCH_SIZE",
+          500,
+          invalid,
+        ),
+        detailDefaultPageSize: parseOptionalPositiveInteger(
+          env,
+          "DOCUMENT_PROCESSING_DETAIL_DEFAULT_PAGE_SIZE",
+          50,
+          invalid,
+        ),
+        detailMaxPageSize: parseOptionalPositiveInteger(
+          env,
+          "DOCUMENT_PROCESSING_DETAIL_MAX_PAGE_SIZE",
+          200,
+          invalid,
+        ),
+        failureRetentionDays: parseOptionalPositiveInteger(
+          env,
+          "DOCUMENT_PROCESSING_FAILURE_RETENTION_DAYS",
+          30,
+          invalid,
+        ),
+        markdownWindowChars: parseOptionalPositiveInteger(
+          env,
+          "DOCUMENT_PROCESSING_MARKDOWN_WINDOW_CHARS",
+          64_000,
+          invalid,
+        ),
+        successRetentionDays: parseOptionalPositiveInteger(
+          env,
+          "DOCUMENT_PROCESSING_SUCCESS_RETENTION_DAYS",
+          7,
           invalid,
         ),
       },

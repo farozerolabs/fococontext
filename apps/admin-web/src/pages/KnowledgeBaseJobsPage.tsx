@@ -7,6 +7,7 @@ import { useParams, useSearchParams } from "react-router"
 
 import {
   type BackgroundOperation,
+  type DocumentProcessingUnit,
   type Job,
   type JobDetail,
   type JobEvent,
@@ -553,6 +554,34 @@ function JobDetailsDialog({
     refetchOnMount: "always",
     refetchOnWindowFocus: true,
   })
+  const processingUnitsQuery = useQuery({
+    enabled: item.document !== null,
+    queryKey:
+      item.document === null
+        ? adminQueryKeys.documentProcessingUnits("")
+        : adminQueryKeys.documentProcessingUnits(item.document.id, {
+            jobId: item.job.id,
+            page: 1,
+            pageSize: 50,
+          }),
+    queryFn: async () => {
+      if (item.document === null) {
+        return {
+          data: [],
+          pagination: createEmptyPagination(1),
+        }
+      }
+
+      return apiClient.listDocumentProcessingUnits(item.document.id, {
+        jobId: item.job.id,
+        page: 1,
+        pageSize: 50,
+      })
+    },
+    refetchInterval: () =>
+      getActiveRefetchInterval(isActiveJobStatus(item.job.status)),
+    refetchIntervalInBackground: true,
+  })
   const selectedJobId = item.job.id
   const selectedJobUpdatedAt = item.job.updated_at
   const jobDetailUpdatedAt = jobDetailQuery.data?.updated_at
@@ -783,6 +812,26 @@ function JobDetailsDialog({
                 label: t("job.section.artifacts"),
               },
               {
+                content: (
+                  <InspectorSection title={t("job.section.processingUnits")}>
+                    {processingUnitsQuery.isLoading ? (
+                      <LoadingState label={t("state.loading")} />
+                    ) : null}
+                    {processingUnitsQuery.isError ? (
+                      <ErrorAlert title={t("state.loadFailed")} />
+                    ) : null}
+                    {processingUnitsQuery.isSuccess ? (
+                      <DocumentProcessingUnitTable
+                        formatDate={formatDate}
+                        units={processingUnitsQuery.data.data}
+                      />
+                    ) : null}
+                  </InspectorSection>
+                ),
+                id: "processing",
+                label: t("job.section.processingUnits"),
+              },
+              {
                 content: <InspectorJson value={jobDetailQuery.data ?? job} />,
                 id: "data",
                 label: t("ide.rawData"),
@@ -840,6 +889,72 @@ function BackgroundOperationTable({
               <time dateTime={operation.updated_at}>
                 {formatDate(operation.updated_at)}
               </time>
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  )
+}
+
+function DocumentProcessingUnitTable({
+  formatDate,
+  units,
+}: {
+  formatDate: (value: string) => string
+  units: readonly DocumentProcessingUnit[]
+}) {
+  const { t } = useTranslation()
+
+  if (units.length === 0) {
+    return (
+      <div className="text-sm text-muted-foreground">
+        {t("job.processing.empty")}
+      </div>
+    )
+  }
+
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>{t("job.processing.unit")}</TableHead>
+          <TableHead>{t("job.processing.stage")}</TableHead>
+          <TableHead>{t("job.processing.status")}</TableHead>
+          <TableHead>{t("job.processing.updated")}</TableHead>
+          <TableHead>{t("job.processing.error")}</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {units.map((unit) => (
+          <TableRow key={unit.id}>
+            <TableCell className="align-top">
+              <div className="flex flex-col gap-1">
+                <span className="font-medium break-words">
+                  {unit.unit_type}
+                </span>
+                <span className="text-xs break-words text-muted-foreground">
+                  {unit.unit_key}
+                </span>
+              </div>
+            </TableCell>
+            <TableCell className="align-top">{unit.stage}</TableCell>
+            <TableCell className="align-top">
+              <Badge variant="outline">{unit.status}</Badge>
+            </TableCell>
+            <TableCell className="align-top">
+              <time dateTime={unit.updated_at}>
+                {formatDate(unit.updated_at)}
+              </time>
+            </TableCell>
+            <TableCell className="align-top">
+              {unit.safe_error === null ? (
+                <span className="text-muted-foreground">
+                  {t("source.notAvailable")}
+                </span>
+              ) : (
+                <InspectorJson value={unit.safe_error} />
+              )}
             </TableCell>
           </TableRow>
         ))}

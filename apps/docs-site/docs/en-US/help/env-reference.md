@@ -238,46 +238,90 @@ Rerank uses an all-or-none contract. Leave every `RERANK_*` value empty to disab
 | `PARSER_REMOTE_IMAGE_FETCHING_ENABLED`       | Remote Markdown/HTML image fetching            | Default `false`                                   |
 | `PARSER_PDF_SNAPSHOT_MIN_TEXT_CHARS`         | PDF page snapshot threshold for low-text pages | Default `80`                                      |
 
+## Document Processing State
+
+| Field                                          | Description                                      | Recommended Value |
+| ---------------------------------------------- | ------------------------------------------------ | ----------------- |
+| `DOCUMENT_PROCESSING_MARKDOWN_WINDOW_CHARS`    | Markdown window artifact size                    | Default `64000`   |
+| `DOCUMENT_PROCESSING_DETAIL_DEFAULT_PAGE_SIZE` | Default page size for processing detail reads    | Default `50`      |
+| `DOCUMENT_PROCESSING_DETAIL_MAX_PAGE_SIZE`     | Max page size for processing detail reads        | Default `200`     |
+| `DOCUMENT_PROCESSING_CLEANUP_BATCH_SIZE`       | Expired intermediate cleanup batch size          | Default `500`     |
+| `DOCUMENT_PROCESSING_SUCCESS_RETENTION_DAYS`   | Successful intermediate detail retention in days | Default `7`       |
+| `DOCUMENT_PROCESSING_FAILURE_RETENTION_DAYS`   | Failed intermediate detail retention in days     | Default `30`      |
+
 ## Queues, Compile, and Retrieve
 
-| Field                                          | Description                        | Recommended Value                                                                        |
-| ---------------------------------------------- | ---------------------------------- | ---------------------------------------------------------------------------------------- |
-| `FOCOCONTEXT_QUEUE_CONCURRENCY`                | Default queue concurrency          | Default `2`                                                                              |
-| `BATCH_IMPORT_CONCURRENCY`                     | Batch import concurrency           | Default `2`                                                                              |
-| `SOURCE_WATCH_SCAN_CONCURRENCY`                | Source Watch scan concurrency      | Default `2`                                                                              |
-| `BACKGROUND_REINDEX_*`                         | Reindex batch/checkpoint controls  | Batch, cursor window, checkpoint interval, retry delay, and concurrency                  |
-| `BACKGROUND_GRAPH_INSIGHTS_*`                  | Graph insight refresh controls     | Batch, cursor window, checkpoint interval, retry delay, and concurrency                  |
-| `BACKGROUND_KNOWLEDGE_CHECK_*`                 | Knowledge Check controls           | Batch, cursor window, checkpoint interval, retry delay, and concurrency                  |
-| `BACKGROUND_SOURCE_WATCH_*`                    | Source Watch background controls   | Batch, cursor window, checkpoint interval, retry delay, and concurrency                  |
-| `BACKGROUND_OCR_*`                             | OCR background worker controls     | Worker batch/checkpoint controls; page work uses `OCR_PAGE_CONCURRENCY`                  |
-| `BACKGROUND_MEDIA_CAPTION_*`                   | Media caption background controls  | Worker batch/checkpoint controls; image calls use `VISION_CAPTION_IMAGE_CONCURRENCY`     |
-| `BACKGROUND_CLEANUP_*`                         | Cleanup background controls        | Batch, cursor window, checkpoint interval, retry delay, and concurrency                  |
-| `RESIDUAL_GRAPH_INSIGHTS_*`                    | Graph insight residual work caps   | Summary window and checkpoint interval; defaults inherit graph insight background limits |
-| `RESIDUAL_SOURCE_WATCH_*`                      | Source Watch comparison caps       | Comparison window, checkpoint interval, and small URL list limit                         |
-| `RESIDUAL_OCR_*`                               | OCR page residual work caps        | Page window and checkpoint interval; defaults inherit OCR background limits              |
-| `RESIDUAL_MEDIA_CAPTION_*`                     | Media caption residual work caps   | Asset window and checkpoint interval; defaults inherit media caption background limits   |
-| `SOURCE_WATCH_SCHEDULER_ENABLED`               | Whether scheduled scans run        | Default `true`                                                                           |
-| `SOURCE_WATCH_SCAN_INTERVAL_SECONDS`           | Scan interval                      | Default `3600`                                                                           |
-| `SOURCE_WATCH_SCAN_MAX_RETRIES`                | Scan retry count                   | Default `2`                                                                              |
-| `SOURCE_WATCH_SCAN_RETRY_BASE_DELAY_MS`        | Base retry delay for scans         | Default `1000`                                                                           |
-| `WIKI_ANALYZE_CONCURRENCY`                     | Analysis stage concurrency         | Default `2`; constrained by Chat provider rate limits                                    |
-| `WIKI_GENERATE_CONCURRENCY`                    | Generation stage concurrency       | Default `2`                                                                              |
-| `WIKI_MERGE_CONCURRENCY`                       | Merge stage concurrency            | Default `2`                                                                              |
-| `COMPILE_MAX_CONTEXT_CHARS`                    | Compile prompt character budget    | Default `24000`; tune by model context                                                   |
-| `RETRIEVE_DEFAULT_TOP_K`                       | Default candidate count            | Default `10`                                                                             |
-| `RETRIEVE_MAX_TOP_K`                           | Max candidate count                | Default `20`                                                                             |
-| `RETRIEVE_DEFAULT_GRAPH_DEPTH`                 | Default graph depth                | Default `1`                                                                              |
-| `RETRIEVE_MAX_GRAPH_DEPTH`                     | Max graph depth                    | Default `3`                                                                              |
-| `RETRIEVE_DEFAULT_GRAPH_LIMIT_PER_RESULT`      | Default graph expansion per result | Default `5`                                                                              |
-| `RETRIEVE_MAX_GRAPH_LIMIT_PER_RESULT`          | Max graph expansion per result     | Default `10`                                                                             |
-| `RETRIEVE_DEFAULT_CONTEXT_BUDGET_TOKENS`       | Default context budget             | Default `4000`                                                                           |
-| `RETRIEVE_MAX_CONTEXT_BUDGET_TOKENS`           | Max context budget                 | Default `12000`                                                                          |
-| `SOURCE_EVIDENCE_DEFAULT_MAX_CHARS`            | Default source evidence text cap   | Default `4000`                                                                           |
-| `SOURCE_EVIDENCE_MAX_CHARS`                    | Max source evidence text cap       | Default `12000`                                                                          |
-| `SOURCE_EVIDENCE_DEFAULT_CONTEXT_CHARS`        | Default source evidence context    | Default `800`                                                                            |
-| `SOURCE_EVIDENCE_MAX_CONTEXT_CHARS`            | Max source evidence context        | Default `2000`                                                                           |
-| `SOURCE_EVIDENCE_BATCH_MAX_ITEMS`              | Max batch evidence items           | Default `20`                                                                             |
-| `SOURCE_EVIDENCE_BATCH_TOTAL_OUTPUT_MAX_CHARS` | Max batch evidence output          | Default `40000`                                                                          |
+| Field                                            | Description                                  | Recommended Value                                     |
+| ------------------------------------------------ | -------------------------------------------- | ----------------------------------------------------- |
+| `FOCOCONTEXT_QUEUE_CONCURRENCY`                  | Default queue concurrency                    | Default `2`                                           |
+| `BATCH_IMPORT_CONCURRENCY`                       | Batch import concurrency                     | Default `2`                                           |
+| `SOURCE_WATCH_SCAN_CONCURRENCY`                  | Source Watch scan concurrency                | Default `2`                                           |
+| `BACKGROUND_REINDEX_BATCH_SIZE`                  | Reindex batch size                           | Default `100`                                         |
+| `BACKGROUND_REINDEX_CURSOR_WINDOW_SIZE`          | Reindex cursor window                        | Default `100`                                         |
+| `BACKGROUND_REINDEX_CHECKPOINT_INTERVAL`         | Reindex checkpoint interval                  | Default `1`                                           |
+| `BACKGROUND_REINDEX_RETRY_BASE_DELAY_MS`         | Reindex retry base delay                     | Default `1000`                                        |
+| `BACKGROUND_REINDEX_CONCURRENCY`                 | Reindex concurrency                          | Defaults to `FOCOCONTEXT_QUEUE_CONCURRENCY`           |
+| `BACKGROUND_GRAPH_INSIGHTS_BATCH_SIZE`           | Graph insight batch size                     | Default `100`                                         |
+| `BACKGROUND_GRAPH_INSIGHTS_CURSOR_WINDOW_SIZE`   | Graph insight cursor window                  | Default `100`                                         |
+| `BACKGROUND_GRAPH_INSIGHTS_CHECKPOINT_INTERVAL`  | Graph insight checkpoint interval            | Default `1`                                           |
+| `BACKGROUND_GRAPH_INSIGHTS_RETRY_BASE_DELAY_MS`  | Graph insight retry base delay               | Default `1000`                                        |
+| `BACKGROUND_GRAPH_INSIGHTS_CONCURRENCY`          | Graph insight concurrency                    | Defaults to `FOCOCONTEXT_QUEUE_CONCURRENCY`           |
+| `BACKGROUND_KNOWLEDGE_CHECK_BATCH_SIZE`          | Knowledge Check batch size                   | Default `100`                                         |
+| `BACKGROUND_KNOWLEDGE_CHECK_CURSOR_WINDOW_SIZE`  | Knowledge Check cursor window                | Default `100`                                         |
+| `BACKGROUND_KNOWLEDGE_CHECK_CHECKPOINT_INTERVAL` | Knowledge Check checkpoint interval          | Default `1`                                           |
+| `BACKGROUND_KNOWLEDGE_CHECK_RETRY_BASE_DELAY_MS` | Knowledge Check retry base delay             | Default `1000`                                        |
+| `BACKGROUND_KNOWLEDGE_CHECK_CONCURRENCY`         | Knowledge Check concurrency                  | Defaults to `FOCOCONTEXT_QUEUE_CONCURRENCY`           |
+| `BACKGROUND_SOURCE_WATCH_BATCH_SIZE`             | Source Watch background batch size           | Default `100`                                         |
+| `BACKGROUND_SOURCE_WATCH_CURSOR_WINDOW_SIZE`     | Source Watch background cursor window        | Default `100`                                         |
+| `BACKGROUND_SOURCE_WATCH_CHECKPOINT_INTERVAL`    | Source Watch background checkpoint interval  | Default `1`                                           |
+| `BACKGROUND_SOURCE_WATCH_RETRY_BASE_DELAY_MS`    | Source Watch background retry base delay     | Default `1000`                                        |
+| `BACKGROUND_SOURCE_WATCH_CONCURRENCY`            | Source Watch background concurrency          | Defaults to `FOCOCONTEXT_QUEUE_CONCURRENCY`           |
+| `BACKGROUND_OCR_BATCH_SIZE`                      | OCR background batch size                    | Default `100`                                         |
+| `BACKGROUND_OCR_CURSOR_WINDOW_SIZE`              | OCR background cursor window                 | Default `100`                                         |
+| `BACKGROUND_OCR_CHECKPOINT_INTERVAL`             | OCR background checkpoint interval           | Default `1`                                           |
+| `BACKGROUND_OCR_RETRY_BASE_DELAY_MS`             | OCR background retry base delay              | Default `1000`                                        |
+| `BACKGROUND_OCR_CONCURRENCY`                     | OCR background concurrency                   | Defaults to `FOCOCONTEXT_QUEUE_CONCURRENCY`           |
+| `BACKGROUND_MEDIA_CAPTION_BATCH_SIZE`            | Media caption background batch size          | Default `100`                                         |
+| `BACKGROUND_MEDIA_CAPTION_CURSOR_WINDOW_SIZE`    | Media caption background cursor window       | Default `100`                                         |
+| `BACKGROUND_MEDIA_CAPTION_CHECKPOINT_INTERVAL`   | Media caption background checkpoint interval | Default `1`                                           |
+| `BACKGROUND_MEDIA_CAPTION_RETRY_BASE_DELAY_MS`   | Media caption background retry base delay    | Default `1000`                                        |
+| `BACKGROUND_MEDIA_CAPTION_CONCURRENCY`           | Media caption background concurrency         | Defaults to `FOCOCONTEXT_QUEUE_CONCURRENCY`           |
+| `BACKGROUND_CLEANUP_BATCH_SIZE`                  | Cleanup batch size                           | Default `100`                                         |
+| `BACKGROUND_CLEANUP_CURSOR_WINDOW_SIZE`          | Cleanup cursor window                        | Default `100`                                         |
+| `BACKGROUND_CLEANUP_CHECKPOINT_INTERVAL`         | Cleanup checkpoint interval                  | Default `1`                                           |
+| `BACKGROUND_CLEANUP_RETRY_BASE_DELAY_MS`         | Cleanup retry base delay                     | Default `1000`                                        |
+| `BACKGROUND_CLEANUP_CONCURRENCY`                 | Cleanup concurrency                          | Defaults to `FOCOCONTEXT_QUEUE_CONCURRENCY`           |
+| `RESIDUAL_GRAPH_INSIGHTS_SUMMARY_WINDOW_SIZE`    | Graph insight residual summary window        | Default `100`                                         |
+| `RESIDUAL_GRAPH_INSIGHTS_CHECKPOINT_INTERVAL`    | Graph insight residual checkpoint interval   | Default `1`                                           |
+| `RESIDUAL_SOURCE_WATCH_COMPARISON_WINDOW_SIZE`   | Source Watch residual comparison window      | Default `100`                                         |
+| `RESIDUAL_SOURCE_WATCH_CHECKPOINT_INTERVAL`      | Source Watch residual checkpoint interval    | Default `1`                                           |
+| `RESIDUAL_SOURCE_WATCH_SMALL_URL_LIST_LIMIT`     | Source Watch small URL list limit            | Defaults to `SOURCE_WATCH_URL_LIST_MAX_URLS`          |
+| `RESIDUAL_OCR_PAGE_WINDOW_SIZE`                  | OCR residual page window                     | Default `100`                                         |
+| `RESIDUAL_OCR_CHECKPOINT_INTERVAL`               | OCR residual checkpoint interval             | Default `1`                                           |
+| `RESIDUAL_MEDIA_CAPTION_ASSET_WINDOW_SIZE`       | Media caption residual asset window          | Default `100`                                         |
+| `RESIDUAL_MEDIA_CAPTION_CHECKPOINT_INTERVAL`     | Media caption residual checkpoint interval   | Default `1`                                           |
+| `SOURCE_WATCH_SCHEDULER_ENABLED`                 | Whether scheduled scans run                  | Default `true`                                        |
+| `SOURCE_WATCH_SCAN_INTERVAL_SECONDS`             | Scan interval                                | Default `3600`                                        |
+| `SOURCE_WATCH_SCAN_MAX_RETRIES`                  | Scan retry count                             | Default `2`                                           |
+| `SOURCE_WATCH_SCAN_RETRY_BASE_DELAY_MS`          | Base retry delay for scans                   | Default `1000`                                        |
+| `WIKI_ANALYZE_CONCURRENCY`                       | Analysis stage concurrency                   | Default `2`; constrained by Chat provider rate limits |
+| `WIKI_GENERATE_CONCURRENCY`                      | Generation stage concurrency                 | Default `2`                                           |
+| `WIKI_MERGE_CONCURRENCY`                         | Merge stage concurrency                      | Default `2`                                           |
+| `COMPILE_MAX_CONTEXT_CHARS`                      | Compile prompt character budget              | Default `24000`; tune by model context                |
+| `RETRIEVE_DEFAULT_TOP_K`                         | Default candidate count                      | Default `10`                                          |
+| `RETRIEVE_MAX_TOP_K`                             | Max candidate count                          | Default `20`                                          |
+| `RETRIEVE_DEFAULT_GRAPH_DEPTH`                   | Default graph depth                          | Default `1`                                           |
+| `RETRIEVE_MAX_GRAPH_DEPTH`                       | Max graph depth                              | Default `3`                                           |
+| `RETRIEVE_DEFAULT_GRAPH_LIMIT_PER_RESULT`        | Default graph expansion per result           | Default `5`                                           |
+| `RETRIEVE_MAX_GRAPH_LIMIT_PER_RESULT`            | Max graph expansion per result               | Default `10`                                          |
+| `RETRIEVE_DEFAULT_CONTEXT_BUDGET_TOKENS`         | Default context budget                       | Default `4000`                                        |
+| `RETRIEVE_MAX_CONTEXT_BUDGET_TOKENS`             | Max context budget                           | Default `12000`                                       |
+| `SOURCE_EVIDENCE_DEFAULT_MAX_CHARS`              | Default source evidence text cap             | Default `4000`                                        |
+| `SOURCE_EVIDENCE_MAX_CHARS`                      | Max source evidence text cap                 | Default `12000`                                       |
+| `SOURCE_EVIDENCE_DEFAULT_CONTEXT_CHARS`          | Default source evidence context              | Default `800`                                         |
+| `SOURCE_EVIDENCE_MAX_CONTEXT_CHARS`              | Max source evidence context                  | Default `2000`                                        |
+| `SOURCE_EVIDENCE_BATCH_MAX_ITEMS`                | Max batch evidence items                     | Default `20`                                          |
+| `SOURCE_EVIDENCE_BATCH_TOTAL_OUTPUT_MAX_CHARS`   | Max batch evidence output                    | Default `40000`                                       |
 
 ## Webhooks
 

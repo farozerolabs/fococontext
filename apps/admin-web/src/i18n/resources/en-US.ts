@@ -508,6 +508,14 @@ export const enUSMessages = {
       status: "Status",
       updated: "Updated",
     },
+    processing: {
+      empty: "No processing units recorded yet",
+      error: "Error",
+      stage: "Stage",
+      status: "Status",
+      unit: "Unit",
+      updated: "Updated",
+    },
     ingestProgressSummary:
       "{{completed}}/{{total}} jobs completed · {{progress}}% stage-average progress",
     loadFailedDescription:
@@ -528,6 +536,7 @@ export const enUSMessages = {
       logs: "Logs",
       ocr: "OCR",
       parser: "Parser",
+      processingUnits: "Processing units",
       summary: "Summary",
       timeline: "Timeline",
     },

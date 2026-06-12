@@ -53,6 +53,8 @@ export const expectedSchemaTables = [
   "knowledge_checks",
   "knowledge_check_findings",
   "knowledge_check_window_checkpoints",
+  "document_processing_units",
+  "document_processing_checkpoints",
   "duplicate_decisions",
   "delete_impact_previews",
   "source_watch_rules",
