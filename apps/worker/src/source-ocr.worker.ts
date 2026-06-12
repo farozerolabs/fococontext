@@ -8,6 +8,7 @@ import {
   renderPdfPagesForOcr,
   type OcrProvider,
   type OcrProviderBlock,
+  type OcrBoundingBox,
   type ParserWarning,
   type PdfNativeTextPage,
   type PdfOcrBlock,
@@ -46,6 +47,7 @@ export interface SourceOcrQueueJob {
 
 export interface SourceOcrProcessorConfig {
   concurrency: number;
+  checkpointInterval: number;
   confidenceThreshold: number;
   languages: string[];
   maxObjectBytes: number;
@@ -56,6 +58,7 @@ export interface SourceOcrProcessorConfig {
   retryBaseDelayMs: number;
   storePageImages: boolean;
   timeoutSeconds: number;
+  windowSize: number;
 }
 
 export interface SourceOcrProcessorOptions {
@@ -127,8 +130,25 @@ export interface SourceOcrSaveResultInput {
   warnings: readonly ParserWarning[];
 }
 
+export interface SourceOcrPageProgressInput {
+  artifacts: readonly SourceOcrArtifactWrite[];
+  completedAt: string;
+  documentId: string;
+  jobId: string;
+  pages: readonly SourceOcrPageWrite[];
+  parsedContentId: string;
+}
+
+export interface SourceOcrReusablePageInput {
+  documentId: string;
+  pageNumbers: readonly number[];
+  parsedContentId: string;
+}
+
 export interface SourceOcrRepository {
   getParsedContentContext(parsedContentId: string): Promise<SourceOcrParsedContentContext | null>;
+  listReusableOcrPages(input: SourceOcrReusablePageInput): Promise<SourceOcrPageWrite[]>;
+  saveOcrPageWindow(input: SourceOcrPageProgressInput): Promise<void>;
   saveOcrResult(input: SourceOcrSaveResultInput): Promise<void>;
 }
 
@@ -267,6 +287,17 @@ export class SourceOcrProcessor {
       return createSourceOcrFailedResult(payload);
     }
 
+    const candidatePageNumbers = payload.candidate_pages.map((page) => page.pageNumber);
+    const reusablePages = await this.repository.listReusableOcrPages({
+      documentId: payload.document_id,
+      pageNumbers: candidatePageNumbers,
+      parsedContentId: payload.parsed_content_id,
+    });
+    const reusablePageNumbers = new Set(reusablePages.map((page) => page.pageNumber));
+    const pendingCandidatePages = payload.candidate_pages
+      .filter((page) => !reusablePageNumbers.has(page.pageNumber))
+      .slice(0, Math.max(0, this.config.maxPagesPerDocument - reusablePages.length));
+
     await this.jobProgress?.updateJobProgress({
       jobId: payload.job_id,
       knowledgeBaseId: payload.knowledge_base_id,
@@ -278,9 +309,24 @@ export class SourceOcrProcessor {
       parsedContentId: payload.parsed_content_id,
       metadata: {
         ocr_candidate_page_count: payload.candidate_pages.length,
-        ocr_candidate_pages: payload.candidate_pages.map((page) => page.pageNumber),
+        ocr_candidate_pages: candidatePageNumbers,
+        ocr_reusable_page_count: reusablePages.length,
+        ocr_window_size: this.config.windowSize,
       },
     });
+
+    if (candidatePageNumbers.length > 0 && pendingCandidatePages.length === 0) {
+      await this.enqueueDownstream(payload, context);
+
+      return {
+        block_count: reusablePages.flatMap((page) => page.blocks).length,
+        document_id: payload.document_id,
+        failed_page_count: countFailedPages(reusablePages),
+        parsed_content_id: payload.parsed_content_id,
+        should_continue: true,
+        status: "completed",
+      };
+    }
 
     const objectReads = new Map<string, Promise<BoundedObjectReadResult>>();
     const readObjectOnce = (key: string): Promise<BoundedObjectReadResult> => {
@@ -319,64 +365,101 @@ export class SourceOcrProcessor {
     const normalizedContent = normalizedRead.content;
     const nativeMarkdown = normalizedContent.toString("utf8");
     const nativePages = extractPdfNativePages(nativeMarkdown);
-    const rendered = await renderPdfPagesForOcr({
-      candidatePages: payload.candidate_pages.map((page) => page.pageNumber),
-      concurrency: this.config.concurrency,
-      content: sourceContent,
-      dpi: this.config.pageDpi,
-      maxPagePixels: this.config.maxPagePixels,
-      maxPages: this.config.maxPagesPerDocument,
-      timeoutMs: this.config.timeoutSeconds * 1000,
-      shouldCancel: async () => {
-        const nextGuard = await this.jobGuard?.canContinueJob({
+    const artifacts: SourceOcrArtifactWrite[] = [];
+    const pageWrites: SourceOcrPageWrite[] = [...reusablePages];
+    const pendingWindows = chunkArray(pendingCandidatePages, this.config.windowSize);
+
+    for (const [windowIndex, pageWindow] of pendingWindows.entries()) {
+      const rendered = await renderPdfPagesForOcr({
+        candidatePages: pageWindow.map((page) => page.pageNumber),
+        concurrency: this.config.concurrency,
+        content: sourceContent,
+        dpi: this.config.pageDpi,
+        maxPagePixels: this.config.maxPagePixels,
+        maxPages: this.config.maxPagesPerDocument,
+        timeoutMs: this.config.timeoutSeconds * 1000,
+        shouldCancel: async () => {
+          const nextGuard = await this.jobGuard?.canContinueJob({
+            jobId: payload.job_id,
+            knowledgeBaseId: payload.knowledge_base_id,
+            inputSnapshotId: payload.input_snapshot_id,
+            sourceDocumentId: payload.document_id,
+          });
+
+          return nextGuard?.canContinue === false;
+        },
+      });
+      const recognizedPages = await mapWithConcurrency(
+        rendered.pages,
+        this.config.concurrency,
+        (page) => this.recognizeRenderedPage(page),
+      );
+      const nextGuard = await this.canContinue(payload);
+
+      if (!nextGuard.canContinue) {
+        await this.jobProgress?.updateJobProgress({
           jobId: payload.job_id,
           knowledgeBaseId: payload.knowledge_base_id,
           inputSnapshotId: payload.input_snapshot_id,
-          sourceDocumentId: payload.document_id,
+          stage: "ocr",
+          status: "failed",
+          progress: 100,
+          message: "OCR stopped because the ingest job is no longer runnable.",
+          parsedContentId: payload.parsed_content_id,
+          error: {
+            code: "source_ocr_stale_job",
+            reason: nextGuard.reason ?? "unknown",
+          },
         });
 
-        return nextGuard?.canContinue === false;
-      },
-    });
-    const recognizedPages = await mapWithConcurrency(
-      rendered.pages,
-      this.config.concurrency,
-      (page) => this.recognizeRenderedPage(page),
-    );
-    const skippedPages = rendered.skippedPages.map((page) => toSkippedPageWrite(page));
-    const nextGuard = await this.canContinue(payload);
+        return createSourceOcrFailedResult(payload);
+      }
 
-    if (!nextGuard.canContinue) {
-      await this.jobProgress?.updateJobProgress({
+      const windowArtifacts = await this.storeRenderedPages(payload, rendered.pages);
+      const artifactByPageNumber = new Map(
+        windowArtifacts.map((artifact) => [artifact.pageNumber, artifact]),
+      );
+      const windowPageWrites = [
+        ...recognizedPages.map((page) => ({
+          ...page,
+          artifactId: artifactByPageNumber.get(page.pageNumber)?.id ?? null,
+        })),
+        ...rendered.skippedPages.map((page) => toSkippedPageWrite(page)),
+      ];
+
+      await this.repository.saveOcrPageWindow({
+        artifacts: windowArtifacts,
+        completedAt: new Date().toISOString(),
+        documentId: payload.document_id,
         jobId: payload.job_id,
-        knowledgeBaseId: payload.knowledge_base_id,
-        inputSnapshotId: payload.input_snapshot_id,
-        stage: "ocr",
-        status: "failed",
-        progress: 100,
-        message: "OCR stopped because the ingest job is no longer runnable.",
+        pages: windowPageWrites,
         parsedContentId: payload.parsed_content_id,
-        error: {
-          code: "source_ocr_stale_job",
-          reason: nextGuard.reason ?? "unknown",
-        },
       });
+      artifacts.push(...windowArtifacts);
+      pageWrites.push(...windowPageWrites);
 
-      return createSourceOcrFailedResult(payload);
+      if ((windowIndex + 1) % this.config.checkpointInterval === 0) {
+        await this.jobProgress?.updateJobProgress({
+          jobId: payload.job_id,
+          knowledgeBaseId: payload.knowledge_base_id,
+          inputSnapshotId: payload.input_snapshot_id,
+          stage: "ocr",
+          status: "running",
+          progress: 40,
+          message: "Running OCR on scanned PDF pages...",
+          parsedContentId: payload.parsed_content_id,
+          metadata: {
+            ocr_completed_windows: windowIndex + 1,
+            ocr_processed_page_count: pageWrites.length,
+            ocr_total_windows: pendingWindows.length,
+            ocr_window_size: this.config.windowSize,
+          },
+        });
+      }
     }
 
-    const artifacts = await this.storeRenderedPages(payload, rendered.pages);
-    const artifactByPageNumber = new Map(
-      artifacts.map((artifact) => [artifact.pageNumber, artifact]),
-    );
-    const pageWrites = [
-      ...recognizedPages.map((page) => ({
-        ...page,
-        artifactId: artifactByPageNumber.get(page.pageNumber)?.id ?? null,
-      })),
-      ...skippedPages,
-    ];
-    const ocrBlocks = recognizedPages.flatMap((page) => page.blocks);
+    pageWrites.sort((left, right) => left.pageNumber - right.pageNumber);
+    const ocrBlocks = pageWrites.flatMap((page) => page.blocks);
     const applied = applyPdfOcrResults({
       nativePages,
       ocrBlocks,
@@ -399,12 +482,12 @@ export class SourceOcrProcessor {
         ocrStatus: "failed",
         pages: pageWrites,
         parsedContentId: payload.parsed_content_id,
-        providerMetadata: createProviderMetadata(recognizedPages),
+        providerMetadata: createProviderMetadata(pageWrites),
         summary: {
           error: applied.error,
           failed_page_count: countFailedPages(pageWrites),
         },
-        warnings: rendered.warnings,
+        warnings: pageWrites.flatMap((page) => page.warnings),
       });
       await this.markFailed(payload, {
         code: "source_ocr_failed",
@@ -435,19 +518,21 @@ export class SourceOcrProcessor {
       ocrStatus:
         ocrBlocks.length > 0
           ? "succeeded"
-          : rendered.skippedPages.length > 0
+          : pageWrites.some((page) => page.status === "skipped")
             ? "skipped"
             : "not_required",
       pages: pageWrites,
       parsedContentId: payload.parsed_content_id,
-      providerMetadata: createProviderMetadata(recognizedPages),
+      providerMetadata: createProviderMetadata(pageWrites),
       summary: {
         failed_page_count: countFailedPages(pageWrites),
-        ocr_candidate_pages: payload.candidate_pages.map((page) => page.pageNumber),
-        ocr_page_count: rendered.pages.length,
-        skipped_page_count: rendered.skippedPages.length,
+        ocr_candidate_pages: candidatePageNumbers,
+        ocr_page_count: pageWrites.filter((page) => page.status === "succeeded").length,
+        ocr_reused_page_count: reusablePages.length,
+        ocr_window_size: this.config.windowSize,
+        skipped_page_count: pageWrites.filter((page) => page.status === "skipped").length,
       },
-      warnings: [...rendered.warnings, ...recognizedPages.flatMap((page) => page.warnings)],
+      warnings: pageWrites.flatMap((page) => page.warnings),
     });
 
     await this.enqueueDownstream(payload, context);
@@ -707,7 +792,77 @@ export class PostgresSourceOcrRepository implements SourceOcrRepository {
     };
   }
 
-  async saveOcrResult(input: SourceOcrSaveResultInput): Promise<void> {
+  async listReusableOcrPages(input: SourceOcrReusablePageInput): Promise<SourceOcrPageWrite[]> {
+    if (input.pageNumbers.length === 0) {
+      return [];
+    }
+
+    const pagesResult = await sql<OcrPageStatusRow>`
+      select
+        page_number,
+        status,
+        reason,
+        provider_name,
+        engine,
+        model_version,
+        confidence_avg,
+        attempt_count,
+        retryable,
+        error,
+        warnings,
+        metadata
+      from ocr_page_statuses
+      where source_document_id = ${input.documentId}
+        and parsed_content_id = ${input.parsedContentId}
+        and page_number in (${sql.join(input.pageNumbers)})
+        and status in ('succeeded', 'skipped')
+      order by page_number asc
+    `.execute(this.db);
+    const blocksResult = await sql<OcrBlockRow>`
+      select
+        page_number,
+        block_index,
+        text,
+        confidence,
+        bbox,
+        language,
+        provider_name,
+        engine,
+        model_version,
+        source_artifact_id
+      from ocr_blocks
+      where source_document_id = ${input.documentId}
+        and parsed_content_id = ${input.parsedContentId}
+        and page_number in (${sql.join(input.pageNumbers)})
+      order by page_number asc, block_index asc
+    `.execute(this.db);
+    const blocksByPage = new Map<number, PdfOcrBlock[]>();
+
+    for (const row of blocksResult.rows) {
+      const pageNumber = row.page_number;
+      const existing = blocksByPage.get(pageNumber) ?? [];
+      existing.push(toPersistedPdfOcrBlock(row));
+      blocksByPage.set(pageNumber, existing);
+    }
+
+    return pagesResult.rows.map((row) => ({
+      artifactId: readOcrSourceArtifactId(row.metadata, blocksResult.rows, row.page_number),
+      attemptCount: row.attempt_count,
+      blocks: blocksByPage.get(row.page_number) ?? [],
+      confidenceAvg: readOptionalNumber(row.confidence_avg),
+      error: readOptionalRecord(row.error),
+      engine: row.engine,
+      modelVersion: row.model_version,
+      pageNumber: row.page_number,
+      providerName: row.provider_name,
+      reason: row.reason,
+      retryable: row.retryable,
+      status: row.status === "skipped" ? "skipped" : "succeeded",
+      warnings: readWarnings(row.warnings),
+    }));
+  }
+
+  async saveOcrPageWindow(input: SourceOcrPageProgressInput): Promise<void> {
     const pageNumbers = input.pages.map((page) => page.pageNumber);
 
     if (pageNumbers.length > 0) {
@@ -743,6 +898,17 @@ export class PostgresSourceOcrRepository implements SourceOcrRepository {
         return { written: pages.length };
       },
     });
+  }
+
+  async saveOcrResult(input: SourceOcrSaveResultInput): Promise<void> {
+    await this.saveOcrPageWindow({
+      artifacts: input.artifacts,
+      completedAt: input.completedAt,
+      documentId: input.documentId,
+      jobId: input.jobId,
+      pages: input.pages,
+      parsedContentId: input.parsedContentId,
+    });
 
     await sql`
       update parsed_contents
@@ -770,7 +936,7 @@ export class PostgresSourceOcrRepository implements SourceOcrRepository {
   }
 
   private async upsertOcrArtifact(
-    input: SourceOcrSaveResultInput,
+    input: SourceOcrPageProgressInput,
     artifact: SourceOcrArtifactWrite,
   ): Promise<void> {
     await sql`
@@ -810,7 +976,7 @@ export class PostgresSourceOcrRepository implements SourceOcrRepository {
   }
 
   private async upsertOcrPage(
-    input: SourceOcrSaveResultInput,
+    input: SourceOcrPageProgressInput,
     page: SourceOcrPageWrite,
   ): Promise<void> {
     const pageStatusId = createOcrPageStatusId(input.documentId, page.pageNumber);
@@ -1057,6 +1223,94 @@ function averageConfidence(blocks: readonly PdfOcrBlock[]) {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
+function chunkArray<T>(items: readonly T[], size: number): T[][] {
+  const safeSize = Math.max(1, Math.floor(size));
+  const chunks: T[][] = [];
+
+  for (let index = 0; index < items.length; index += safeSize) {
+    chunks.push(items.slice(index, index + safeSize));
+  }
+
+  return chunks;
+}
+
+function toPersistedPdfOcrBlock(row: OcrBlockRow): PdfOcrBlock {
+  const bbox = readOptionalBoundingBox(row.bbox);
+  const confidence = readOptionalNumber(row.confidence);
+
+  return {
+    pageNumber: row.page_number,
+    blockIndex: row.block_index,
+    text: row.text,
+    ...(confidence === null ? {} : { confidence }),
+    ...(bbox === undefined ? {} : { bbox }),
+    ...(row.language === null ? {} : { language: row.language }),
+    provider: row.provider_name,
+    engine: row.engine,
+    ...(row.model_version === null ? {} : { modelVersion: row.model_version }),
+  };
+}
+
+function readOcrSourceArtifactId(
+  metadata: unknown,
+  blockRows: readonly OcrBlockRow[],
+  pageNumber: number,
+): string | null {
+  const metadataRecord = readOptionalRecord(metadata);
+  const metadataArtifactId =
+    typeof metadataRecord?.source_artifact_id === "string"
+      ? metadataRecord.source_artifact_id
+      : null;
+
+  if (metadataArtifactId !== null) {
+    return metadataArtifactId;
+  }
+
+  return blockRows.find((row) => row.page_number === pageNumber)?.source_artifact_id ?? null;
+}
+
+function readOptionalBoundingBox(value: unknown): OcrBoundingBox | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  return value as OcrBoundingBox;
+}
+
+function readOptionalNumber(value: unknown): number | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  const numberValue = Number(value);
+
+  return Number.isFinite(numberValue) ? numberValue : null;
+}
+
+function readOptionalRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+
+  return value as Record<string, unknown>;
+}
+
+function readWarnings(value: unknown): ParserWarning[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.filter((item): item is ParserWarning => {
+    if (typeof item !== "object" || item === null) {
+      return false;
+    }
+
+    const warning = item as Partial<ParserWarning>;
+
+    return typeof warning.kind === "string" && typeof warning.message === "string";
+  });
+}
+
 function normalizeOcrError(error: unknown): Record<string, unknown> {
   if (error instanceof Error) {
     return {
@@ -1175,4 +1429,32 @@ function createObjectReadLimitExceededResult(
       limit_bytes: limitBytes,
     },
   };
+}
+
+interface OcrPageStatusRow {
+  page_number: number;
+  status: string;
+  reason: string | null;
+  provider_name: string | null;
+  engine: string | null;
+  model_version: string | null;
+  confidence_avg: string | number | null;
+  attempt_count: number;
+  retryable: boolean;
+  error: unknown;
+  warnings: unknown;
+  metadata: unknown;
+}
+
+interface OcrBlockRow {
+  page_number: number;
+  block_index: number;
+  text: string;
+  confidence: string | number | null;
+  bbox: unknown;
+  language: string | null;
+  provider_name: string;
+  engine: string;
+  model_version: string | null;
+  source_artifact_id: string | null;
 }

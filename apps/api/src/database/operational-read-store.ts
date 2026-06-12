@@ -26,6 +26,7 @@ import type {
 } from "../deletion-cleanup/deletion-cleanup.types.js";
 import type {
   ScheduledImportJobRecord,
+  SourceWatchDiscoveredSource,
   SourceWatchLatestScanResponse,
   SourceWatchRuleRecord,
   SourceWatchRuleSchedule,
@@ -36,6 +37,7 @@ import type {
   SourceWatchSchedulerStatus,
   SourceWatchSourceKind,
 } from "../source-watch/source-watch.types.js";
+import { compareDiscoveredSources } from "../source-watch/source-watch-discovery-compare.js";
 import type {
   WebhookDeliveryRecord,
   WebhookDeliveryStatus,
@@ -86,6 +88,25 @@ export interface SourceDocumentReadInput extends PaginatedReadInput {
 export interface SourceWatchDocumentReadInput {
   knowledgeBaseId: string;
   sourceWatchRuleId: string;
+}
+
+export interface SourceWatchDiscoveryComparisonReadInput {
+  comparisonWindowSize?: number;
+  rule: SourceWatchRuleRecord;
+  scannedSources: readonly SourceWatchDiscoveredSource[];
+}
+
+export interface SourceWatchDiscoveryComparisonReadResult {
+  changedSources: SourceWatchDiscoveredSource[];
+  deleteCandidates: SourceWatchScanResultResponse["delete_candidates"];
+  newSources: SourceWatchDiscoveredSource[];
+}
+
+export interface SourceWatchFingerprintReadInput {
+  knowledgeBaseId: string;
+  sourcePath: string;
+  sourceWatchRuleId: string;
+  fingerprint: string;
 }
 
 export interface PaginatedSourceDocumentReadResult {
@@ -242,6 +263,12 @@ export interface OperationalReadStore {
   listSourceWatchDocuments(
     input: SourceWatchDocumentReadInput,
   ): Promise<SourceDocumentRecord[] | null>;
+  compareSourceWatchDiscoveredSources(
+    input: SourceWatchDiscoveryComparisonReadInput,
+  ): Promise<SourceWatchDiscoveryComparisonReadResult | null>;
+  hasMatchingSourceWatchFingerprint(
+    input: SourceWatchFingerprintReadInput,
+  ): Promise<boolean | null>;
   getSourceDocumentById(documentId: string): Promise<SourceDocumentRecord | null>;
   getVisibleSourceDocumentById(
     knowledgeBaseId: string,
@@ -356,6 +383,12 @@ export function createNoopOperationalReadStore(): OperationalReadStore {
       return null;
     },
     async listSourceWatchDocuments() {
+      return null;
+    },
+    async compareSourceWatchDiscoveredSources() {
+      return null;
+    },
+    async hasMatchingSourceWatchFingerprint() {
       return null;
     },
     async getSourceDocumentById() {
@@ -1145,6 +1178,169 @@ class PostgresOperationalReadStore implements OperationalReadStore {
         and metadata->>'source_watch_rule_id' = ${input.sourceWatchRuleId}
       order by lower(metadata->>'source_path') asc, updated_at desc, id desc
     `.execute(this.db);
+
+    return result.rows.map(toSourceDocumentRecord);
+  }
+
+  async compareSourceWatchDiscoveredSources(
+    input: SourceWatchDiscoveryComparisonReadInput,
+  ): Promise<SourceWatchDiscoveryComparisonReadResult> {
+    const comparisonWindowSize = Math.max(1, Math.floor(input.comparisonWindowSize ?? 100));
+    const sourcePaths = input.scannedSources
+      .map((source) => source.source_path ?? source.name)
+      .filter((sourcePath, index, values) => values.indexOf(sourcePath) === index);
+    const existingForScanned: SourceDocumentRecord[] = [];
+
+    for (const sourcePathWindow of chunkArray(sourcePaths, comparisonWindowSize)) {
+      if (sourcePathWindow.length === 0) {
+        continue;
+      }
+
+      const result = await sql<SourceDocumentRow>`
+              select
+                id,
+                knowledge_base_id,
+                source_type,
+                name,
+                status,
+                content_hash,
+                object_key,
+                mime_type,
+                size_bytes::bigint as size_bytes,
+                metadata,
+                ocr_status,
+                ocr_summary,
+                visibility_origin,
+                owner_knowledge_base_id,
+                upstream_resource_id,
+                fork_tombstoned_at,
+                created_at,
+                updated_at
+              from source_documents
+              where knowledge_base_id = ${input.rule.knowledgeBaseId}
+                and owner_knowledge_base_id is null
+                and fork_tombstoned_at is null
+                and deleted_at is null
+                and status <> 'deleted'
+                and metadata->>'source_path' in (${sql.join(sourcePathWindow)})
+                and metadata->>'source_watch_rule_id' = ${input.rule.id}
+              order by lower(metadata->>'source_path') asc, updated_at desc, id desc
+            `.execute(this.db);
+
+      existingForScanned.push(...result.rows.map(toSourceDocumentRecord));
+    }
+
+    const comparison = compareDiscoveredSources(
+      input.rule,
+      existingForScanned,
+      input.scannedSources,
+    );
+    const deleteRows =
+      sourcePaths.length === 0
+        ? await this.listLatestSourceWatchDocumentsMissingFromPaths(input.rule, [])
+        : await this.listLatestSourceWatchDocumentsMissingFromPaths(input.rule, sourcePaths);
+
+    return {
+      ...comparison,
+      deleteCandidates: deleteRows.map((document) => ({
+        document_id: document.id,
+        source_path: document.sourcePath ?? document.name,
+        reason: "missing_from_source",
+        metadata: {
+          source_watch_rule_id: input.rule.id,
+          source_watch_source_kind: input.rule.sourceKind,
+        },
+      })),
+    };
+  }
+
+  async hasMatchingSourceWatchFingerprint(
+    input: SourceWatchFingerprintReadInput,
+  ): Promise<boolean> {
+    const result = await sql<{ matched: number }>`
+      select 1 as matched
+      from source_documents
+      where knowledge_base_id = ${input.knowledgeBaseId}
+        and owner_knowledge_base_id is null
+        and fork_tombstoned_at is null
+        and deleted_at is null
+        and status <> 'deleted'
+        and metadata->>'source_path' = ${input.sourcePath}
+        and metadata->>'source_watch_rule_id' = ${input.sourceWatchRuleId}
+        and metadata->>'source_watch_fingerprint' = ${input.fingerprint}
+      limit 1
+    `.execute(this.db);
+
+    return result.rows.length > 0;
+  }
+
+  private async listLatestSourceWatchDocumentsMissingFromPaths(
+    rule: SourceWatchRuleRecord,
+    scannedSourcePaths: readonly string[],
+  ): Promise<SourceDocumentRecord[]> {
+    const result =
+      scannedSourcePaths.length === 0
+        ? await sql<SourceDocumentRow>`
+            select distinct on (metadata->>'source_path')
+              id,
+              knowledge_base_id,
+              source_type,
+              name,
+              status,
+              content_hash,
+              object_key,
+              mime_type,
+              size_bytes::bigint as size_bytes,
+              metadata,
+              ocr_status,
+              ocr_summary,
+              visibility_origin,
+              owner_knowledge_base_id,
+              upstream_resource_id,
+              fork_tombstoned_at,
+              created_at,
+              updated_at
+            from source_documents
+            where knowledge_base_id = ${rule.knowledgeBaseId}
+              and owner_knowledge_base_id is null
+              and fork_tombstoned_at is null
+              and deleted_at is null
+              and status <> 'deleted'
+              and metadata->>'source_path' is not null
+              and metadata->>'source_watch_rule_id' = ${rule.id}
+            order by metadata->>'source_path', updated_at desc, id desc
+          `.execute(this.db)
+        : await sql<SourceDocumentRow>`
+            select distinct on (metadata->>'source_path')
+              id,
+              knowledge_base_id,
+              source_type,
+              name,
+              status,
+              content_hash,
+              object_key,
+              mime_type,
+              size_bytes::bigint as size_bytes,
+              metadata,
+              ocr_status,
+              ocr_summary,
+              visibility_origin,
+              owner_knowledge_base_id,
+              upstream_resource_id,
+              fork_tombstoned_at,
+              created_at,
+              updated_at
+            from source_documents
+            where knowledge_base_id = ${rule.knowledgeBaseId}
+              and owner_knowledge_base_id is null
+              and fork_tombstoned_at is null
+              and deleted_at is null
+              and status <> 'deleted'
+              and metadata->>'source_path' is not null
+              and metadata->>'source_watch_rule_id' = ${rule.id}
+              and not (metadata->>'source_path' in (${sql.join(scannedSourcePaths)}))
+            order by metadata->>'source_path', updated_at desc, id desc
+          `.execute(this.db);
 
     return result.rows.map(toSourceDocumentRecord);
   }
@@ -3907,6 +4103,17 @@ function readJsonObjectArray(value: unknown): Record<string, unknown>[] {
     (item): item is Record<string, unknown> =>
       item !== null && typeof item === "object" && !Array.isArray(item),
   );
+}
+
+function chunkArray<T>(items: readonly T[], size: number): T[][] {
+  const safeSize = Math.max(1, Math.floor(size));
+  const chunks: T[][] = [];
+
+  for (let index = 0; index < items.length; index += safeSize) {
+    chunks.push(items.slice(index, index + safeSize));
+  }
+
+  return chunks;
 }
 
 function normalizeJsonObject(value: unknown): Record<string, unknown> {

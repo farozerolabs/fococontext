@@ -252,6 +252,10 @@ Rerank 使用全有或全无配置规则。所有 `RERANK_*` 都留空时禁用 
 | `BACKGROUND_OCR_*`                             | OCR 后台 worker 控制  | worker 批处理和 checkpoint；页级处理使用 `OCR_PAGE_CONCURRENCY`             |
 | `BACKGROUND_MEDIA_CAPTION_*`                   | 媒体 caption 后台控制 | worker 批处理和 checkpoint；图片调用使用 `VISION_CAPTION_IMAGE_CONCURRENCY` |
 | `BACKGROUND_CLEANUP_*`                         | 清理后台控制          | 批大小、游标窗口、checkpoint 间隔、重试延迟和并发                           |
+| `RESIDUAL_GRAPH_INSIGHTS_*`                    | 图谱洞察残余工作上限  | summary 窗口和 checkpoint 间隔；默认继承图谱洞察后台限制                    |
+| `RESIDUAL_SOURCE_WATCH_*`                      | Source Watch 对比上限 | 对比窗口、checkpoint 间隔和小 URL 列表上限                                  |
+| `RESIDUAL_OCR_*`                               | OCR 页级残余工作上限  | 页窗口和 checkpoint 间隔；默认继承 OCR 后台限制                             |
+| `RESIDUAL_MEDIA_CAPTION_*`                     | 媒体 caption 残余上限 | 资产窗口和 checkpoint 间隔；默认继承媒体 caption 后台限制                   |
 | `SOURCE_WATCH_SCHEDULER_ENABLED`               | 是否启用定时扫描      | 默认 `true`                                                                 |
 | `SOURCE_WATCH_SCAN_INTERVAL_SECONDS`           | 定时扫描间隔          | 默认 `3600`                                                                 |
 | `SOURCE_WATCH_SCAN_MAX_RETRIES`                | 扫描失败重试次数      | 默认 `2`                                                                    |

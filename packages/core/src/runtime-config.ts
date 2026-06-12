@@ -219,6 +219,7 @@ export interface RuntimeConfigLimits {
   webhookDelivery: WebhookDeliveryLimits;
   effectiveConcurrency: RuntimeConfigEffectiveConcurrency;
   backgroundJobs: RuntimeBackgroundJobLimits;
+  residualMemory: RuntimeResidualMemoryLimits;
   pressure: RuntimePressureLimits;
 }
 
@@ -306,6 +307,23 @@ export type RuntimeBackgroundJobLimits = Record<
   RuntimeBackgroundJobWorkload,
   RuntimeBackgroundJobWorkloadLimits
 >;
+
+export interface RuntimeResidualMemoryWorkloadLimits {
+  checkpointInterval: number;
+  checkpointIntervalSource: string;
+  windowSize: number;
+  windowSizeSource: string;
+}
+
+export interface RuntimeResidualMemoryLimits {
+  graphInsights: RuntimeResidualMemoryWorkloadLimits;
+  mediaCaption: RuntimeResidualMemoryWorkloadLimits;
+  ocr: RuntimeResidualMemoryWorkloadLimits;
+  sourceWatch: RuntimeResidualMemoryWorkloadLimits & {
+    smallUrlListLimit: number;
+    smallUrlListLimitSource: string;
+  };
+}
 
 export type DeletionCleanupRetryBackoff = "fixed" | "exponential";
 export type WebhookDeliveryRetryBackoff = "fixed" | "exponential";
@@ -762,6 +780,41 @@ function resolveBackgroundJobWorkloadLimits(input: {
   };
 }
 
+function resolveResidualMemoryWorkloadLimits(input: {
+  checkpointDefault: RuntimeBackgroundJobWorkloadLimits;
+  checkpointKey: string;
+  env: RuntimeEnv;
+  invalid: string[];
+  windowDefault: RuntimeBackgroundJobWorkloadLimits;
+  windowKey: string;
+}): RuntimeResidualMemoryWorkloadLimits {
+  const windowSize = parseOptionalPositiveIntegerInRangeWithSource(
+    input.env,
+    input.windowKey,
+    input.windowDefault.cursorWindowSize,
+    1,
+    backgroundJobMaxCursorWindowSize,
+    input.invalid,
+    input.windowDefault.source.cursorWindowSize,
+  );
+  const checkpointInterval = parseOptionalPositiveIntegerInRangeWithSource(
+    input.env,
+    input.checkpointKey,
+    input.checkpointDefault.checkpointInterval,
+    1,
+    backgroundJobMaxCheckpointInterval,
+    input.invalid,
+    input.checkpointDefault.source.checkpointInterval,
+  );
+
+  return {
+    checkpointInterval: checkpointInterval.value,
+    checkpointIntervalSource: checkpointInterval.source,
+    windowSize: windowSize.value,
+    windowSizeSource: windowSize.source,
+  };
+}
+
 function parseBoolean(env: RuntimeEnv, key: string, invalid: string[]): boolean {
   const value = readOptional(env, key);
 
@@ -1017,6 +1070,100 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
       }
     });
   }
+
+  const backgroundJobs: RuntimeBackgroundJobLimits = {
+    reindex: resolveBackgroundJobWorkloadLimits({
+      env,
+      invalid,
+      prefix: "BACKGROUND_REINDEX",
+      fallbackConcurrency: queueConcurrency,
+    }),
+    graphInsights: resolveBackgroundJobWorkloadLimits({
+      env,
+      invalid,
+      prefix: "BACKGROUND_GRAPH_INSIGHTS",
+      fallbackConcurrency: wikiMergeConcurrency,
+    }),
+    knowledgeCheck: resolveBackgroundJobWorkloadLimits({
+      env,
+      invalid,
+      prefix: "BACKGROUND_KNOWLEDGE_CHECK",
+      fallbackConcurrency: queueConcurrency,
+    }),
+    sourceWatch: resolveBackgroundJobWorkloadLimits({
+      env,
+      invalid,
+      prefix: "BACKGROUND_SOURCE_WATCH",
+      fallbackConcurrency: sourceWatchConcurrency,
+    }),
+    ocr: resolveBackgroundJobWorkloadLimits({
+      env,
+      invalid,
+      prefix: "BACKGROUND_OCR",
+      fallbackConcurrency: ocrConcurrency,
+    }),
+    mediaCaption: resolveBackgroundJobWorkloadLimits({
+      env,
+      invalid,
+      prefix: "BACKGROUND_MEDIA_CAPTION",
+      fallbackConcurrency: visionCaptionConcurrency,
+    }),
+    cleanup: resolveBackgroundJobWorkloadLimits({
+      env,
+      invalid,
+      prefix: "BACKGROUND_CLEANUP",
+      fallbackConcurrency: deletionCleanupConcurrency,
+    }),
+  };
+  const residualSourceWatchSmallUrlList = parseOptionalPositiveIntegerInRangeWithSource(
+    env,
+    "RESIDUAL_SOURCE_WATCH_SMALL_URL_LIST_LIMIT",
+    parseOptionalPositiveInteger(env, "SOURCE_WATCH_URL_LIST_MAX_URLS", 100, invalid),
+    1,
+    backgroundJobMaxCursorWindowSize,
+    invalid,
+    readOptional(env, "SOURCE_WATCH_URL_LIST_MAX_URLS") === undefined
+      ? "default"
+      : "SOURCE_WATCH_URL_LIST_MAX_URLS",
+  );
+  const residualMemory: RuntimeResidualMemoryLimits = {
+    graphInsights: resolveResidualMemoryWorkloadLimits({
+      checkpointDefault: backgroundJobs.graphInsights,
+      checkpointKey: "RESIDUAL_GRAPH_INSIGHTS_CHECKPOINT_INTERVAL",
+      env,
+      invalid,
+      windowDefault: backgroundJobs.graphInsights,
+      windowKey: "RESIDUAL_GRAPH_INSIGHTS_SUMMARY_WINDOW_SIZE",
+    }),
+    mediaCaption: resolveResidualMemoryWorkloadLimits({
+      checkpointDefault: backgroundJobs.mediaCaption,
+      checkpointKey: "RESIDUAL_MEDIA_CAPTION_CHECKPOINT_INTERVAL",
+      env,
+      invalid,
+      windowDefault: backgroundJobs.mediaCaption,
+      windowKey: "RESIDUAL_MEDIA_CAPTION_ASSET_WINDOW_SIZE",
+    }),
+    ocr: resolveResidualMemoryWorkloadLimits({
+      checkpointDefault: backgroundJobs.ocr,
+      checkpointKey: "RESIDUAL_OCR_CHECKPOINT_INTERVAL",
+      env,
+      invalid,
+      windowDefault: backgroundJobs.ocr,
+      windowKey: "RESIDUAL_OCR_PAGE_WINDOW_SIZE",
+    }),
+    sourceWatch: {
+      ...resolveResidualMemoryWorkloadLimits({
+        checkpointDefault: backgroundJobs.sourceWatch,
+        checkpointKey: "RESIDUAL_SOURCE_WATCH_CHECKPOINT_INTERVAL",
+        env,
+        invalid,
+        windowDefault: backgroundJobs.sourceWatch,
+        windowKey: "RESIDUAL_SOURCE_WATCH_COMPARISON_WINDOW_SIZE",
+      }),
+      smallUrlListLimit: residualSourceWatchSmallUrlList.value,
+      smallUrlListLimitSource: residualSourceWatchSmallUrlList.source,
+    },
+  };
 
   const config: RuntimeConfig = {
     api: {
@@ -1409,50 +1556,8 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
           visionCaptionImageConcurrency,
         },
       },
-      backgroundJobs: {
-        reindex: resolveBackgroundJobWorkloadLimits({
-          env,
-          invalid,
-          prefix: "BACKGROUND_REINDEX",
-          fallbackConcurrency: queueConcurrency,
-        }),
-        graphInsights: resolveBackgroundJobWorkloadLimits({
-          env,
-          invalid,
-          prefix: "BACKGROUND_GRAPH_INSIGHTS",
-          fallbackConcurrency: wikiMergeConcurrency,
-        }),
-        knowledgeCheck: resolveBackgroundJobWorkloadLimits({
-          env,
-          invalid,
-          prefix: "BACKGROUND_KNOWLEDGE_CHECK",
-          fallbackConcurrency: queueConcurrency,
-        }),
-        sourceWatch: resolveBackgroundJobWorkloadLimits({
-          env,
-          invalid,
-          prefix: "BACKGROUND_SOURCE_WATCH",
-          fallbackConcurrency: sourceWatchConcurrency,
-        }),
-        ocr: resolveBackgroundJobWorkloadLimits({
-          env,
-          invalid,
-          prefix: "BACKGROUND_OCR",
-          fallbackConcurrency: ocrConcurrency,
-        }),
-        mediaCaption: resolveBackgroundJobWorkloadLimits({
-          env,
-          invalid,
-          prefix: "BACKGROUND_MEDIA_CAPTION",
-          fallbackConcurrency: visionCaptionConcurrency,
-        }),
-        cleanup: resolveBackgroundJobWorkloadLimits({
-          env,
-          invalid,
-          prefix: "BACKGROUND_CLEANUP",
-          fallbackConcurrency: deletionCleanupConcurrency,
-        }),
-      },
+      backgroundJobs,
+      residualMemory,
       pressure: {
         uploadDegradedThreshold: uploadLimits.pressureDegradedThreshold,
         queueDepthDegradedThreshold: parseOptionalPositiveInteger(

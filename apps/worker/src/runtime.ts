@@ -164,6 +164,7 @@ async function main(): Promise<void> {
           new MediaCaptionProcessor({
             compileQueue: wikiAnalyzeQueue,
             config: {
+              checkpointInterval: config.limits.residualMemory.mediaCaption.checkpointInterval,
               concurrency: config.limits.visionCaption.imageConcurrency,
               contextChars: config.limits.visionCaption.contextChars,
               maxImageBytes: config.limits.parser.maxImageBytes,
@@ -176,6 +177,7 @@ async function main(): Promise<void> {
               requestMaxRetries: modelProfiles.visionCaption.requestMaxRetries,
               retryBaseDelayMs: config.limits.visionCaption.retryBaseDelayMs,
               timeoutSeconds: config.limits.visionCaption.timeoutSeconds,
+              windowSize: config.limits.residualMemory.mediaCaption.windowSize,
             },
             jobGuard: jobProgress,
             jobProgress,
@@ -211,6 +213,7 @@ async function main(): Promise<void> {
             compileQueue: wikiAnalyzeQueue,
             config: {
               concurrency: config.limits.ocr.pageConcurrency,
+              checkpointInterval: config.limits.residualMemory.ocr.checkpointInterval,
               confidenceThreshold: config.limits.ocr.confidenceThreshold,
               languages: config.ocr.languages,
               maxObjectBytes: config.limits.parser.maxFileSizeMb * 1024 * 1024,
@@ -221,6 +224,7 @@ async function main(): Promise<void> {
               retryBaseDelayMs: config.limits.ocr.retryBaseDelayMs,
               storePageImages: config.limits.ocr.storePageImages,
               timeoutSeconds: config.limits.ocr.timeoutSeconds,
+              windowSize: config.limits.residualMemory.ocr.windowSize,
             },
             jobGuard: jobProgress,
             jobProgress,

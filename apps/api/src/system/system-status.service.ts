@@ -267,6 +267,7 @@ export class SystemStatusService {
       apiFanOut: this.config.limits.apiFanOut,
       effectiveConcurrency: this.config.limits.effectiveConcurrency,
       backgroundJobs: this.config.limits.backgroundJobs,
+      residualMemory: this.config.limits.residualMemory,
       compile: this.config.limits.compile,
       retrieve: this.config.limits.retrieve,
       sourceEvidence: this.config.limits.sourceEvidence,

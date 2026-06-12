@@ -13,12 +13,6 @@ import {
   type ObjectStorageOperationRecorder,
 } from "@fococontext/storage";
 
-import type { SourceDocumentRecord } from "../documents/document.types.js";
-import {
-  compareDiscoveredSources,
-  groupDocumentsBySourcePath,
-  hasMatchingS3Fingerprint,
-} from "./source-watch-discovery-compare.js";
 import type {
   SourceWatchDiscoveredSource,
   SourceWatchRuleRecord,
@@ -78,12 +72,23 @@ export interface SourceWatchS3ClientFactoryInput {
 }
 
 export interface SourceWatchExistingDocumentProvider {
-  listExistingDocuments(
+  compareDiscoveredSources(
     rule: SourceWatchRuleRecord,
-  ): Promise<readonly SourceDocumentRecord[] | null>;
+    scannedSources: readonly SourceWatchDiscoveredSource[],
+  ): Promise<{
+    changedSources: SourceWatchDiscoveredSource[];
+    deleteCandidates: SourceWatchScanDiscovery["deleteCandidates"];
+    newSources: SourceWatchDiscoveredSource[];
+  } | null>;
+  hasMatchingFingerprint(
+    rule: SourceWatchRuleRecord,
+    sourcePath: string,
+    fingerprint: string,
+  ): Promise<boolean | null>;
 }
 
 export interface SourceWatchScannerOptions {
+  comparisonWindowSize?: number;
   existingDocumentProvider?: SourceWatchExistingDocumentProvider;
   operationRecorder?: ObjectStorageOperationRecorder;
   s3ClientFactory?: (input: SourceWatchS3ClientFactoryInput) => SourceWatchS3Client;
@@ -93,6 +98,12 @@ export function createDefaultSourceWatchScanner(
   config: RuntimeConfig,
   options: SourceWatchScannerOptions = {},
 ): SourceWatchScanner {
+  const scannerOptions = {
+    ...options,
+    comparisonWindowSize:
+      options.comparisonWindowSize ?? config.limits.residualMemory.sourceWatch.windowSize,
+  };
+
   return {
     async scan(rule, runtimeOptions) {
       if (rule.status === "disabled") {
@@ -100,16 +111,16 @@ export function createDefaultSourceWatchScanner(
       }
 
       if (rule.sourceKind === "mounted_directory") {
-        return scanMountedDirectory(rule, options, runtimeOptions);
+        return scanMountedDirectory(rule, scannerOptions, runtimeOptions);
       }
       if (rule.sourceKind === "url_list") {
-        return scanUrlList(rule, config, options, runtimeOptions);
+        return scanUrlList(rule, config, scannerOptions, runtimeOptions);
       }
       if (rule.sourceKind === "s3_prefix") {
-        return scanS3Prefix(rule, config, options, runtimeOptions);
+        return scanS3Prefix(rule, config, scannerOptions, runtimeOptions);
       }
       if (rule.sourceKind === "git_repo") {
-        return scanGitRepository(rule, config, options, runtimeOptions);
+        return scanGitRepository(rule, config, scannerOptions, runtimeOptions);
       }
 
       return createDisabledDiscovery("source_watch_adapter_disabled");
@@ -162,16 +173,24 @@ async function scanMountedDirectory(
     stage: "adapter_page",
     totalCount: scannedSources.length,
   });
-  const existingSources = await listExistingSourceWatchDocuments(
+  const comparison = await compareSourceWatchDiscovery(
     rule,
     options.existingDocumentProvider,
+    scannedSources,
   );
-  const comparison = compareDiscoveredSources(rule, existingSources, scannedSources);
   await runtimeOptions?.onProgress?.({
+    cursor: {
+      comparison_source_offset: scannedSources.length,
+      source_watch_rule_id: rule.id,
+    },
     metadata: {
       changed_count: comparison.changedSources.length,
+      comparison_window_size: options.comparisonWindowSize ?? scannedSources.length,
       delete_candidate_count: comparison.deleteCandidates.length,
+      failed_count: 0,
       new_count: comparison.newSources.length,
+      processed_source_count: scannedSources.length,
+      skipped_count: skipped.length,
     },
     processedCount: scannedSources.length,
     stage: "compare",
@@ -207,22 +226,33 @@ async function scanUrlList(
   await runtimeOptions?.onProgress?.({
     metadata: {
       adapter: "url_list",
+      request_local_input: true,
+      small_url_list_limit: config.limits.residualMemory.sourceWatch.smallUrlListLimit,
       skipped_count: skipped.length,
     },
     processedCount: sources.length,
     stage: "adapter_page",
     totalCount: sources.length,
   });
-  const existingSources = await listExistingSourceWatchDocuments(
+  const comparison = await compareSourceWatchDiscovery(
     rule,
     options.existingDocumentProvider,
+    sources,
   );
-  const comparison = compareDiscoveredSources(rule, existingSources, sources);
   await runtimeOptions?.onProgress?.({
+    cursor: {
+      comparison_source_offset: sources.length,
+      source_watch_rule_id: rule.id,
+    },
     metadata: {
       changed_count: comparison.changedSources.length,
+      comparison_window_size: options.comparisonWindowSize ?? sources.length,
       delete_candidate_count: comparison.deleteCandidates.length,
+      failed_count: 0,
       new_count: comparison.newSources.length,
+      processed_source_count: sources.length,
+      request_local_input: true,
+      skipped_count: skipped.length,
     },
     processedCount: sources.length,
     stage: "compare",
@@ -371,11 +401,6 @@ async function scanS3Prefix(
   }
 
   const discovered: SourceWatchDiscoveredSource[] = [];
-  const existingSources = await listExistingSourceWatchDocuments(
-    rule,
-    options.existingDocumentProvider,
-  );
-  const existingByPath = groupDocumentsBySourcePath(existingSources);
   let continuationToken: string | undefined;
 
   do {
@@ -456,7 +481,12 @@ async function scanS3Prefix(
       });
       const isUnchangedFingerprint =
         adapter.incrementalScanEnabled &&
-        hasMatchingS3Fingerprint(existingByPath.get(sourcePath) ?? [], fingerprint);
+        (await hasMatchingSourceWatchFingerprint(
+          rule,
+          options.existingDocumentProvider,
+          sourcePath,
+          fingerprint,
+        ));
       const shouldReadContent = rule.autoIngest && !isUnchangedFingerprint;
       const content = shouldReadContent
         ? await readS3Object(
@@ -523,12 +553,24 @@ async function scanS3Prefix(
     });
   } while (continuationToken !== undefined && discovered.length < adapter.maxItems);
 
-  const comparison = compareDiscoveredSources(rule, existingSources, discovered);
+  const comparison = await compareSourceWatchDiscovery(
+    rule,
+    options.existingDocumentProvider,
+    discovered,
+  );
   await runtimeOptions?.onProgress?.({
+    cursor: {
+      comparison_source_offset: discovered.length,
+      source_watch_rule_id: rule.id,
+    },
     metadata: {
       changed_count: comparison.changedSources.length,
+      comparison_window_size: options.comparisonWindowSize ?? discovered.length,
       delete_candidate_count: comparison.deleteCandidates.length,
+      failed_count: 0,
       new_count: comparison.newSources.length,
+      processed_source_count: discovered.length,
+      skipped_count: skipped.length,
     },
     processedCount: discovered.length,
     stage: "compare",
@@ -599,16 +641,24 @@ async function scanGitRepository(
       stage: "adapter_page",
       totalCount: sources.length,
     });
-    const existingSources = await listExistingSourceWatchDocuments(
+    const comparison = await compareSourceWatchDiscovery(
       rule,
       options.existingDocumentProvider,
+      sources,
     );
-    const comparison = compareDiscoveredSources(rule, existingSources, sources);
     await runtimeOptions?.onProgress?.({
+      cursor: {
+        comparison_source_offset: sources.length,
+        source_watch_rule_id: rule.id,
+      },
       metadata: {
         changed_count: comparison.changedSources.length,
+        comparison_window_size: options.comparisonWindowSize ?? sources.length,
         delete_candidate_count: comparison.deleteCandidates.length,
+        failed_count: 0,
         new_count: comparison.newSources.length,
+        processed_source_count: sources.length,
+        skipped_count: skipped.length,
       },
       processedCount: sources.length,
       stage: "compare",
@@ -872,17 +922,41 @@ async function walkMountedDirectory(
   }
 }
 
-async function listExistingSourceWatchDocuments(
+async function compareSourceWatchDiscovery(
   rule: SourceWatchRuleRecord,
   existingDocumentProvider: SourceWatchExistingDocumentProvider | undefined,
-): Promise<readonly SourceDocumentRecord[]> {
-  const providedSources = await existingDocumentProvider?.listExistingDocuments(rule);
+  scannedSources: readonly SourceWatchDiscoveredSource[],
+): Promise<{
+  changedSources: SourceWatchDiscoveredSource[];
+  deleteCandidates: SourceWatchScanDiscovery["deleteCandidates"];
+  newSources: SourceWatchDiscoveredSource[];
+}> {
+  const comparison = await existingDocumentProvider?.compareDiscoveredSources(rule, scannedSources);
 
-  if (providedSources !== undefined && providedSources !== null) {
-    return providedSources;
+  if (comparison !== undefined && comparison !== null) {
+    return comparison;
   }
 
-  return [];
+  return {
+    changedSources: [],
+    deleteCandidates: [],
+    newSources: [...scannedSources],
+  };
+}
+
+async function hasMatchingSourceWatchFingerprint(
+  rule: SourceWatchRuleRecord,
+  existingDocumentProvider: SourceWatchExistingDocumentProvider | undefined,
+  sourcePath: string,
+  fingerprint: string,
+): Promise<boolean> {
+  const matched = await existingDocumentProvider?.hasMatchingFingerprint(
+    rule,
+    sourcePath,
+    fingerprint,
+  );
+
+  return matched === true;
 }
 
 function createS3ObjectFingerprint(input: {

@@ -8,6 +8,7 @@ import {
   type BackgroundOperationCheckpointRepository,
   type TenantProjectScope,
 } from "@fococontext/db";
+import type { GraphInsightsResponse } from "@fococontext/retrieval";
 
 import type { PostgresWikiMergeApplier } from "./wiki-compile.processors.js";
 
@@ -69,6 +70,10 @@ export class PostgresGraphInsightsRefreshProcessor implements GraphInsightsRefre
           stage: "refreshing",
         });
       }
+      const precomputedGraphInsights = readCheckpointGraphInsightsSnapshot(
+        checkpoint?.metadata,
+        payload.knowledge_base_id,
+      );
       const result = await this.mergeApplier.refreshGraphInsightsForJob({
         jobId: payload.job_id,
         knowledgeBaseId: payload.knowledge_base_id,
@@ -84,6 +89,7 @@ export class PostgresGraphInsightsRefreshProcessor implements GraphInsightsRefre
             });
           }
         },
+        ...(precomputedGraphInsights === undefined ? {} : { precomputedGraphInsights }),
         requestedKnowledgeVersionId: payload.requested_knowledge_version_id,
         skipDerivedGraphSignals: checkpoint?.metadata.derived_graph_signals_completed === true,
       });
@@ -195,4 +201,21 @@ function createStableGraphInsightsOperationId(payload: GraphInsightsRefreshPaylo
     .slice(0, 32);
 
   return `${backgroundOperationIdPrefix}graph_insights_${digest}`;
+}
+
+function readCheckpointGraphInsightsSnapshot(
+  metadata: Record<string, unknown> | undefined,
+  knowledgeBaseId: string,
+): GraphInsightsResponse | undefined {
+  const snapshot = metadata?.graph_insights_snapshot;
+
+  if (typeof snapshot !== "object" || snapshot === null || Array.isArray(snapshot)) {
+    return undefined;
+  }
+
+  const graphInsights = snapshot as Partial<GraphInsightsResponse>;
+
+  return graphInsights.knowledge_base_id === knowledgeBaseId
+    ? (graphInsights as GraphInsightsResponse)
+    : undefined;
 }

@@ -75,7 +75,15 @@ const systemPageLogMaxEntries = 200;
 interface GraphInsightsRefreshProgress {
   metadata: Record<string, unknown>;
   processedCount: number;
-  stage: "graph_signals" | "snapshot";
+  stage:
+    | "graph_signals"
+    | "page"
+    | "edge"
+    | "source_overlap"
+    | "degree"
+    | "community"
+    | "final_summary"
+    | "snapshot";
   totalCount: number;
 }
 
@@ -2779,6 +2787,7 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     jobId: string;
     knowledgeBaseId: string;
     onProgress?: (progress: GraphInsightsRefreshProgress) => Promise<void>;
+    precomputedGraphInsights?: GraphInsightsResponse;
     requestedKnowledgeVersionId: string | null;
     skipDerivedGraphSignals?: boolean;
   }): Promise<{ status: "completed" | "failed"; knowledge_base_id: string; job_id: string }> {
@@ -2803,6 +2812,10 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
       let graphInsights: GraphInsightsResponse | null = null;
       const refreshContext = context;
 
+      if (input.precomputedGraphInsights !== undefined) {
+        graphInsights = input.precomputedGraphInsights;
+      }
+
       if (input.skipDerivedGraphSignals !== true) {
         await this.db.transaction().execute(async (trx) => {
           await this.insertDerivedGraphSignalEdges(
@@ -2823,14 +2836,19 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
         });
       }
 
-      graphInsights = await this.createGraphInsightsSnapshot(input.knowledgeBaseId, this.db);
+      if (graphInsights === null) {
+        graphInsights = await this.createGraphInsightsSnapshot(input.knowledgeBaseId, this.db, {
+          ...(input.onProgress === undefined ? {} : { onProgress: input.onProgress }),
+        });
+      }
       await input.onProgress?.({
         metadata: {
+          graph_insights_snapshot: graphInsights,
           graph_insights_summary: createGraphInsightsCompactSummary(graphInsights),
         },
-        processedCount: 2,
+        processedCount: 7,
         stage: "snapshot",
-        totalCount: 2,
+        totalCount: 7,
       });
 
       if (graphInsights === null) {
@@ -2950,37 +2968,94 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
   private async createGraphInsightsSnapshot(
     knowledgeBaseId: string,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+    options: {
+      onProgress?: (progress: GraphInsightsRefreshProgress) => Promise<void>;
+    } = {},
   ): Promise<GraphInsightsResponse> {
     const limit = Math.max(1, this.options.graphInsightBatchSize ?? 100);
-    const [counts, isolatedPages, sparsePages, bridgePages, communities, surprisingConnections] =
-      await Promise.all([
-        this.countGraphInsightInputs(knowledgeBaseId, db),
-        this.listBoundedDegreeGraphInsights({
-          knowledgeBaseId,
-          db,
-          insightType: "isolated_page",
-          maxDegree: 0,
-          limit,
-        }),
-        this.listBoundedDegreeGraphInsights({
-          knowledgeBaseId,
-          db,
-          insightType: "sparse_page",
-          minDegree: 1,
-          maxDegree: 1,
-          limit,
-        }),
-        this.listBoundedDegreeGraphInsights({
-          knowledgeBaseId,
-          db,
-          insightType: "bridge_page",
-          minDegree: 2,
-          limit,
-          orderByDegreeDesc: true,
-        }),
-        this.listBoundedCommunityGraphInsights(knowledgeBaseId, limit, db),
-        this.listBoundedSurprisingConnections(knowledgeBaseId, limit, db),
-      ]);
+    const counts = await this.countGraphInsightInputs(knowledgeBaseId, db);
+    await options.onProgress?.({
+      metadata: {
+        graph_insights_stage_completed: "page",
+        node_count: counts.nodeCount,
+      },
+      processedCount: 2,
+      stage: "page",
+      totalCount: 7,
+    });
+
+    const isolatedPages = await this.listBoundedDegreeGraphInsights({
+      knowledgeBaseId,
+      db,
+      insightType: "isolated_page",
+      maxDegree: 0,
+      limit,
+    });
+    const sparsePages = await this.listBoundedDegreeGraphInsights({
+      knowledgeBaseId,
+      db,
+      insightType: "sparse_page",
+      minDegree: 1,
+      maxDegree: 1,
+      limit,
+    });
+    const bridgePages = await this.listBoundedDegreeGraphInsights({
+      knowledgeBaseId,
+      db,
+      insightType: "bridge_page",
+      minDegree: 2,
+      limit,
+      orderByDegreeDesc: true,
+    });
+    await options.onProgress?.({
+      metadata: {
+        graph_insights_stage_completed: "degree",
+        limit,
+        selected_degree_insights: isolatedPages.length + sparsePages.length + bridgePages.length,
+      },
+      processedCount: 3,
+      stage: "degree",
+      totalCount: 7,
+    });
+
+    const communities = await this.listBoundedCommunityGraphInsights(knowledgeBaseId, limit, db);
+    await options.onProgress?.({
+      metadata: {
+        graph_insights_stage_completed: "community",
+        limit,
+        selected_communities: communities.length,
+      },
+      processedCount: 4,
+      stage: "community",
+      totalCount: 7,
+    });
+
+    const surprisingConnections = await this.listBoundedSurprisingConnections(
+      knowledgeBaseId,
+      limit,
+      db,
+    );
+    await options.onProgress?.({
+      metadata: {
+        edge_count: counts.edgeCount,
+        graph_insights_stage_completed: "edge",
+        limit,
+        selected_edges: surprisingConnections.length,
+      },
+      processedCount: 5,
+      stage: "edge",
+      totalCount: 7,
+    });
+    await options.onProgress?.({
+      metadata: {
+        graph_insights_stage_completed: "source_overlap",
+        skipped: true,
+        reason: "source-overlap insight materialization is not enabled in this bounded worker.",
+      },
+      processedCount: 6,
+      stage: "source_overlap",
+      totalCount: 7,
+    });
     const knowledgeGaps = [
       ...isolatedPages.map((item) => ({
         ...item,
@@ -2997,8 +3072,7 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
         reason_codes: ["sparse_page"],
       })),
     ];
-
-    return {
+    const graphInsights: GraphInsightsResponse = {
       knowledge_base_id: knowledgeBaseId,
       status: {
         failure_reason: null,
@@ -3008,7 +3082,7 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
         updated_at: null,
       },
       snapshot: {
-        algorithm: createBoundedGraphInsightAlgorithmMetadata(),
+        algorithm: createBoundedGraphInsightAlgorithmMetadata(limit),
         edge_count: counts.edgeCount,
         graph_hash: createWorkerGraphHash({
           edgeCount: counts.edgeCount,
@@ -3032,6 +3106,29 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
       communities,
       surprising_connections: surprisingConnections,
     };
+
+    await options.onProgress?.({
+      metadata: {
+        graph_insights_stage_completed: "final_summary",
+        graph_insights_snapshot: graphInsights,
+        graph_insights_summary: {
+          bridge_pages_count: bridgePages.length,
+          communities_count: communities.length,
+          isolated_pages_count: isolatedPages.length,
+          knowledge_gaps_count: knowledgeGaps.length,
+          sparse_pages_count: sparsePages.length,
+          surprising_connections_count: surprisingConnections.length,
+        },
+        limit,
+        omitted_edge_count_estimate: Math.max(0, counts.edgeCount - limit),
+        omitted_node_count_estimate: Math.max(0, counts.nodeCount - limit),
+      },
+      processedCount: 7,
+      stage: "final_summary",
+      totalCount: 7,
+    });
+
+    return graphInsights;
   }
 
   private async countGraphInsightInputs(
@@ -3189,7 +3286,7 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
         reason_codes: ["type_affinity_cluster"],
         score: memberCount,
         community: {
-          algorithm: createBoundedGraphInsightAlgorithmMetadata().community_algorithm,
+          algorithm: createBoundedGraphInsightAlgorithmMetadata(limit).community_algorithm,
           cohesion: 1,
           confidence: 0.5,
           id: `type:${row.page_type}`,
@@ -5429,7 +5526,7 @@ function readRetrievalVisibilityOrigin(value: string | null): RetrievalVisibilit
   return "canonical";
 }
 
-function createBoundedGraphInsightAlgorithmMetadata(): GraphAlgorithmMetadata {
+function createBoundedGraphInsightAlgorithmMetadata(limit?: number): GraphAlgorithmMetadata {
   return {
     name: "bounded_graph_insight_summary",
     version: "1",
@@ -5438,6 +5535,7 @@ function createBoundedGraphInsightAlgorithmMetadata(): GraphAlgorithmMetadata {
       version: "1",
       weighted: false,
     },
+    ...(limit === undefined ? {} : { weights: { insight_limit: limit } }),
   };
 }
 
@@ -5462,18 +5560,29 @@ function createWorkerGraphHash(input: {
 function createGraphInsightsCompactSummary(
   graphInsights: GraphInsightsResponse,
 ): Record<string, unknown> {
+  const limit = extractBoundedGraphInsightLimit(graphInsights);
+
   return {
     bridge_pages_count: graphInsights.bridge_pages.length,
     communities_count: graphInsights.communities.length,
     graph_hash: graphInsights.snapshot.graph_hash,
     isolated_pages_count: graphInsights.isolated_pages.length,
     knowledge_gaps_count: graphInsights.knowledge_gaps.length,
+    limit,
     node_count: graphInsights.snapshot.node_count,
     edge_count: graphInsights.snapshot.edge_count,
+    omitted_edge_count_estimate: Math.max(0, graphInsights.snapshot.edge_count - limit),
+    omitted_node_count_estimate: Math.max(0, graphInsights.snapshot.node_count - limit),
     sparse_pages_count: graphInsights.sparse_pages?.length ?? 0,
     state: graphInsights.status.state,
     surprising_connections_count: graphInsights.surprising_connections.length,
   };
+}
+
+function extractBoundedGraphInsightLimit(graphInsights: GraphInsightsResponse): number {
+  const limit = graphInsights.snapshot.algorithm.weights?.insight_limit;
+
+  return typeof limit === "number" && Number.isFinite(limit) ? limit : 1;
 }
 
 function createWorkerHash(value: string): string {

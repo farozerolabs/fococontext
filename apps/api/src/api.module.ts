@@ -415,12 +415,21 @@ export class ApiModule implements NestModule {
             options.sourceWatchScanner ??
             createDefaultSourceWatchScanner(config, {
               existingDocumentProvider: {
-                listExistingDocuments: (rule) =>
-                  operationalReadStore.listSourceWatchDocuments({
+                compareDiscoveredSources: (rule, scannedSources) =>
+                  operationalReadStore.compareSourceWatchDiscoveredSources({
+                    comparisonWindowSize: config.limits.residualMemory.sourceWatch.windowSize,
+                    rule,
+                    scannedSources,
+                  }),
+                hasMatchingFingerprint: (rule, sourcePath, fingerprint) =>
+                  operationalReadStore.hasMatchingSourceWatchFingerprint({
+                    fingerprint,
                     knowledgeBaseId: rule.knowledgeBaseId,
+                    sourcePath,
                     sourceWatchRuleId: rule.id,
                   }),
               },
+              comparisonWindowSize: config.limits.residualMemory.sourceWatch.windowSize,
               operationRecorder: objectStorageOperationRecorder,
             }),
           inject: [operationalReadStoreToken, objectStorageOperationRecorderToken],

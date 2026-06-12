@@ -140,6 +140,7 @@ export interface VisionCaptionProvider {
 }
 
 export interface MediaCaptionProcessorConfig {
+  checkpointInterval: number;
   concurrency: number;
   contextChars: number;
   maxImageBytes: number;
@@ -152,6 +153,7 @@ export interface MediaCaptionProcessorConfig {
   requestMaxRetries: number;
   retryBaseDelayMs: number;
   timeoutSeconds: number;
+  windowSize: number;
 }
 
 export interface MediaCaptionProcessorOptions {
@@ -358,19 +360,50 @@ export class MediaCaptionProcessor {
     let failedCount = 0;
     let generatedCount = 0;
     let providerCallCount = 0;
-    const captionGroups = this.groupAssetsByCaptionCacheKey(assets, resolvedPrompt.prompt.id);
-    const groupResults = await mapWithConcurrency(captionGroups, this.config.concurrency, (group) =>
-      this.captionWorkLimiter(() =>
-        this.processCaptionGroup(payload, group, normalizedMarkdown, resolvedPrompt),
-      ),
-    );
+    const assetWindows = chunkArray(assets, this.config.windowSize);
 
-    for (const result of groupResults) {
-      cacheHitCount += result.cacheHitCount;
-      failedCount += result.failedCount;
-      generatedCount += result.generatedCount;
-      providerCallCount += result.providerCallCount;
-      captions.push(...result.captions);
+    for (const [windowIndex, assetWindow] of assetWindows.entries()) {
+      const captionGroups = this.groupAssetsByCaptionCacheKey(
+        assetWindow,
+        resolvedPrompt.prompt.id,
+      );
+      const groupResults = await mapWithConcurrency(
+        captionGroups,
+        this.config.concurrency,
+        (group) =>
+          this.captionWorkLimiter(() =>
+            this.processCaptionGroup(payload, group, normalizedMarkdown, resolvedPrompt),
+          ),
+      );
+
+      for (const result of groupResults) {
+        cacheHitCount += result.cacheHitCount;
+        failedCount += result.failedCount;
+        generatedCount += result.generatedCount;
+        providerCallCount += result.providerCallCount;
+        captions.push(...result.captions);
+      }
+
+      if ((windowIndex + 1) % this.config.checkpointInterval === 0) {
+        await this.jobProgress?.updateJobProgress({
+          jobId: payload.job_id,
+          knowledgeBaseId: payload.knowledge_base_id,
+          inputSnapshotId: payload.input_snapshot_id,
+          stage: "captioning",
+          status: "running",
+          progress: 40,
+          message: "Captioning media assets...",
+          parsedContentId: payload.parsed_content_id,
+          metadata: {
+            caption_completed_windows: windowIndex + 1,
+            caption_processed_asset_count: assetWindows
+              .slice(0, windowIndex + 1)
+              .reduce((sum, window) => sum + window.length, 0),
+            caption_total_windows: assetWindows.length,
+            caption_window_size: this.config.windowSize,
+          },
+        });
+      }
     }
 
     const afterCaptionGuard = await this.canContinue(payload);
@@ -996,6 +1029,7 @@ export class PostgresMediaCaptionRepository implements MediaCaptionRepository {
         caption_error
       from media_assets
       where id = any(${ids}::text[])
+        and caption_status in ('pending', 'failed')
       order by created_at asc
     `.execute(this.db);
 
@@ -1299,6 +1333,17 @@ function escapeMarkdownAlt(value: string): string {
 
 function sanitizeCacheKeyPart(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]+/g, "_");
+}
+
+function chunkArray<T>(items: readonly T[], size: number): T[][] {
+  const safeSize = Math.max(1, Math.floor(size));
+  const chunks: T[][] = [];
+
+  for (let index = 0; index < items.length; index += safeSize) {
+    chunks.push(items.slice(index, index + safeSize));
+  }
+
+  return chunks;
 }
 
 function sleepFor(milliseconds: number): Promise<void> {
