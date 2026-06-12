@@ -50,7 +50,10 @@ export class WikiDraftService {
     const now = new Date().toISOString();
     const draftId = createWikiDraftId();
     const changeSetId = createResourceId("changeSet");
+    const queueScope = scope ?? defaultApiResourceScope;
     const document = createWikiDraftDocumentRecord({
+      tenantId: queueScope.tenantId,
+      projectId: queueScope.projectId,
       knowledgeBaseId,
       draftId,
       changeSetId,
@@ -161,6 +164,8 @@ function toDatasetConfigurationSnapshotPayload(configuration: DatasetConfigurati
 }
 
 function createWikiDraftDocumentRecord(input: {
+  tenantId: string;
+  projectId: string;
   knowledgeBaseId: string;
   draftId: string;
   changeSetId: string;
@@ -186,6 +191,8 @@ function createWikiDraftDocumentRecord(input: {
 
   return {
     id: createResourceId("sourceDocument"),
+    tenantId: input.tenantId,
+    projectId: input.projectId,
     knowledgeBaseId: input.knowledgeBaseId,
     name: `${input.title}.md`,
     displayName: input.title,

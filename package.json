@@ -22,7 +22,10 @@
     "lint": "eslint . --ext .js,.mjs,.cjs,.ts,.tsx",
     "test": "vitest run --passWithNoTests",
     "typecheck": "tsc -b --pretty false",
-    "validation:white-box": "node scripts/validation/white-box-real-data-validation.mjs",
+    "validation:black-box": "node scripts/validation/white-box-real-data-validation.mjs --compose true --runtime true --openapi true --admin true",
+    "validation:release": "node scripts/validation/white-box-real-data-validation.mjs",
+    "validation:report-contract": "node scripts/validation/release-validation-report-contract.mjs --self-test",
+    "validation:white-box": "node scripts/validation/white-box-real-data-validation.mjs --compose true --runtime true --openapi false --admin false",
     "verify": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm run test"
   },
   "devDependencies": {

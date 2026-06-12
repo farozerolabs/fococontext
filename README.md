@@ -382,6 +382,23 @@ if (retrieval.answerability.no_answer) {
 
 See `examples/sdk-ready-quickstart.ts` for a complete script.
 
+### Validate a Release Candidate
+
+FocoContext keeps release validation split into white-box and black-box paths.
+White-box checks internal contracts, migrations, runtime configuration, and UI
+state. Black-box starts the Docker Compose runtime and verifies the product
+through public OpenAPI and Admin Web flows with a small representative document
+sample.
+
+```bash
+pnpm run validation:report-contract
+pnpm run validation:release -- --env .env
+```
+
+Reports are written under `test-results/whitebox-blackbox-validation` by
+default and are local validation artifacts. Read the full guide at
+[docs.fococontext.com](https://docs.fococontext.com/en-US/help/release-validation).
+
 ## Core API Surface
 
 | Endpoint                                                                                              | Purpose                                      |

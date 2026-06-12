@@ -567,6 +567,8 @@ class PostgresApiDatabaseMirror implements ApiDatabaseMirror {
     await sql`
       insert into source_documents (
         id,
+        tenant_id,
+        project_id,
         knowledge_base_id,
         source_type,
         name,
@@ -587,6 +589,8 @@ class PostgresApiDatabaseMirror implements ApiDatabaseMirror {
       )
       values (
         ${record.id},
+        ${record.tenantId},
+        ${record.projectId},
         ${record.knowledgeBaseId},
         ${record.sourceType},
         ${record.name},
@@ -606,6 +610,8 @@ class PostgresApiDatabaseMirror implements ApiDatabaseMirror {
         ${record.updatedAt}
       )
       on conflict (id) do update set
+        tenant_id = excluded.tenant_id,
+        project_id = excluded.project_id,
         name = excluded.name,
         status = excluded.status,
         content_hash = excluded.content_hash,

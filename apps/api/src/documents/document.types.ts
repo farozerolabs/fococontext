@@ -73,6 +73,8 @@ export type JobStage =
 
 export interface SourceDocumentRecord {
   id: string;
+  tenantId: string;
+  projectId: string;
   knowledgeBaseId: string;
   name: string;
   displayName: string;

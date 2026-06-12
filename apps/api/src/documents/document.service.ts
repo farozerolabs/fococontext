@@ -330,6 +330,7 @@ export class DocumentService {
       uploadedFile,
       uploadData,
       now,
+      createSourceDocumentScope(scope),
       createSourceVisibilityMetadata(knowledgeBase),
     );
     const job = createParseJobRecord(knowledgeBaseId, uploadedFile, now, idempotencyKey);
@@ -512,6 +513,10 @@ export class DocumentService {
         metadata: finalizedMetadata,
       },
       now,
+      {
+        tenantId: session.tenantId,
+        projectId: session.projectId,
+      },
       createSourceVisibilityMetadata(knowledgeBase),
     );
     const job = createParseJobRecord(knowledgeBaseId, uploadedFile, now, idempotencyKey);
@@ -561,6 +566,7 @@ export class DocumentService {
       uploadedFile,
       createUploadDataField(name, input.source_path, input.metadata),
       now,
+      createSourceDocumentScope(scope),
       createSourceVisibilityMetadata(knowledgeBase),
       "text",
     );
@@ -599,6 +605,7 @@ export class DocumentService {
       uploadedFile,
       createUploadDataField(name, input.source_path, input.metadata),
       now,
+      createSourceDocumentScope(scope),
       createSourceVisibilityMetadata(knowledgeBase),
       "url",
       sourceUrl,
@@ -650,6 +657,7 @@ export class DocumentService {
       uploadedFile,
       createUploadDataField(name, input.source_path, input.metadata),
       now,
+      createSourceDocumentScope(scope),
       createSourceVisibilityMetadata(knowledgeBase),
     );
     const job = createParseJobRecord(knowledgeBaseId, uploadedFile, now, idempotencyKey);
@@ -2247,6 +2255,7 @@ function createSourceDocumentRecord(
   uploadedFile: UploadedFile,
   uploadData: UploadDataField,
   timestamp: string,
+  documentScope: Pick<SourceDocumentRecord, "tenantId" | "projectId">,
   visibilityMetadata: Pick<
     SourceDocumentRecord,
     "visibilityOrigin" | "ownerKnowledgeBaseId" | "upstreamResourceId" | "forkTombstonedAt"
@@ -2256,6 +2265,7 @@ function createSourceDocumentRecord(
 ): SourceDocumentRecord {
   const record: SourceDocumentRecord = {
     id: uploadedFile.documentId,
+    ...documentScope,
     knowledgeBaseId,
     name: uploadedFile.name,
     displayName: uploadData.display_name ?? uploadedFile.name,
@@ -2281,6 +2291,17 @@ function createSourceDocumentRecord(
   }
 
   return record;
+}
+
+function createSourceDocumentScope(
+  scope: ApiResourceScope | undefined,
+): Pick<SourceDocumentRecord, "tenantId" | "projectId"> {
+  const resolvedScope = scope ?? defaultApiResourceScope;
+
+  return {
+    tenantId: resolvedScope.tenantId,
+    projectId: resolvedScope.projectId,
+  };
 }
 
 function createSourceVisibilityMetadata(

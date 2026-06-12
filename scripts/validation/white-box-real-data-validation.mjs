@@ -36,9 +36,11 @@ const reportDir = resolve(
   workspaceRoot,
   args.reportDir ??
     process.env.FOCOCONTEXT_VALIDATION_REPORT_DIR ??
-    "test-results/white-box-real-data-validation",
+    "test-results/whitebox-blackbox-validation",
 );
 const runId = args.runId ?? process.env.FOCOCONTEXT_VALIDATION_RUN_ID ?? timestampId();
+const validationSuiteName = "whitebox-blackbox-release-validation";
+const validationReportContractVersion = 1;
 const generalLimit = readPositiveInt(
   args.generalLimit ?? process.env.FOCOCONTEXT_VALIDATION_GENERAL_LIMIT,
   3,
@@ -93,11 +95,21 @@ const report = {
     jobs: [],
     pages: 0,
     retrieveResults: 0,
+    sourceEvidenceResolved: 0,
+  },
+  blackBox: {
+    adminViews: [],
+    checks: [],
+    endpointCoverage: [],
   },
   compose: {
     checks: [],
     files: composeFiles.map((file) => relativePath(file)),
     services: {},
+  },
+  developerExperience: {
+    callSequence: [],
+    findings: [],
   },
   env: {
     checks: [],
@@ -116,11 +128,48 @@ const report = {
     strict,
     workspaceRoot,
   },
+  metrics: {
+    adminFlowPassRate: 0,
+    failedJobCount: 0,
+    ingestCompletionRate: 0,
+    phaseElapsedMs: {},
+    retrieveExpandSuccessRate: 0,
+    retrieveSuccessRate: 0,
+    sourceEvidenceDereferenceSuccessRate: 0,
+    unauthorizedRejectionPassRate: 0,
+    uploadSuccessRate: 0,
+  },
   moduleCoverage: [],
+  releaseGate: {
+    blockingFailures: [],
+    ready: false,
+    residualRisks: [],
+  },
   reruns: [],
   residualRisks: [],
+  security: {
+    denialChecks: [],
+  },
   status: "running",
   timings: {},
+  userExperience: {
+    findings: [],
+    retrievalReviews: [],
+  },
+  validationSuite: {
+    branch: "unknown",
+    commandList: [],
+    commit: "unknown",
+    composeTemplate: composeFiles.map((file) => relativePath(file)).join(","),
+    environmentClass: "local-dev",
+    mode: "whitebox-blackbox",
+    name: validationSuiteName,
+    reportContractVersion: validationReportContractVersion,
+  },
+  whiteBox: {
+    checks: [],
+    persistenceBoundaries: [],
+  },
   warnings: [],
 };
 
@@ -137,6 +186,19 @@ const adminBaseUrl = stripTrailingSlash(
   selectedEnv.FOCOCONTEXT_ADMIN_BASE_URL ??
     `http://127.0.0.1:${selectedEnv.FOCOCONTEXT_ADMIN_PORT ?? "18081"}`,
 );
+const gitMetadata = await readGitMetadata();
+report.validationSuite = {
+  ...report.validationSuite,
+  branch: gitMetadata.branch,
+  commandList: [
+    "node",
+    "scripts/validation/white-box-real-data-validation.mjs",
+    ...process.argv.slice(2),
+  ].map((item) => redactString(item)),
+  commit: gitMetadata.commit,
+  environmentClass:
+    args.environmentClass ?? process.env.FOCOCONTEXT_VALIDATION_ENVIRONMENT_CLASS ?? "local-dev",
+};
 
 try {
   await step("preflight", async () => {
@@ -237,9 +299,11 @@ try {
   report.failures.push(toErrorMessage(error));
 } finally {
   await cleanupOpenApiKnowledgeBase();
+  finalizeReport();
   report.status = report.failures.length === 0 ? "passed" : "failed";
   report.timings.finishedAt = new Date().toISOString();
   await writeReport();
+  await validateGeneratedReportContract();
 }
 
 if (report.failures.length > 0) {
@@ -329,6 +393,13 @@ async function validateEnvConfiguration(example, actual) {
   report.env.effective = redactObject({
     apiBaseUrl,
     adminBaseUrl,
+    databaseConfigured: !isEmpty(actual.DATABASE_URL) && !isPlaceholder(actual.DATABASE_URL),
+    redisConfigured: !isEmpty(actual.REDIS_URL) && !isPlaceholder(actual.REDIS_URL),
+    objectStorageConfigured:
+      !isEmpty(actual.S3_ENDPOINT) &&
+      !isPlaceholder(actual.S3_ENDPOINT) &&
+      !isEmpty(actual.S3_BUCKET) &&
+      !isPlaceholder(actual.S3_BUCKET),
     corsOrigins: actual.FOCOCONTEXT_CORS_ORIGINS,
     ocrEnabled: actual.OCR_ENABLED,
     queueConcurrency: actual.FOCOCONTEXT_QUEUE_CONCURRENCY,
@@ -409,28 +480,29 @@ async function validateRuntimeMetadata(actualEnv) {
     headers: { accept: "application/json" },
   });
   const healthData = health.data ?? {};
+  const runtimeStatus = await apiGet("/runtime/status");
 
   recordCheck(report.env.checks, "api-health-ready", healthData.status === "ready", {
     status: healthData.status,
   });
-  validateReleaseMetadata("api", healthData.runtime?.release);
-  validateReleaseMetadata("worker", healthData.dependencies?.worker?.release);
-  validateReleaseMetadata("ocr", healthData.dependencies?.ocr?.release);
+  validateReleaseMetadata("api", runtimeStatus.runtime?.release);
+  validateReleaseMetadata("worker", runtimeStatus.dependencies?.worker?.release);
+  validateReleaseMetadata("ocr", runtimeStatus.dependencies?.ocr?.release);
   recordCheck(
     report.env.checks,
     "health-api-base-url-matches-env",
-    healthData.runtime?.apiBaseUrl === apiBaseUrl,
+    runtimeStatus.runtime?.apiBaseUrl === apiBaseUrl,
     {
-      actual: healthData.runtime?.apiBaseUrl,
+      actual: runtimeStatus.runtime?.apiBaseUrl,
       expected: apiBaseUrl,
     },
   );
   recordCheck(
     report.env.checks,
     "health-admin-base-url-matches-env",
-    healthData.runtime?.adminBaseUrl === adminBaseUrl,
+    runtimeStatus.runtime?.adminBaseUrl === adminBaseUrl,
     {
-      actual: healthData.runtime?.adminBaseUrl,
+      actual: runtimeStatus.runtime?.adminBaseUrl,
       expected: adminBaseUrl,
     },
   );
@@ -440,9 +512,9 @@ async function validateRuntimeMetadata(actualEnv) {
     recordCheck(
       report.env.checks,
       `dependency-${key}-has-status`,
-      healthData.dependencies?.[key]?.status !== undefined,
+      runtimeStatus.dependencies?.[key]?.status !== undefined,
       {
-        status: healthData.dependencies?.[key]?.status,
+        status: runtimeStatus.dependencies?.[key]?.status,
       },
     );
   }
@@ -466,8 +538,8 @@ async function validateRuntimeMetadata(actualEnv) {
   recordCheck(
     report.env.checks,
     "health-direct-upload-status-present",
-    healthData.limits?.upload?.directUpload !== undefined,
-    healthData.limits?.upload ?? {},
+    runtimeStatus.limits?.upload?.directUpload !== undefined,
+    runtimeStatus.limits?.upload ?? {},
   );
 }
 
@@ -672,6 +744,7 @@ async function uploadDocument(knowledgeBaseId, item) {
   const content = await readFile(item.path);
   const formData = new FormData();
   const extension = extname(item.path).toLowerCase();
+  const startedAt = Date.now();
 
   formData.set(
     "data",
@@ -704,6 +777,12 @@ async function uploadDocument(knowledgeBaseId, item) {
       method: "POST",
     },
     "document-upload",
+  );
+  recordOpenApiCall(
+    "POST",
+    `/knowledge-bases/${knowledgeBaseId}/documents`,
+    response.status,
+    Date.now() - startedAt,
   );
 
   return readData(response);
@@ -786,10 +865,8 @@ async function validateApiLists(knowledgeBaseId) {
 }
 
 async function validateDirectUploadIfReady(knowledgeBaseId) {
-  const health = await httpJson(`${apiRootUrl}/health`, {
-    headers: { accept: "application/json" },
-  });
-  const directUpload = health.data?.limits?.upload?.directUpload;
+  const runtimeStatus = await apiGet("/runtime/status");
+  const directUpload = runtimeStatus.limits?.upload?.directUpload;
 
   if (directUpload?.ready !== true) {
     report.warnings.push(
@@ -898,6 +975,7 @@ async function validateRetrieval(knowledgeBaseId) {
   const evidenceItems = collectSourceEvidenceItems(retrieve, knowledgeBaseId).slice(0, 5);
   if (evidenceItems.length > 0) {
     const resolved = await apiPost("/source-evidence/resolve", { items: evidenceItems });
+    report.api.sourceEvidenceResolved = resolved.items?.length ?? 0;
     recordCheck(
       report.api.checks,
       "source-evidence-resolve",
@@ -963,6 +1041,99 @@ function markCoverage(names, status) {
 }
 
 async function validateApiErrors(knowledgeBaseId) {
+  const noAuth = await fetchWithTimeout(
+    `${apiBaseUrl}/knowledge-bases/${knowledgeBaseId}`,
+    {
+      headers: { accept: "application/json" },
+    },
+    "missing-auth-check",
+  );
+  recordDenialCheck("missing-auth-rejected", noAuth.status, noAuth.status === 401);
+
+  const noAuthRuntime = await fetchWithTimeout(
+    `${apiBaseUrl}/runtime/status`,
+    {
+      headers: { accept: "application/json" },
+    },
+    "missing-auth-runtime-check",
+  );
+  recordDenialCheck(
+    "missing-auth-runtime-status-rejected",
+    noAuthRuntime.status,
+    noAuthRuntime.status === 401,
+  );
+
+  const noAuthUpload = await fetchWithTimeout(
+    `${apiBaseUrl}/knowledge-bases/${knowledgeBaseId}/documents`,
+    {
+      headers: { accept: "application/json" },
+      method: "POST",
+    },
+    "missing-auth-upload-check",
+  );
+  recordDenialCheck(
+    "missing-auth-upload-rejected",
+    noAuthUpload.status,
+    noAuthUpload.status === 401,
+  );
+
+  const noAuthRetrieve = await fetchWithTimeout(
+    `${apiBaseUrl}/knowledge-bases/${knowledgeBaseId}/retrieve`,
+    {
+      body: JSON.stringify({ query: "validation" }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    },
+    "missing-auth-retrieve-check",
+  );
+  recordDenialCheck(
+    "missing-auth-retrieve-rejected",
+    noAuthRetrieve.status,
+    noAuthRetrieve.status === 401,
+  );
+
+  const noAuthEvidence = await fetchWithTimeout(
+    `${apiBaseUrl}/source-evidence/resolve`,
+    {
+      body: JSON.stringify({ document_id: "doc_missing_validation" }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    },
+    "missing-auth-source-evidence-check",
+  );
+  recordDenialCheck(
+    "missing-auth-source-evidence-rejected",
+    noAuthEvidence.status,
+    noAuthEvidence.status === 401,
+  );
+
+  const noAuthCleanup = await fetchWithTimeout(
+    `${apiBaseUrl}/knowledge-bases/${knowledgeBaseId}`,
+    {
+      headers: { accept: "application/json" },
+      method: "DELETE",
+    },
+    "missing-auth-cleanup-check",
+  );
+  recordDenialCheck(
+    "missing-auth-cleanup-rejected",
+    noAuthCleanup.status,
+    noAuthCleanup.status === 401,
+  );
+
+  const malformedAuth = await fetchWithTimeout(
+    `${apiBaseUrl}/knowledge-bases/${knowledgeBaseId}`,
+    {
+      headers: { authorization: "Basic invalid" },
+    },
+    "malformed-auth-check",
+  );
+  recordDenialCheck(
+    "malformed-auth-rejected",
+    malformedAuth.status,
+    malformedAuth.status === 401 || malformedAuth.status === 403,
+  );
+
   const invalidAuth = await fetchWithTimeout(
     `${apiBaseUrl}/knowledge-bases/${knowledgeBaseId}`,
     {
@@ -970,13 +1141,10 @@ async function validateApiErrors(knowledgeBaseId) {
     },
     "invalid-auth-check",
   );
-  recordCheck(
-    report.api.checks,
+  recordDenialCheck(
     "invalid-auth-rejected",
+    invalidAuth.status,
     invalidAuth.status === 401 || invalidAuth.status === 403,
-    {
-      status: invalidAuth.status,
-    },
   );
 
   const missing = await fetchWithTimeout(
@@ -989,6 +1157,29 @@ async function validateApiErrors(knowledgeBaseId) {
   recordCheck(report.api.checks, "missing-resource-rejected", missing.status === 404, {
     status: missing.status,
   });
+
+  const anonymousOpenApi = await fetchWithTimeout(
+    `${apiRootUrl}/openapi.json`,
+    {
+      headers: { accept: "application/json" },
+    },
+    "anonymous-openapi-json-check",
+  );
+  recordDenialCheck(
+    "anonymous-openapi-json-rejected",
+    anonymousOpenApi.status,
+    anonymousOpenApi.status === 401 || anonymousOpenApi.status === 403,
+  );
+}
+
+function recordDenialCheck(name, status, passed) {
+  const item = {
+    name,
+    status: passed ? "passed" : "failed",
+    statusCode: status,
+  };
+  report.security.denialChecks.push(item);
+  recordCheck(report.api.checks, name, passed, { status });
 }
 
 async function runAdminValidation() {
@@ -1083,8 +1274,14 @@ async function runAdminValidation() {
 async function adminCheck(name, action) {
   try {
     await action();
+    report.blackBox.adminViews.push({ name, status: "passed" });
     recordCheck(report.admin.checks, name, true);
   } catch (error) {
+    report.blackBox.adminViews.push({
+      name,
+      status: "failed",
+      error: toErrorMessage(error),
+    });
     recordCheck(report.admin.checks, name, false, { error: toErrorMessage(error) });
     throw error;
   }
@@ -1163,13 +1360,155 @@ async function validateNoSecretLeak() {
   }
 }
 
+function finalizeReport() {
+  report.metrics.phaseElapsedMs = Object.fromEntries(
+    Object.entries(report.timings)
+      .filter(([, value]) => typeof value?.durationMs === "number")
+      .map(([key, value]) => [key, value.durationMs]),
+  );
+
+  const uploadedDocuments = report.api.documents.filter(
+    (item) => typeof item.documentId === "string" && item.documentId.length > 0,
+  );
+  const completedJobs = report.api.jobs.filter((item) => item.status === "completed");
+  const failedJobs = report.api.jobs.filter((item) => item.status !== "completed");
+  const retrieveExpandPassed = findCheck(report.api.checks, "retrieve-expand-readable")?.status;
+  const sourceEvidencePassed = findCheck(report.api.checks, "source-evidence-resolve")?.status;
+  const retrievePassed = findCheck(report.api.checks, "retrieve-results")?.status;
+
+  report.metrics.uploadSuccessRate = ratio(uploadedDocuments.length, report.api.documents.length);
+  report.metrics.ingestCompletionRate = ratio(completedJobs.length, report.api.jobs.length);
+  report.metrics.failedJobCount = failedJobs.length;
+  report.metrics.retrieveSuccessRate = retrievePassed === "passed" ? 1 : 0;
+  report.metrics.retrieveExpandSuccessRate =
+    retrieveExpandPassed === undefined ? 0 : retrieveExpandPassed === "passed" ? 1 : 0;
+  report.metrics.sourceEvidenceDereferenceSuccessRate =
+    sourceEvidencePassed === undefined ? 0 : sourceEvidencePassed === "passed" ? 1 : 0;
+  report.metrics.unauthorizedRejectionPassRate = ratio(
+    report.security.denialChecks.filter((item) => item.status === "passed").length,
+    report.security.denialChecks.length,
+  );
+  report.metrics.adminFlowPassRate = ratio(
+    report.admin.checks.filter((item) => item.status === "passed").length,
+    report.admin.checks.length,
+  );
+
+  report.whiteBox.checks = [
+    ...report.env.checks.map((item) => ({ ...item, group: "env" })),
+    ...report.compose.checks.map((item) => ({ ...item, group: "compose" })),
+  ];
+  report.whiteBox.persistenceBoundaries = [
+    {
+      evidence: "DATABASE_URL",
+      name: "postgres",
+      status: report.env.effective.databaseConfigured === true ? "configured" : "unknown",
+    },
+    {
+      evidence: "REDIS_URL",
+      name: "redis",
+      status: report.env.effective.redisConfigured === true ? "configured" : "unknown",
+    },
+    {
+      evidence: "S3_ENDPOINT/S3_BUCKET",
+      name: "object-storage",
+      status: report.env.effective.objectStorageConfigured === true ? "configured" : "unknown",
+    },
+  ];
+  report.blackBox.checks = [
+    ...report.api.checks.map((item) => ({ ...item, group: "openapi" })),
+    ...report.admin.checks.map((item) => ({ ...item, group: "admin" })),
+  ];
+
+  if (report.developerExperience.findings.length === 0) {
+    report.developerExperience.findings.push({
+      endpoint: "public-openapi-flow",
+      evidence: `${report.developerExperience.callSequence.length} public API calls recorded.`,
+      recommendation:
+        "Review call sequence and latency when the validation report is used for release sign-off.",
+      severity: "info",
+      summary: "OpenAPI validation recorded the developer call sequence.",
+    });
+  }
+
+  if (report.userExperience.retrievalReviews.length === 0) {
+    report.userExperience.retrievalReviews.push({
+      citationQuality: sourceEvidencePassed ?? "not-run",
+      confidenceRating: report.metrics.retrieveSuccessRate === 1 ? "medium" : "low",
+      missingImportantContent: [],
+      observedResultCoverage: report.api.retrieveResults,
+      queryIntent:
+        "Validate that representative uploaded sources produce source-traceable retrieval context.",
+      recommendedFollowUp:
+        report.metrics.retrieveSuccessRate === 1
+          ? "None for this sample."
+          : "Inspect retrieve output for weak sample coverage.",
+    });
+  }
+
+  if (report.userExperience.findings.length === 0) {
+    report.userExperience.findings.push({
+      evidence: `Retrieve results: ${report.api.retrieveResults}; source evidence resolved: ${report.api.sourceEvidenceResolved}.`,
+      recommendation: "Use a larger representative sample before a major release.",
+      severity: "info",
+      summary: "Representative retrieval sample completed with bounded evidence.",
+    });
+  }
+
+  const failedChecks = [
+    ...report.env.checks,
+    ...report.compose.checks,
+    ...report.api.checks,
+    ...report.admin.checks,
+  ].filter((check) => check.status === "failed");
+  report.releaseGate.blockingFailures = [
+    ...report.failures.map((message) => ({ message, source: "runtime" })),
+    ...failedChecks.map((check) => ({
+      message: `Check failed: ${check.name}`,
+      source: "validation-check",
+    })),
+  ];
+  report.releaseGate.residualRisks = [...report.residualRisks];
+  report.releaseGate.ready = report.releaseGate.blockingFailures.length === 0;
+}
+
+function ratio(numerator, denominator) {
+  if (denominator === 0) {
+    return 1;
+  }
+  return numerator / denominator;
+}
+
+function findCheck(checks, name) {
+  return checks.find((item) => item.name === name);
+}
+
 async function writeReport() {
+  const summary = renderSummary(redactObject(report));
   await writeFile(
     join(reportDir, "report.json"),
     JSON.stringify(redactObject(report), null, 2),
     "utf8",
   );
-  await writeFile(join(reportDir, "summary.md"), renderSummary(redactObject(report)), "utf8");
+  await writeFile(join(reportDir, "summary.md"), summary, "utf8");
+}
+
+async function validateGeneratedReportContract() {
+  const reportPath = join(reportDir, "report.json");
+  const result = await execFileAsync(
+    process.execPath,
+    ["scripts/validation/release-validation-report-contract.mjs", "--report", reportPath],
+    {
+      cwd: workspaceRoot,
+      maxBuffer: 1024 * 1024,
+    },
+  ).catch((error) => {
+    throw new Error(
+      `Generated validation report did not satisfy the release contract: ${error.stderr || error.stdout || error.message}`,
+    );
+  });
+  if (result.stdout.trim().length > 0) {
+    console.log(result.stdout.trim());
+  }
 }
 
 function renderSummary(value) {
@@ -1204,7 +1543,26 @@ function renderSummary(value) {
     `- Compose checks: ${countPassed(value.compose.checks)}/${value.compose.checks.length}`,
     `- OpenAPI checks: ${countPassed(value.api.checks)}/${value.api.checks.length}`,
     `- Admin checks: ${countPassed(value.admin.checks)}/${value.admin.checks.length}`,
+    `- Unauthorized rejection pass rate: ${formatPercent(value.metrics.unauthorizedRejectionPassRate)}`,
+    `- Upload success rate: ${formatPercent(value.metrics.uploadSuccessRate)}`,
+    `- Ingest completion rate: ${formatPercent(value.metrics.ingestCompletionRate)}`,
+    `- Retrieve success rate: ${formatPercent(value.metrics.retrieveSuccessRate)}`,
+    `- Source evidence dereference success rate: ${formatPercent(value.metrics.sourceEvidenceDereferenceSuccessRate)}`,
+    `- Admin flow pass rate: ${formatPercent(value.metrics.adminFlowPassRate)}`,
+    `- Release gate ready: ${value.releaseGate.ready ? "yes" : "no"}`,
     `- Failures: ${value.failures.length}`,
+    "",
+    "## Developer Experience Findings",
+    "",
+    ...value.developerExperience.findings.map(
+      (item) => `- ${item.severity}: ${item.summary} ${item.recommendation}`,
+    ),
+    "",
+    "## User Experience Findings",
+    "",
+    ...value.userExperience.findings.map(
+      (item) => `- ${item.severity}: ${item.summary} ${item.recommendation}`,
+    ),
     "",
     "## Failed Checks",
     "",
@@ -1225,7 +1583,12 @@ function countPassed(checks) {
   return checks.filter((check) => check.status === "passed").length;
 }
 
+function formatPercent(value) {
+  return `${Math.round(Number(value) * 100)}%`;
+}
+
 async function apiGet(path) {
+  const startedAt = Date.now();
   const response = await fetchWithTimeout(
     `${apiBaseUrl}${path}`,
     {
@@ -1233,10 +1596,12 @@ async function apiGet(path) {
     },
     `GET ${path}`,
   );
+  recordOpenApiCall("GET", path, response.status, Date.now() - startedAt);
   return readData(response);
 }
 
 async function apiList(path) {
+  const startedAt = Date.now();
   const response = await fetchWithTimeout(
     `${apiBaseUrl}${path}`,
     {
@@ -1244,6 +1609,7 @@ async function apiList(path) {
     },
     `GET ${path}`,
   );
+  recordOpenApiCall("GET", path, response.status, Date.now() - startedAt);
   const envelope = await readEnvelope(response);
   return {
     items: Array.isArray(envelope.data) ? envelope.data : [],
@@ -1252,6 +1618,7 @@ async function apiList(path) {
 }
 
 async function apiPost(path, body) {
+  const startedAt = Date.now();
   const response = await fetchWithTimeout(
     `${apiBaseUrl}${path}`,
     {
@@ -1264,10 +1631,12 @@ async function apiPost(path, body) {
     },
     `POST ${path}`,
   );
+  recordOpenApiCall("POST", path, response.status, Date.now() - startedAt);
   return readData(response);
 }
 
 async function apiDelete(path) {
+  const startedAt = Date.now();
   const response = await fetchWithTimeout(
     `${apiBaseUrl}${path}`,
     {
@@ -1276,7 +1645,28 @@ async function apiDelete(path) {
     },
     `DELETE ${path}`,
   );
+  recordOpenApiCall("DELETE", path, response.status, Date.now() - startedAt);
   return readData(response);
+}
+
+function recordOpenApiCall(method, path, status, durationMs) {
+  const item = {
+    durationMs,
+    method,
+    path: normalizeEndpointPath(path),
+    status,
+  };
+  report.developerExperience.callSequence.push(item);
+  report.blackBox.endpointCoverage.push(item);
+}
+
+function normalizeEndpointPath(path) {
+  return path
+    .replace(/kb_[A-Za-z0-9_:-]+/gu, "{knowledge_base_id}")
+    .replace(/doc_[A-Za-z0-9_:-]+/gu, "{document_id}")
+    .replace(/job_[A-Za-z0-9_:-]+/gu, "{job_id}")
+    .replace(/ups_[A-Za-z0-9_:-]+/gu, "{upload_session_id}")
+    .replace(/upload_session_[A-Za-z0-9_:-]+/gu, "{upload_session_id}");
 }
 
 async function readData(response) {
@@ -1364,6 +1754,22 @@ async function dockerComposeJson(composeArgs, actualEnv) {
   }
 }
 
+async function readGitMetadata() {
+  const [branch, commit] = await Promise.all([
+    execFileAsync("git", ["branch", "--show-current"], {
+      cwd: workspaceRoot,
+    }).catch(() => ({ stdout: "unknown" })),
+    execFileAsync("git", ["rev-parse", "HEAD"], {
+      cwd: workspaceRoot,
+    }).catch(() => ({ stdout: "unknown" })),
+  ]);
+
+  return {
+    branch: branch.stdout.trim() || "unknown",
+    commit: commit.stdout.trim() || "unknown",
+  };
+}
+
 async function readEnvFile(path, options = {}) {
   const required = options.required === true;
   try {
@@ -1407,6 +1813,9 @@ function parseArgs(argv) {
 
   for (let index = 0; index < argv.length; index += 1) {
     const item = argv[index];
+    if (item === "--") {
+      continue;
+    }
     if (!item.startsWith("--")) {
       continue;
     }
@@ -1458,15 +1867,51 @@ async function manifestItem(path) {
   const extension = extname(path).toLowerCase();
 
   return {
+    documentType: documentTypeFromExtension(extension),
     extension,
     kind: path.startsWith(legalMarkdownDir) ? "legal" : "general",
     modifiedAt: stats.mtime.toISOString(),
     name: basename(path),
     path,
+    rationale: representativeRationale(path, content.byteLength),
     relativePath: relativePath(path),
     sha256: createHash("sha256").update(content).digest("hex"),
     size: content.byteLength,
+    sizeClass: sizeClass(content.byteLength),
   };
+}
+
+function documentTypeFromExtension(extension) {
+  return (
+    new Map([
+      [".csv", "CSV table"],
+      [".docx", "Word document"],
+      [".html", "HTML document"],
+      [".md", "Markdown document"],
+      [".pdf", "PDF document"],
+      [".pptx", "PowerPoint deck"],
+      [".rtf", "Rich text document"],
+      [".txt", "Plain text document"],
+      [".xls", "Excel workbook"],
+      [".xlsx", "Excel workbook"],
+    ]).get(extension) ?? "Document"
+  );
+}
+
+function representativeRationale(path, bytes) {
+  const extension = extname(path).toLowerCase();
+  const kind = path.startsWith(legalMarkdownDir) ? "legal corpus Markdown" : "general document";
+  return `${documentTypeFromExtension(extension)} selected from ${kind} sample set with ${sizeClass(bytes)} size profile.`;
+}
+
+function sizeClass(bytes) {
+  if (bytes < 128 * 1024) {
+    return "small";
+  }
+  if (bytes < 5 * 1024 * 1024) {
+    return "medium";
+  }
+  return "large";
 }
 
 function documentRank(path) {

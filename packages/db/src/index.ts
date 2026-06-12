@@ -170,6 +170,10 @@ create index if not exists source_documents_kb_visible_updated_idx
   on source_documents(knowledge_base_id, updated_at desc, id desc)
   where deleted_at is null and status <> 'deleted';
 
+create index if not exists source_documents_scope_visible_updated_idx
+  on source_documents(tenant_id, project_id, knowledge_base_id, updated_at desc, id desc)
+  where deleted_at is null and status <> 'deleted';
+
 create index if not exists source_documents_kb_owner_visible_updated_idx
   on source_documents(knowledge_base_id, owner_knowledge_base_id, updated_at desc, id desc)
   where deleted_at is null and status <> 'deleted' and fork_tombstoned_at is null;

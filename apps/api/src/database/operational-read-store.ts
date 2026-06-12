@@ -1010,6 +1010,8 @@ class PostgresOperationalReadStore implements OperationalReadStore {
       sql<JobRow>`
         select
           id,
+          tenant_id,
+          project_id,
           knowledge_base_id,
           source_document_id,
           job_type,
@@ -1057,7 +1059,7 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     const [itemsResult, totalResult] = await Promise.all([
       sql<SourceDocumentRow>`
         with target_kb as (
-          select id, knowledge_base_type, upstream_knowledge_base_id
+          select id, tenant_id, project_id, knowledge_base_type, upstream_knowledge_base_id
           from knowledge_bases
           where id = ${input.knowledgeBaseId}
             and deleted_at is null
@@ -1074,6 +1076,8 @@ class PostgresOperationalReadStore implements OperationalReadStore {
         visible_source_documents as (
           select
             source_documents.id,
+            source_documents.tenant_id,
+            source_documents.project_id,
             source_documents.knowledge_base_id,
             source_documents.source_type,
             source_documents.name,
@@ -1103,6 +1107,8 @@ class PostgresOperationalReadStore implements OperationalReadStore {
           union all
           select
             source_documents.id,
+            target_kb.tenant_id,
+            target_kb.project_id,
             target_kb.id as knowledge_base_id,
             source_documents.source_type,
             source_documents.name,
@@ -1137,6 +1143,8 @@ class PostgresOperationalReadStore implements OperationalReadStore {
           union all
           select
             source_documents.id,
+            source_documents.tenant_id,
+            source_documents.project_id,
             target_kb.id as knowledge_base_id,
             source_documents.source_type,
             source_documents.name,
@@ -1174,6 +1182,8 @@ class PostgresOperationalReadStore implements OperationalReadStore {
         )
         select
           id,
+          tenant_id,
+          project_id,
           knowledge_base_id,
           source_type,
           name,
@@ -1326,6 +1336,8 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     const result = await sql<SourceDocumentRow>`
       select
         id,
+        tenant_id,
+        project_id,
         knowledge_base_id,
         source_type,
         name,
@@ -1374,6 +1386,8 @@ class PostgresOperationalReadStore implements OperationalReadStore {
       const result = await sql<SourceDocumentRow>`
               select
                 id,
+                tenant_id,
+                project_id,
                 knowledge_base_id,
                 source_type,
                 name,
@@ -1446,6 +1460,8 @@ class PostgresOperationalReadStore implements OperationalReadStore {
       const result = await sql<SourceDocumentRow>`
         select
           id,
+          tenant_id,
+          project_id,
           knowledge_base_id,
           source_type,
           name,
@@ -1497,6 +1513,8 @@ class PostgresOperationalReadStore implements OperationalReadStore {
       sql<SourceDocumentRow>`
         select
           source_documents.id,
+          source_documents.tenant_id,
+          source_documents.project_id,
           source_documents.knowledge_base_id,
           source_documents.source_type,
           source_documents.name,
@@ -1603,6 +1621,8 @@ class PostgresOperationalReadStore implements OperationalReadStore {
         ? await sql<SourceDocumentRow>`
             select distinct on (metadata->>'source_path')
               id,
+              tenant_id,
+              project_id,
               knowledge_base_id,
               source_type,
               name,
@@ -1633,6 +1653,8 @@ class PostgresOperationalReadStore implements OperationalReadStore {
         : await sql<SourceDocumentRow>`
             select distinct on (metadata->>'source_path')
               id,
+              tenant_id,
+              project_id,
               knowledge_base_id,
               source_type,
               name,
@@ -1669,6 +1691,8 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     const result = await sql<SourceDocumentRow>`
       select
         id,
+        tenant_id,
+        project_id,
         knowledge_base_id,
         source_type,
         name,
@@ -1703,7 +1727,7 @@ class PostgresOperationalReadStore implements OperationalReadStore {
   ): Promise<SourceDocumentRecord | null> {
     const result = await sql<SourceDocumentRow>`
       with target_kb as (
-        select id, knowledge_base_type, upstream_knowledge_base_id
+        select id, tenant_id, project_id, knowledge_base_type, upstream_knowledge_base_id
         from knowledge_bases
         where id = ${knowledgeBaseId}
           and deleted_at is null
@@ -1712,6 +1736,16 @@ class PostgresOperationalReadStore implements OperationalReadStore {
       )
       select
         source_documents.id,
+        case
+          when source_documents.knowledge_base_id = target_kb.upstream_knowledge_base_id
+            then target_kb.tenant_id
+          else source_documents.tenant_id
+        end as tenant_id,
+        case
+          when source_documents.knowledge_base_id = target_kb.upstream_knowledge_base_id
+            then target_kb.project_id
+          else source_documents.project_id
+        end as project_id,
         case
           when source_documents.knowledge_base_id = target_kb.upstream_knowledge_base_id
             then target_kb.id
@@ -3374,6 +3408,8 @@ interface KnowledgeCheckRow {
 
 interface SourceDocumentRow {
   id: string;
+  tenant_id: string;
+  project_id: string;
   knowledge_base_id: string;
   source_type: string;
   name: string;
@@ -3887,6 +3923,8 @@ function toSourceDocumentRecord(row: SourceDocumentRow): SourceDocumentRecord {
 
   return {
     id: row.id,
+    tenantId: row.tenant_id,
+    projectId: row.project_id,
     knowledgeBaseId: row.knowledge_base_id,
     name: row.name,
     displayName: readString(metadata.display_name) ?? row.name,
