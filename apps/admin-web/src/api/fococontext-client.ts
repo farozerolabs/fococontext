@@ -18,6 +18,10 @@ export interface CleanupOperationItemListOptions {
   itemsPageSize?: number
 }
 
+export interface SourceWatchScanItemListOptions extends ListOptions {
+  itemKind?: SourceWatchScanItemKind
+}
+
 export interface FococontextApiClient {
   cancelJob(jobId: string): Promise<JobDetail>
   createKnowledgeCheck(
@@ -75,9 +79,17 @@ export interface FococontextApiClient {
     knowledgeBaseId: string
   ): Promise<DatasetConfiguration>
   getKnowledgeCheck(checkId: string): Promise<KnowledgeCheckResponse>
+  listKnowledgeCheckFindings(
+    checkId: string,
+    options?: ListOptions
+  ): Promise<KnowledgeCheckFindingListResult>
   getChangeSet(changeSetId: string): Promise<ChangeSet>
   getAdminSession(): Promise<AdminLoginResult>
   getScheduledImportJob(jobId: string): Promise<ScheduledImportJobEnvelope>
+  listScheduledImportJobItems(
+    jobId: string,
+    options?: SourceWatchScanItemListOptions
+  ): Promise<SourceWatchScanItemListResult>
   getMediaAssetPreview(mediaAssetId: string): Promise<MediaAssetPreviewEnvelope>
   getSourceDocument(documentId: string): Promise<SourceDocumentDetail>
   getSystemSettings(): Promise<SystemSettingsStatus>
@@ -1029,6 +1041,32 @@ export interface ScheduledImportJobListResult {
   pagination: Pagination
 }
 
+export type SourceWatchScanItemKind =
+  | "discovered"
+  | "skipped"
+  | "new"
+  | "changed"
+  | "unchanged"
+  | "delete_candidate"
+  | "failed"
+
+export interface SourceWatchScanItem {
+  comparison_status?: string
+  content_hash?: string
+  cursor?: Record<string, unknown>
+  item_kind: SourceWatchScanItemKind
+  payload: Record<string, unknown>
+  safe_error?: Record<string, unknown> | null
+  source_identity: string
+  source_path?: string
+  source_url?: string
+}
+
+export interface SourceWatchScanItemListResult {
+  data: SourceWatchScanItem[]
+  pagination: Pagination
+}
+
 export interface SourceWatchScan {
   changed_sources: readonly SourceWatchScanSource[]
   created_at: string
@@ -1355,23 +1393,25 @@ export interface CreateKnowledgeCheckInput {
   source_document_ids?: string[]
 }
 
+export interface KnowledgeCheckFinding {
+  affected_object_ids?: string[]
+  confidence?: number
+  evidence?: Record<string, unknown>[]
+  finding_id?: string
+  message: string
+  page_id: string | null
+  severity: "low" | "medium" | "high"
+  source_refs?: Record<string, unknown>[]
+  suggested_action?: Record<string, unknown>
+  type: KnowledgeCheckType
+}
+
 export interface KnowledgeCheckResponse {
   check_id: string
   checks: KnowledgeCheckType[]
   created_at: string
   configuration_snapshot: Record<string, unknown>
-  findings: Array<{
-    affected_object_ids?: string[]
-    confidence?: number
-    evidence?: Record<string, unknown>[]
-    finding_id?: string
-    message: string
-    page_id: string | null
-    severity: "low" | "medium" | "high"
-    source_refs?: Record<string, unknown>[]
-    suggested_action?: Record<string, unknown>
-    type: KnowledgeCheckType
-  }>
+  findings: KnowledgeCheckFinding[]
   knowledge_base_id: string
   page_ids: string[]
   progress: number
@@ -1394,6 +1434,11 @@ export interface KnowledgeCheckResponse {
   }
   status: KnowledgeCheckStatus
   updated_at: string
+}
+
+export interface KnowledgeCheckFindingListResult {
+  data: KnowledgeCheckFinding[]
+  pagination: Pagination
 }
 
 export interface RetrieveRequestInput {
@@ -2071,6 +2116,16 @@ export function createFococontextApiClient(
         `/knowledge-checks/${encodeURIComponent(checkId)}`,
         options
       ),
+    listKnowledgeCheckFindings: (checkId, listOptions = {}) =>
+      requestListJson(
+        fetchFn,
+        baseUrl,
+        appendListQuery(
+          `/knowledge-checks/${encodeURIComponent(checkId)}/findings`,
+          listOptions
+        ),
+        options
+      ),
     getChangeSet: (changeSetId) =>
       requestJson(
         fetchFn,
@@ -2085,6 +2140,16 @@ export function createFococontextApiClient(
         fetchFn,
         baseUrl,
         `/scheduled-import-jobs/${encodeURIComponent(jobId)}`,
+        options
+      ),
+    listScheduledImportJobItems: (jobId, listOptions = {}) =>
+      requestListJson(
+        fetchFn,
+        baseUrl,
+        appendSourceWatchScanItemListQuery(
+          `/scheduled-import-jobs/${encodeURIComponent(jobId)}/items`,
+          listOptions
+        ),
         options
       ),
     getMediaAssetPreview: (mediaAssetId) =>
@@ -2559,6 +2624,21 @@ function appendListQuery(path: string, options: ListOptions): string {
   }
 
   return `${path}${path.includes("?") ? "&" : "?"}${query}`
+}
+
+function appendSourceWatchScanItemListQuery(
+  path: string,
+  options: SourceWatchScanItemListOptions
+): string {
+  const basePath = appendListQuery(path, options)
+
+  if (options.itemKind === undefined) {
+    return basePath
+  }
+
+  return `${basePath}${basePath.includes("?") ? "&" : "?"}item_kind=${encodeURIComponent(
+    options.itemKind
+  )}`
 }
 
 function appendCleanupItemQuery(

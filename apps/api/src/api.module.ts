@@ -409,6 +409,7 @@ export class ApiModule implements NestModule {
         {
           provide: sourceWatchScannerToken,
           useFactory: (
+            apiDatabaseMirror: ApiDatabaseMirror,
             operationalReadStore: OperationalReadStore,
             objectStorageOperationRecorder: ObjectStorageOperationRecorder,
           ) =>
@@ -431,8 +432,21 @@ export class ApiModule implements NestModule {
               },
               comparisonWindowSize: config.limits.residualMemory.sourceWatch.windowSize,
               operationRecorder: objectStorageOperationRecorder,
+              stageScanItems: (input) =>
+                apiDatabaseMirror.saveSourceWatchScanItems({
+                  items: input.items,
+                  knowledgeBaseId: input.rule.knowledgeBaseId,
+                  now: new Date().toISOString(),
+                  scheduledImportJobId: input.scanRunId,
+                  sourceKind: input.rule.sourceKind,
+                  sourceWatchRuleId: input.rule.id,
+                }),
             }),
-          inject: [operationalReadStoreToken, objectStorageOperationRecorderToken],
+          inject: [
+            apiDatabaseMirrorToken,
+            operationalReadStoreToken,
+            objectStorageOperationRecorderToken,
+          ],
         },
         {
           provide: sourceWatchScanCoordinatorToken,

@@ -31,8 +31,10 @@ import type {
   SourceWatchRuleRecord,
   SourceWatchRuleSchedule,
   SourceWatchRuleStatus,
+  SourceWatchScanItemKind,
   SourceWatchScanResultResponse,
   SourceWatchScanStatus,
+  SourceWatchScanStageItem,
   SourceWatchScanTriggerType,
   SourceWatchSchedulerStatus,
   SourceWatchSourceKind,
@@ -60,6 +62,7 @@ import type {
 import {
   knowledgeCheckTypes,
   type KnowledgeCheckRecord,
+  type KnowledgeCheckFinding,
   type KnowledgeCheckSemanticRun,
   type KnowledgeCheckStatus,
   type KnowledgeCheckType,
@@ -102,6 +105,31 @@ export interface SourceWatchDiscoveryComparisonReadResult {
   newSources: SourceWatchDiscoveredSource[];
 }
 
+export interface SourceWatchDiscoveryWindowComparisonReadInput {
+  comparisonWindowSize?: number;
+  rule: SourceWatchRuleRecord;
+  scannedSources: readonly SourceWatchDiscoveredSource[];
+}
+
+export interface SourceWatchDiscoveryWindowComparisonReadResult {
+  changedSources: SourceWatchDiscoveredSource[];
+  newSources: SourceWatchDiscoveredSource[];
+}
+
+export interface SourceWatchMissingScanDeleteCandidateReadInput extends Omit<
+  PaginatedReadInput,
+  "knowledgeBaseId"
+> {
+  rule: SourceWatchRuleRecord;
+  scheduledImportJobId: string;
+}
+
+export interface PaginatedSourceWatchDeleteCandidateReadResult {
+  items: SourceWatchScanResultResponse["delete_candidates"];
+  total: number;
+  hasMore: boolean;
+}
+
 export interface SourceWatchFingerprintReadInput {
   knowledgeBaseId: string;
   sourcePath: string;
@@ -135,6 +163,17 @@ export interface PaginatedSourceWatchRuleReadResult {
 
 export interface PaginatedScheduledImportJobReadResult {
   items: ScheduledImportJobRecord[];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface SourceWatchScanItemReadInput extends Omit<PaginatedReadInput, "knowledgeBaseId"> {
+  itemKind?: SourceWatchScanItemKind;
+  scheduledImportJobId: string;
+}
+
+export interface PaginatedSourceWatchScanItemReadResult {
+  items: SourceWatchScanStageItem[];
   total: number;
   hasMore: boolean;
 }
@@ -178,6 +217,19 @@ export interface KnowledgeCheckReadInput extends PaginatedReadInput {
 
 export interface PaginatedKnowledgeCheckReadResult {
   items: KnowledgeCheckRecord[];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface KnowledgeCheckFindingReadInput extends Omit<
+  PaginatedReadInput,
+  "knowledgeBaseId"
+> {
+  checkId: string;
+}
+
+export interface PaginatedKnowledgeCheckFindingReadResult {
+  items: KnowledgeCheckFinding[];
   total: number;
   hasMore: boolean;
 }
@@ -256,6 +308,9 @@ export interface OperationalReadStore {
     input: KnowledgeCheckReadInput,
   ): Promise<PaginatedKnowledgeCheckReadResult | null>;
   getKnowledgeCheckById(checkId: string): Promise<KnowledgeCheckRecord | null>;
+  listKnowledgeCheckFindings(
+    input: KnowledgeCheckFindingReadInput,
+  ): Promise<PaginatedKnowledgeCheckFindingReadResult | null>;
   listJobs(input: PaginatedReadInput): Promise<PaginatedJobReadResult | null>;
   listSourceDocuments(
     input: SourceDocumentReadInput,
@@ -266,6 +321,12 @@ export interface OperationalReadStore {
   compareSourceWatchDiscoveredSources(
     input: SourceWatchDiscoveryComparisonReadInput,
   ): Promise<SourceWatchDiscoveryComparisonReadResult | null>;
+  compareSourceWatchDiscoveredSourceWindow(
+    input: SourceWatchDiscoveryWindowComparisonReadInput,
+  ): Promise<SourceWatchDiscoveryWindowComparisonReadResult | null>;
+  listSourceWatchDeleteCandidatesMissingFromScan(
+    input: SourceWatchMissingScanDeleteCandidateReadInput,
+  ): Promise<PaginatedSourceWatchDeleteCandidateReadResult | null>;
   hasMatchingSourceWatchFingerprint(
     input: SourceWatchFingerprintReadInput,
   ): Promise<boolean | null>;
@@ -317,6 +378,9 @@ export interface OperationalReadStore {
     input: Omit<PaginatedReadInput, "knowledgeBaseId">,
   ): Promise<PaginatedScheduledImportJobReadResult | null>;
   getScheduledImportJobById(jobId: string): Promise<ScheduledImportJobRecord | null>;
+  listSourceWatchScanItems(
+    input: SourceWatchScanItemReadInput,
+  ): Promise<PaginatedSourceWatchScanItemReadResult | null>;
   listWebhooks(
     scope: ApiResourceScope,
     input: Omit<PaginatedReadInput, "knowledgeBaseId">,
@@ -367,6 +431,9 @@ export function createNoopOperationalReadStore(): OperationalReadStore {
     async getKnowledgeCheckById() {
       return null;
     },
+    async listKnowledgeCheckFindings() {
+      return null;
+    },
     async getKnowledgeBaseById() {
       return null;
     },
@@ -386,6 +453,12 @@ export function createNoopOperationalReadStore(): OperationalReadStore {
       return null;
     },
     async compareSourceWatchDiscoveredSources() {
+      return null;
+    },
+    async compareSourceWatchDiscoveredSourceWindow() {
+      return null;
+    },
+    async listSourceWatchDeleteCandidatesMissingFromScan() {
       return null;
     },
     async hasMatchingSourceWatchFingerprint() {
@@ -455,6 +528,9 @@ export function createNoopOperationalReadStore(): OperationalReadStore {
       return null;
     },
     async getScheduledImportJobById() {
+      return null;
+    },
+    async listSourceWatchScanItems() {
       return null;
     },
     async listWebhooks() {
@@ -778,18 +854,37 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     const [itemsResult, totalResult] = await Promise.all([
       sql<KnowledgeCheckRow>`
         select
-          id,
-          knowledge_base_id,
-          status,
-          progress,
-          findings,
-          metadata,
-          created_at,
-          updated_at
+          knowledge_checks.id,
+          knowledge_checks.knowledge_base_id,
+          knowledge_checks.status,
+          knowledge_checks.progress,
+          knowledge_checks.findings,
+          finding_preview.findings_preview,
+          finding_count.findings_count,
+          knowledge_checks.metadata,
+          knowledge_checks.created_at,
+          knowledge_checks.updated_at
         from knowledge_checks
-        where knowledge_base_id = ${input.knowledgeBaseId}
-          and (${status}::text is null or status = ${status})
-        order by updated_at desc, id desc
+        left join lateral (
+          select coalesce(jsonb_agg(ordered.finding order by ordered.created_at asc, ordered.id asc), '[]'::jsonb) as findings_preview
+          from (
+            select id, finding, created_at
+            from knowledge_check_findings
+            where check_id = knowledge_checks.id
+              and status = 'active'
+            order by created_at asc, id asc
+            limit 100
+          ) ordered
+        ) finding_preview on true
+        left join lateral (
+          select count(*) as findings_count
+          from knowledge_check_findings
+          where check_id = knowledge_checks.id
+            and status = 'active'
+        ) finding_count on true
+        where knowledge_checks.knowledge_base_id = ${input.knowledgeBaseId}
+          and (${status}::text is null or knowledge_checks.status = ${status})
+        order by knowledge_checks.updated_at desc, knowledge_checks.id desc
         limit ${input.pageSize}
         offset ${offset}
       `.execute(this.db),
@@ -812,21 +907,72 @@ class PostgresOperationalReadStore implements OperationalReadStore {
   async getKnowledgeCheckById(checkId: string): Promise<KnowledgeCheckRecord | null> {
     const result = await sql<KnowledgeCheckRow>`
       select
-        id,
-        knowledge_base_id,
-        status,
-        progress,
-        findings,
-        metadata,
-        created_at,
-        updated_at
+        knowledge_checks.id,
+        knowledge_checks.knowledge_base_id,
+        knowledge_checks.status,
+        knowledge_checks.progress,
+        knowledge_checks.findings,
+        finding_preview.findings_preview,
+        finding_count.findings_count,
+        knowledge_checks.metadata,
+        knowledge_checks.created_at,
+        knowledge_checks.updated_at
       from knowledge_checks
-      where id = ${checkId}
+      left join lateral (
+        select coalesce(jsonb_agg(ordered.finding order by ordered.created_at asc, ordered.id asc), '[]'::jsonb) as findings_preview
+        from (
+          select id, finding, created_at
+          from knowledge_check_findings
+          where check_id = knowledge_checks.id
+            and status = 'active'
+          order by created_at asc, id asc
+          limit 100
+        ) ordered
+      ) finding_preview on true
+      left join lateral (
+        select count(*) as findings_count
+        from knowledge_check_findings
+        where check_id = knowledge_checks.id
+          and status = 'active'
+      ) finding_count on true
+      where knowledge_checks.id = ${checkId}
       limit 1
     `.execute(this.db);
     const row = result.rows[0];
 
     return row === undefined ? null : toKnowledgeCheckRecord(row);
+  }
+
+  async listKnowledgeCheckFindings(
+    input: KnowledgeCheckFindingReadInput,
+  ): Promise<PaginatedKnowledgeCheckFindingReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<{ finding: unknown }>`
+        select finding
+        from knowledge_check_findings
+        where check_id = ${input.checkId}
+          and status = 'active'
+        order by created_at asc, id asc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from knowledge_check_findings
+        where check_id = ${input.checkId}
+          and status = 'active'
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items: itemsResult.rows.map(
+        (row) => normalizeJsonObject(row.finding) as unknown as KnowledgeCheckFinding,
+      ),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
   }
 
   async listJobs(input: PaginatedReadInput): Promise<PaginatedJobReadResult> {
@@ -1251,6 +1397,151 @@ class PostgresOperationalReadStore implements OperationalReadStore {
           source_watch_source_kind: input.rule.sourceKind,
         },
       })),
+    };
+  }
+
+  async compareSourceWatchDiscoveredSourceWindow(
+    input: SourceWatchDiscoveryWindowComparisonReadInput,
+  ): Promise<SourceWatchDiscoveryWindowComparisonReadResult> {
+    const comparisonWindowSize = Math.max(1, Math.floor(input.comparisonWindowSize ?? 100));
+    const sourcePaths = input.scannedSources
+      .map((source) => source.source_path ?? source.name)
+      .filter((sourcePath, index, values) => values.indexOf(sourcePath) === index);
+    const existingForScanned: SourceDocumentRecord[] = [];
+
+    for (const sourcePathWindow of chunkArray(sourcePaths, comparisonWindowSize)) {
+      if (sourcePathWindow.length === 0) {
+        continue;
+      }
+
+      const result = await sql<SourceDocumentRow>`
+        select
+          id,
+          knowledge_base_id,
+          source_type,
+          name,
+          status,
+          content_hash,
+          object_key,
+          mime_type,
+          size_bytes::bigint as size_bytes,
+          metadata,
+          ocr_status,
+          ocr_summary,
+          visibility_origin,
+          owner_knowledge_base_id,
+          upstream_resource_id,
+          fork_tombstoned_at,
+          created_at,
+          updated_at
+        from source_documents
+        where knowledge_base_id = ${input.rule.knowledgeBaseId}
+          and owner_knowledge_base_id is null
+          and fork_tombstoned_at is null
+          and deleted_at is null
+          and status <> 'deleted'
+          and metadata->>'source_path' in (${sql.join(sourcePathWindow)})
+          and metadata->>'source_watch_rule_id' = ${input.rule.id}
+        order by lower(metadata->>'source_path') asc, updated_at desc, id desc
+      `.execute(this.db);
+
+      existingForScanned.push(...result.rows.map(toSourceDocumentRecord));
+    }
+
+    const comparison = compareDiscoveredSources(
+      input.rule,
+      existingForScanned,
+      input.scannedSources,
+    );
+
+    return {
+      changedSources: comparison.changedSources,
+      newSources: comparison.newSources,
+    };
+  }
+
+  async listSourceWatchDeleteCandidatesMissingFromScan(
+    input: SourceWatchMissingScanDeleteCandidateReadInput,
+  ): Promise<PaginatedSourceWatchDeleteCandidateReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<SourceDocumentRow>`
+        select
+          source_documents.id,
+          source_documents.knowledge_base_id,
+          source_documents.source_type,
+          source_documents.name,
+          source_documents.status,
+          source_documents.content_hash,
+          source_documents.object_key,
+          source_documents.mime_type,
+          source_documents.size_bytes::bigint as size_bytes,
+          source_documents.metadata,
+          source_documents.ocr_status,
+          source_documents.ocr_summary,
+          source_documents.visibility_origin,
+          source_documents.owner_knowledge_base_id,
+          source_documents.upstream_resource_id,
+          source_documents.fork_tombstoned_at,
+          source_documents.created_at,
+          source_documents.updated_at
+        from source_documents
+        where source_documents.knowledge_base_id = ${input.rule.knowledgeBaseId}
+          and source_documents.owner_knowledge_base_id is null
+          and source_documents.fork_tombstoned_at is null
+          and source_documents.deleted_at is null
+          and source_documents.status <> 'deleted'
+          and source_documents.metadata->>'source_path' is not null
+          and source_documents.metadata->>'source_watch_rule_id' = ${input.rule.id}
+          and not exists (
+            select 1
+            from source_watch_scan_items
+            where source_watch_scan_items.scheduled_import_job_id = ${input.scheduledImportJobId}
+              and source_watch_scan_items.item_kind = 'discovered'
+              and source_watch_scan_items.source_path = source_documents.metadata->>'source_path'
+          )
+        order by lower(source_documents.metadata->>'source_path') asc, source_documents.updated_at desc, source_documents.id desc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from source_documents
+        where source_documents.knowledge_base_id = ${input.rule.knowledgeBaseId}
+          and source_documents.owner_knowledge_base_id is null
+          and source_documents.fork_tombstoned_at is null
+          and source_documents.deleted_at is null
+          and source_documents.status <> 'deleted'
+          and source_documents.metadata->>'source_path' is not null
+          and source_documents.metadata->>'source_watch_rule_id' = ${input.rule.id}
+          and not exists (
+            select 1
+            from source_watch_scan_items
+            where source_watch_scan_items.scheduled_import_job_id = ${input.scheduledImportJobId}
+              and source_watch_scan_items.item_kind = 'discovered'
+              and source_watch_scan_items.source_path = source_documents.metadata->>'source_path'
+          )
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+    const items = itemsResult.rows.map((row) => {
+      const document = toSourceDocumentRecord(row);
+
+      return {
+        document_id: document.id,
+        source_path: document.sourcePath ?? document.name,
+        reason: "missing_from_source",
+        metadata: {
+          source_watch_rule_id: input.rule.id,
+          source_watch_source_kind: input.rule.sourceKind,
+        },
+      };
+    });
+
+    return {
+      items,
+      total,
+      hasMore: offset + input.pageSize < total,
     };
   }
 
@@ -2113,25 +2404,45 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     const [itemsResult, totalResult] = await Promise.all([
       sql<ScheduledImportJobRow>`
         select
-          id,
-          source_watch_rule_id,
-          knowledge_base_id,
-          status,
-          trigger_type,
-          scan_result,
-          started_at,
-          finished_at,
-          duration_ms,
-          retry_count,
-          retryable,
-          next_retry_at,
-          error,
-          scheduled_for,
-          created_at,
-          updated_at
+          scheduled_import_jobs.id,
+          scheduled_import_jobs.source_watch_rule_id,
+          scheduled_import_jobs.knowledge_base_id,
+          scheduled_import_jobs.status,
+          scheduled_import_jobs.trigger_type,
+          scheduled_import_jobs.scan_result,
+          staged_scan.scan_result_preview,
+          staged_scan.staged_item_count,
+          scheduled_import_jobs.started_at,
+          scheduled_import_jobs.finished_at,
+          scheduled_import_jobs.duration_ms,
+          scheduled_import_jobs.retry_count,
+          scheduled_import_jobs.retryable,
+          scheduled_import_jobs.next_retry_at,
+          scheduled_import_jobs.error,
+          scheduled_import_jobs.scheduled_for,
+          scheduled_import_jobs.created_at,
+          scheduled_import_jobs.updated_at
         from scheduled_import_jobs
-        where source_watch_rule_id = ${ruleId}
-        order by updated_at desc, id desc
+        left join lateral (
+          select
+            jsonb_build_object(
+              'new_sources', coalesce(jsonb_agg(payload order by updated_at desc, id desc) filter (where item_kind = 'new'), '[]'::jsonb),
+              'changed_sources', coalesce(jsonb_agg(payload order by updated_at desc, id desc) filter (where item_kind = 'changed'), '[]'::jsonb),
+              'delete_candidates', coalesce(jsonb_agg(payload order by updated_at desc, id desc) filter (where item_kind = 'delete_candidate'), '[]'::jsonb),
+              'skipped', coalesce(jsonb_agg(payload order by updated_at desc, id desc) filter (where item_kind in ('skipped', 'failed')), '[]'::jsonb)
+            ) as scan_result_preview,
+            count(*) as staged_item_count
+          from (
+            select id, item_kind, payload, updated_at
+            from source_watch_scan_items
+            where scheduled_import_job_id = scheduled_import_jobs.id
+              and item_kind in ('new', 'changed', 'delete_candidate', 'skipped', 'failed')
+            order by updated_at desc, id desc
+            limit 400
+          ) staged_items
+        ) staged_scan on true
+        where scheduled_import_jobs.source_watch_rule_id = ${ruleId}
+        order by scheduled_import_jobs.updated_at desc, scheduled_import_jobs.id desc
         limit ${input.pageSize}
         offset ${offset}
       `.execute(this.db),
@@ -2153,29 +2464,90 @@ class PostgresOperationalReadStore implements OperationalReadStore {
   async getScheduledImportJobById(jobId: string): Promise<ScheduledImportJobRecord | null> {
     const result = await sql<ScheduledImportJobRow>`
       select
-        id,
-        source_watch_rule_id,
-        knowledge_base_id,
-        status,
-        trigger_type,
-        scan_result,
-        started_at,
-        finished_at,
-        duration_ms,
-        retry_count,
-        retryable,
-        next_retry_at,
-        error,
-        scheduled_for,
-        created_at,
-        updated_at
+        scheduled_import_jobs.id,
+        scheduled_import_jobs.source_watch_rule_id,
+        scheduled_import_jobs.knowledge_base_id,
+        scheduled_import_jobs.status,
+        scheduled_import_jobs.trigger_type,
+        scheduled_import_jobs.scan_result,
+        staged_scan.scan_result_preview,
+        staged_scan.staged_item_count,
+        scheduled_import_jobs.started_at,
+        scheduled_import_jobs.finished_at,
+        scheduled_import_jobs.duration_ms,
+        scheduled_import_jobs.retry_count,
+        scheduled_import_jobs.retryable,
+        scheduled_import_jobs.next_retry_at,
+        scheduled_import_jobs.error,
+        scheduled_import_jobs.scheduled_for,
+        scheduled_import_jobs.created_at,
+        scheduled_import_jobs.updated_at
       from scheduled_import_jobs
-      where id = ${jobId}
+      left join lateral (
+        select
+          jsonb_build_object(
+            'new_sources', coalesce(jsonb_agg(payload order by updated_at desc, id desc) filter (where item_kind = 'new'), '[]'::jsonb),
+            'changed_sources', coalesce(jsonb_agg(payload order by updated_at desc, id desc) filter (where item_kind = 'changed'), '[]'::jsonb),
+            'delete_candidates', coalesce(jsonb_agg(payload order by updated_at desc, id desc) filter (where item_kind = 'delete_candidate'), '[]'::jsonb),
+            'skipped', coalesce(jsonb_agg(payload order by updated_at desc, id desc) filter (where item_kind in ('skipped', 'failed')), '[]'::jsonb)
+          ) as scan_result_preview,
+          count(*) as staged_item_count
+        from (
+          select id, item_kind, payload, updated_at
+          from source_watch_scan_items
+          where scheduled_import_job_id = scheduled_import_jobs.id
+            and item_kind in ('new', 'changed', 'delete_candidate', 'skipped', 'failed')
+          order by updated_at desc, id desc
+          limit 400
+        ) staged_items
+      ) staged_scan on true
+      where scheduled_import_jobs.id = ${jobId}
       limit 1
     `.execute(this.db);
     const row = result.rows[0];
 
     return row === undefined ? null : toScheduledImportJobRecord(row);
+  }
+
+  async listSourceWatchScanItems(
+    input: SourceWatchScanItemReadInput,
+  ): Promise<PaginatedSourceWatchScanItemReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const itemKindPredicate =
+      input.itemKind === undefined ? sql`true` : sql`item_kind = ${input.itemKind}`;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<SourceWatchScanItemRow>`
+        select
+          item_kind,
+          comparison_status,
+          content_hash,
+          cursor,
+          payload,
+          safe_error,
+          source_identity,
+          source_path,
+          source_url
+        from source_watch_scan_items
+        where scheduled_import_job_id = ${input.scheduledImportJobId}
+          and ${itemKindPredicate}
+        order by updated_at desc, id desc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from source_watch_scan_items
+        where scheduled_import_job_id = ${input.scheduledImportJobId}
+          and ${itemKindPredicate}
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items: itemsResult.rows.map(toSourceWatchScanStageItem),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
   }
 
   async listWebhooks(
@@ -2881,6 +3253,8 @@ interface KnowledgeCheckRow {
   status: string;
   progress: number;
   findings: unknown;
+  findings_count?: string | number | bigint | null;
+  findings_preview?: unknown;
   metadata: unknown;
   created_at: unknown;
   updated_at: unknown;
@@ -3032,6 +3406,8 @@ interface ScheduledImportJobRow {
   status: string;
   trigger_type: string;
   scan_result: unknown;
+  scan_result_preview?: unknown;
+  staged_item_count?: string | number | bigint | null;
   started_at: unknown;
   finished_at: unknown;
   duration_ms: number | null;
@@ -3042,6 +3418,18 @@ interface ScheduledImportJobRow {
   scheduled_for: unknown;
   created_at: unknown;
   updated_at: unknown;
+}
+
+interface SourceWatchScanItemRow {
+  item_kind: string;
+  comparison_status: string | null;
+  content_hash: string | null;
+  cursor: unknown;
+  payload: unknown;
+  safe_error: unknown;
+  source_identity: string;
+  source_path: string | null;
+  source_url: string | null;
 }
 
 interface WebhookRow {
@@ -3262,6 +3650,11 @@ function createEmptyRuntimeSourceJobSummary(): RuntimeSourceJobSummary {
 
 function toKnowledgeCheckRecord(row: KnowledgeCheckRow): KnowledgeCheckRecord {
   const metadata = normalizeJsonObject(row.metadata);
+  const persistedFindings = readJsonArray(row.findings_preview);
+  const fallbackFindings = readJsonArray(row.findings);
+  const findings = persistedFindings.length > 0 ? persistedFindings : fallbackFindings;
+  const semanticRun = readKnowledgeCheckSemanticRun(metadata.semantic_run);
+  const persistedFindingsCount = readCount(row.findings_count ?? undefined);
 
   return {
     id: row.id,
@@ -3271,8 +3664,12 @@ function toKnowledgeCheckRecord(row: KnowledgeCheckRow): KnowledgeCheckRecord {
     checks: readKnowledgeCheckArray(metadata.checks),
     pageIds: readStringArray(metadata.page_ids),
     sourceDocumentIds: readStringArray(metadata.source_document_ids),
-    findings: readJsonArray(row.findings) as KnowledgeCheckRecord["findings"],
-    semanticRun: readKnowledgeCheckSemanticRun(metadata.semantic_run),
+    findings: findings as KnowledgeCheckRecord["findings"],
+    semanticRun: {
+      ...semanticRun,
+      findings_count:
+        persistedFindingsCount > 0 ? persistedFindingsCount : semanticRun.findings_count,
+    },
     configurationSnapshot: normalizeJsonObject(metadata.configuration_snapshot),
     createdAt: normalizeTimestamp(row.created_at),
     updatedAt: normalizeTimestamp(row.updated_at),
@@ -3513,13 +3910,17 @@ function toSourceWatchRuleRecord(row: SourceWatchRuleRow): SourceWatchRuleRecord
 }
 
 function toScheduledImportJobRecord(row: ScheduledImportJobRow): ScheduledImportJobRecord {
+  const stagedItemCount = readCount(row.staged_item_count ?? undefined);
+
   return {
     id: row.id,
     sourceWatchRuleId: row.source_watch_rule_id ?? "",
     knowledgeBaseId: row.knowledge_base_id,
     status: readSourceWatchScanStatus(row.status),
     triggerType: readSourceWatchScanTriggerType(row.trigger_type),
-    scanResult: readSourceWatchScanResult(row.scan_result),
+    scanResult: readSourceWatchScanResult(
+      stagedItemCount > 0 ? row.scan_result_preview : row.scan_result,
+    ),
     startedAt: normalizeTimestamp(row.started_at ?? row.created_at),
     finishedAt: normalizeNullableTimestamp(row.finished_at),
     durationMs: row.duration_ms,
@@ -3530,6 +3931,20 @@ function toScheduledImportJobRecord(row: ScheduledImportJobRow): ScheduledImport
     scheduledFor: normalizeNullableTimestamp(row.scheduled_for),
     createdAt: normalizeTimestamp(row.created_at),
     updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toSourceWatchScanStageItem(row: SourceWatchScanItemRow): SourceWatchScanStageItem {
+  return {
+    item_kind: readSourceWatchScanItemKind(row.item_kind),
+    payload: normalizeJsonObject(row.payload),
+    source_identity: row.source_identity,
+    ...(row.comparison_status === null ? {} : { comparison_status: row.comparison_status }),
+    ...(row.content_hash === null ? {} : { content_hash: row.content_hash }),
+    ...(row.source_path === null ? {} : { source_path: row.source_path }),
+    ...(row.source_url === null ? {} : { source_url: row.source_url }),
+    cursor: normalizeJsonObject(row.cursor),
+    safe_error: normalizeNullableJsonObject(row.safe_error),
   };
 }
 
@@ -3758,6 +4173,21 @@ function readSourceWatchScanTriggerType(value: unknown): SourceWatchScanTriggerT
   }
 
   return "manual";
+}
+
+function readSourceWatchScanItemKind(value: unknown): SourceWatchScanItemKind {
+  if (
+    value === "skipped" ||
+    value === "new" ||
+    value === "changed" ||
+    value === "unchanged" ||
+    value === "delete_candidate" ||
+    value === "failed"
+  ) {
+    return value;
+  }
+
+  return "discovered";
 }
 
 function readSourceWatchLatestScan(value: unknown): SourceWatchLatestScanResponse | null {

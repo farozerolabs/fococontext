@@ -3360,6 +3360,54 @@ export const openApiComponents = {
       additionalProperties: true,
       description: "Source Watch scan history and import preview record.",
     },
+    SourceWatchScanItem: {
+      type: "object",
+      additionalProperties: true,
+      description:
+        "Persisted Source Watch staging item for scan details and large-scan pagination.",
+      required: ["item_kind", "payload", "source_identity"],
+      properties: {
+        item_kind: {
+          type: "string",
+          enum: [
+            "discovered",
+            "skipped",
+            "new",
+            "changed",
+            "unchanged",
+            "delete_candidate",
+            "failed",
+          ],
+        },
+        source_identity: {
+          type: "string",
+        },
+        source_path: {
+          type: "string",
+        },
+        source_url: {
+          type: "string",
+        },
+        content_hash: {
+          type: "string",
+        },
+        comparison_status: {
+          type: "string",
+        },
+        cursor: {
+          type: "object",
+          additionalProperties: true,
+        },
+        payload: {
+          type: "object",
+          additionalProperties: true,
+        },
+        safe_error: {
+          type: ["object", "null"],
+          additionalProperties: true,
+        },
+      },
+    },
     GraphNode: {
       type: "object",
       required: ["page_id", "title", "type", "source_refs"],
@@ -6011,6 +6059,42 @@ export const openApiPaths = {
       },
     },
   },
+  "/scheduled-import-jobs/{scheduled_import_job_id}/items": {
+    get: {
+      summary: "List scheduled import job scan items",
+      description:
+        "Returns persisted Source Watch scan staging items with pagination for large discovery and comparison runs.",
+      operationId: "listScheduledImportJobScanItems",
+      parameters: [
+        ...paginationParameters,
+        {
+          name: "item_kind",
+          in: "query",
+          required: false,
+          description: "Optional Source Watch staging item kind filter.",
+          schema: {
+            type: "string",
+            enum: [
+              "discovered",
+              "skipped",
+              "new",
+              "changed",
+              "unchanged",
+              "delete_candidate",
+              "failed",
+            ],
+          },
+        },
+      ],
+      responses: {
+        "200": listJsonResponse(
+          "Source Watch scan staging items.",
+          "#/components/schemas/SourceWatchScanItem",
+        ),
+        ...standardErrorResponses,
+      },
+    },
+  },
   "/knowledge-bases/{knowledge_base_id}/knowledge-checks": {
     post: {
       summary: "Create a knowledge check",
@@ -6035,6 +6119,22 @@ export const openApiPaths = {
       operationId: "getKnowledgeCheck",
       responses: {
         "200": jsonResponse("Knowledge Check detail.", "#/components/schemas/KnowledgeCheck"),
+        ...standardErrorResponses,
+      },
+    },
+  },
+  "/knowledge-checks/{check_id}/findings": {
+    get: {
+      summary: "List knowledge check findings",
+      description:
+        "Returns persisted Knowledge Check findings through stable pagination while the Knowledge Check detail response keeps a bounded preview.",
+      operationId: "listKnowledgeCheckFindings",
+      parameters: paginationParameters,
+      responses: {
+        "200": listJsonResponse(
+          "Knowledge Check findings.",
+          "#/components/schemas/KnowledgeCheckFinding",
+        ),
         ...standardErrorResponses,
       },
     },

@@ -23,6 +23,10 @@ export interface CleanupOperationItemListOptions extends RequestOptions {
   itemsPageSize?: number;
 }
 
+export interface SourceWatchScanItemListOptions extends ListOptions {
+  item_kind?: SourceWatchScanItemKind;
+}
+
 export interface UploadSourceDocumentInput extends RequestOptions {
   file: Blob;
   name?: string;
@@ -448,6 +452,28 @@ export interface ForkSubmissionResponse extends JsonObject {
   job: JsonObject;
   upstream_knowledge_base_id: string | null;
 }
+
+export type SourceWatchScanItemKind =
+  | "discovered"
+  | "skipped"
+  | "new"
+  | "changed"
+  | "unchanged"
+  | "delete_candidate"
+  | "failed";
+
+export interface SourceWatchScanItem extends JsonObject {
+  comparison_status?: string;
+  content_hash?: string;
+  cursor?: JsonObject;
+  item_kind: SourceWatchScanItemKind;
+  payload: JsonObject;
+  safe_error?: JsonObject | null;
+  source_identity: string;
+  source_path?: string;
+  source_url?: string;
+}
+
 export type KnowledgeCheckType =
   | "orphan_pages"
   | "broken_wikilinks"
@@ -1858,6 +1884,17 @@ export class FococontextClient {
     return this.getJson(`/scheduled-import-jobs/${encodePath(jobId)}`, options);
   }
 
+  listScheduledImportJobItems<TItem = SourceWatchScanItem>(
+    jobId: string,
+    options: SourceWatchScanItemListOptions = {},
+  ): Promise<ListResult<TItem>> {
+    return this.requestList(
+      `/scheduled-import-jobs/${encodePath(jobId)}/items`,
+      toPageQuery(options),
+      options,
+    );
+  }
+
   listSourceWatchScanHistory<TItem = JsonObject>(
     ruleId: string,
     options: ListOptions = {},
@@ -1900,6 +1937,17 @@ export class FococontextClient {
     options: RequestOptions = {},
   ): Promise<TData> {
     return this.getJson(`/knowledge-checks/${encodePath(checkId)}`, options);
+  }
+
+  listKnowledgeCheckFindings<TItem = KnowledgeCheckFinding>(
+    checkId: string,
+    options: ListOptions = {},
+  ): Promise<ListResult<TItem>> {
+    return this.requestList(
+      `/knowledge-checks/${encodePath(checkId)}/findings`,
+      toPageQuery(options),
+      options,
+    );
   }
 
   listKnowledgeBaseVersions<TItem = JsonObject>(

@@ -97,3 +97,11 @@ export interface KnowledgeCheckResponse {
   created_at: string;
   updated_at: string;
 }
+
+export interface ListKnowledgeCheckFindingsResult {
+  items: readonly KnowledgeCheckFinding[];
+  page: number;
+  pageSize: number;
+  total: number;
+  hasMore: boolean;
+}

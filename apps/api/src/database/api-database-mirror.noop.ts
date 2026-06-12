@@ -30,11 +30,22 @@ export function createNoopApiDatabaseMirror(): ApiDatabaseMirror {
     async saveSourceWatchRule() {},
     async updateSourceWatchRule() {},
     async saveScheduledImportJob() {},
+    async saveSourceWatchScanItems() {},
     async saveWebhook() {},
     async saveWebhookDelivery() {},
     async saveKnowledgeCheck() {},
+    async cleanupExpiredMaintenanceIntermediateState() {
+      return {
+        knowledgeCheckFindings: 0,
+        knowledgeCheckWindowCheckpoints: 0,
+        sourceWatchScanItems: 0,
+      };
+    },
     async createOrReuseBackgroundOperationCheckpoint(input) {
       return createNoopBackgroundOperationCheckpoint(input);
+    },
+    async getBackgroundOperationCheckpointById() {
+      return null;
     },
     async markBackgroundOperationCheckpointRunning(input) {
       return createNoopBackgroundOperationCheckpoint({

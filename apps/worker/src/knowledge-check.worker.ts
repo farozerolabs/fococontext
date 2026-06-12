@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { Worker } from "bullmq";
 import { sql, type Kysely } from "kysely";
@@ -75,8 +75,10 @@ export interface WorkerKnowledgeCheckFinding {
 export interface WorkerKnowledgeCheckSemanticRun {
   failure_reason?: string;
   findings_count: number;
+  output_status?: "succeeded" | "failed";
   repair_attempts: number;
   status: "skipped" | "completed" | "partial" | "failed";
+  structured_output_mode?: "strict_json_schema" | "json_object_fallback";
   trace?: Record<string, unknown>;
 }
 
@@ -121,6 +123,11 @@ export interface WorkerKnowledgeCheckRelatedSummary {
   relationTypes: string[];
 }
 
+export interface WorkerKnowledgeCheckWindowCheckpoint {
+  retryEligible: boolean;
+  status: string;
+}
+
 export interface ListKnowledgeCheckPagesInput {
   check: WorkerKnowledgeCheckRecord;
   cursor: WorkerKnowledgeCheckPageCursor | null;
@@ -135,13 +142,12 @@ export interface KnowledgeCheckStore {
   }): Promise<WorkerKnowledgeCheckRecord>;
   updateCheckProgress(input: {
     check: WorkerKnowledgeCheckRecord;
-    findings: readonly WorkerKnowledgeCheckFinding[];
     progress: number;
     now: string;
   }): Promise<WorkerKnowledgeCheckRecord>;
   markCheckCompleted(input: {
     check: WorkerKnowledgeCheckRecord;
-    findings: readonly WorkerKnowledgeCheckFinding[];
+    findingsPreview: readonly WorkerKnowledgeCheckFinding[];
     semanticRun: WorkerKnowledgeCheckSemanticRun;
     now: string;
   }): Promise<WorkerKnowledgeCheckRecord>;
@@ -163,6 +169,34 @@ export interface KnowledgeCheckStore {
   listDuplicateTitleFindings(
     check: WorkerKnowledgeCheckRecord,
   ): Promise<WorkerKnowledgeCheckFinding[]>;
+  countFindings(checkId: string): Promise<number>;
+  listFindings(checkId: string, limit: number): Promise<WorkerKnowledgeCheckFinding[]>;
+  saveFindings(input: {
+    check: WorkerKnowledgeCheckRecord;
+    findings: readonly WorkerKnowledgeCheckFinding[];
+    modelTrace?: Record<string, unknown>;
+    now: string;
+    stage: string;
+  }): Promise<number>;
+  saveWindowCheckpoint(input: {
+    attemptSummary?: Record<string, unknown>;
+    check: WorkerKnowledgeCheckRecord;
+    cursor?: Record<string, unknown>;
+    promptConfigHash?: string | null;
+    providerMetadata?: Record<string, unknown>;
+    retryEligible: boolean;
+    safeError?: Record<string, unknown> | null;
+    stage: string;
+    status: string;
+    structuredOutputMode?: string | null;
+    windowKey: string;
+    now: string;
+  }): Promise<void>;
+  getWindowCheckpoint(input: {
+    checkId: string;
+    stage: string;
+    windowKey: string;
+  }): Promise<WorkerKnowledgeCheckWindowCheckpoint | null>;
   resolveKnowledgeBaseScope(knowledgeBaseId: string): Promise<TenantProjectScope>;
 }
 
@@ -234,14 +268,16 @@ export class KnowledgeCheckProcessor {
       });
       let processed = resumeState.processed;
       let cursor = resumeState.cursor;
-      const findings: WorkerKnowledgeCheckFinding[] =
-        processed > 0
-          ? [...running.findings]
-          : [
-              ...(running.checks.includes("duplicate_candidates")
-                ? await this.store.listDuplicateTitleFindings(running)
-                : []),
-            ];
+      let findingsCount = await this.store.countFindings(running.id);
+
+      if (processed === 0 && running.checks.includes("duplicate_candidates")) {
+        findingsCount = await this.store.saveFindings({
+          check: running,
+          findings: await this.store.listDuplicateTitleFindings(running),
+          now: this.now(),
+          stage: "structural",
+        });
+      }
 
       while (processed < total || cursor !== null) {
         const batch = await this.store.listTargetPages({
@@ -265,20 +301,25 @@ export class KnowledgeCheckProcessor {
             )
           : new Set<string>();
 
-        findings.push(
-          ...createStructuralFindings({
-            checks: running.checks,
-            existingPageKeys,
-            pages: batch.items,
-            relatedSummaries,
-          }),
-        );
+        const batchFindings = createStructuralFindings({
+          checks: running.checks,
+          existingPageKeys,
+          pages: batch.items,
+          relatedSummaries,
+        });
+
+        findingsCount = await this.store.saveFindings({
+          check: running,
+          findings: batchFindings,
+          now: this.now(),
+          stage: "structural",
+        });
         processed += batch.items.length;
         const lastPage = batch.items.at(-1);
         await saveKnowledgeCheckCheckpointProgress({
           checkpoint,
           cursor: batch.nextCursor,
-          findingsCount: findings.length,
+          findingsCount,
           lastItemId: lastPage?.id ?? null,
           now: this.now(),
           processed,
@@ -288,7 +329,6 @@ export class KnowledgeCheckProcessor {
 
         await this.store.updateCheckProgress({
           check: running,
-          findings,
           now: this.now(),
           progress: calculateProgress(processed, total),
         });
@@ -296,15 +336,50 @@ export class KnowledgeCheckProcessor {
         cursor = batch.nextCursor;
       }
 
+      const semanticWindowCheckpoint = await this.getSemanticWindowCheckpoint(running);
+      const semanticWindowCompleted =
+        semanticWindowCheckpoint !== null && isCompletedWindowCheckpoint(semanticWindowCheckpoint);
+      const semanticRun = this.createSemanticRun({
+        check: running,
+        checkpointCompleted: semanticWindowCompleted,
+        findingsCount,
+      });
+
+      if (
+        running.checks.some((check) => semanticCheckTypes.has(check)) &&
+        !semanticWindowCompleted
+      ) {
+        await this.store.saveWindowCheckpoint({
+          attemptSummary: {
+            repair_attempts: semanticRun.repair_attempts,
+            structured_output_final_status: semanticRun.output_status ?? null,
+          },
+          check: running,
+          providerMetadata: semanticRun.trace ?? {},
+          retryEligible: semanticRun.status === "failed" || semanticRun.status === "partial",
+          safeError:
+            semanticRun.failure_reason === undefined
+              ? null
+              : {
+                  message: semanticRun.failure_reason,
+                },
+          stage: "semantic",
+          status: semanticRun.status,
+          structuredOutputMode: semanticRun.structured_output_mode ?? null,
+          windowKey: "semantic-summary",
+          now: this.now(),
+        });
+      }
+
       const completed = await this.store.markCheckCompleted({
         check: running,
-        findings,
+        findingsPreview: await this.store.listFindings(running.id, 100),
         now: this.now(),
-        semanticRun: createWorkerSemanticRun(running.checks, findings.length),
+        semanticRun,
       });
       await markKnowledgeCheckCheckpointCompleted({
         checkpoint,
-        findingsCount: completed.findings.length,
+        findingsCount,
         lastItemId: completed.findings.at(-1)?.page_id ?? null,
         now: this.now(),
         processed,
@@ -317,7 +392,7 @@ export class KnowledgeCheckProcessor {
         knowledgeBaseId: completed.knowledgeBaseId,
         payload: {
           check_id: completed.id,
-          finding_count: completed.findings.length,
+          finding_count: findingsCount,
           semantic_status: completed.semanticRun.status,
           status: completed.status,
         },
@@ -346,6 +421,38 @@ export class KnowledgeCheckProcessor {
   private now(): string {
     return (this.options.now ?? (() => new Date()))().toISOString();
   }
+
+  private async getSemanticWindowCheckpoint(
+    check: WorkerKnowledgeCheckRecord,
+  ): Promise<WorkerKnowledgeCheckWindowCheckpoint | null> {
+    if (!check.checks.some((checkType) => semanticCheckTypes.has(checkType))) {
+      return null;
+    }
+
+    return this.store.getWindowCheckpoint({
+      checkId: check.id,
+      stage: "semantic",
+      windowKey: "semantic-summary",
+    });
+  }
+
+  private createSemanticRun(input: {
+    check: WorkerKnowledgeCheckRecord;
+    checkpointCompleted: boolean;
+    findingsCount: number;
+  }): WorkerKnowledgeCheckSemanticRun {
+    if (!input.check.checks.some((check) => semanticCheckTypes.has(check))) {
+      return createWorkerSemanticRun(input.check.checks, input.findingsCount);
+    }
+
+    if (input.checkpointCompleted) {
+      return input.check.semanticRun.status === "skipped"
+        ? createWorkerSemanticRun(input.check.checks, input.findingsCount)
+        : input.check.semanticRun;
+    }
+
+    return createWorkerSemanticRun(input.check.checks, input.findingsCount);
+  }
 }
 
 export class PostgresKnowledgeCheckStore implements KnowledgeCheckStore {
@@ -360,7 +467,13 @@ export class PostgresKnowledgeCheckStore implements KnowledgeCheckStore {
     `.execute(this.db);
     const row = result.rows[0];
 
-    return row === undefined ? undefined : toWorkerKnowledgeCheckRecord(row);
+    if (row === undefined) {
+      return undefined;
+    }
+    return {
+      ...toWorkerKnowledgeCheckRecord(row),
+      findings: await this.listFindings(row.id, 100),
+    };
   }
 
   async markCheckRunning(input: {
@@ -377,22 +490,23 @@ export class PostgresKnowledgeCheckStore implements KnowledgeCheckStore {
 
   async updateCheckProgress(input: {
     check: WorkerKnowledgeCheckRecord;
-    findings: readonly WorkerKnowledgeCheckFinding[];
     progress: number;
     now: string;
   }): Promise<WorkerKnowledgeCheckRecord> {
+    const findingsPreview = await this.listFindings(input.check.id, 100);
+
     return this.saveCheck({
       ...input.check,
       status: "running",
       progress: input.progress,
-      findings: [...input.findings],
+      findings: findingsPreview,
       updatedAt: input.now,
     });
   }
 
   async markCheckCompleted(input: {
     check: WorkerKnowledgeCheckRecord;
-    findings: readonly WorkerKnowledgeCheckFinding[];
+    findingsPreview: readonly WorkerKnowledgeCheckFinding[];
     semanticRun: WorkerKnowledgeCheckSemanticRun;
     now: string;
   }): Promise<WorkerKnowledgeCheckRecord> {
@@ -400,7 +514,7 @@ export class PostgresKnowledgeCheckStore implements KnowledgeCheckStore {
       ...input.check,
       status: "completed",
       progress: 100,
-      findings: [...input.findings],
+      findings: [...input.findingsPreview],
       semanticRun: input.semanticRun,
       updatedAt: input.now,
     });
@@ -620,6 +734,219 @@ export class PostgresKnowledgeCheckStore implements KnowledgeCheckStore {
         },
       }),
     );
+  }
+
+  async countFindings(checkId: string): Promise<number> {
+    const result = await sql<{ total: string | number | bigint }>`
+      select count(*) as total
+      from knowledge_check_findings
+      where check_id = ${checkId}
+        and status = 'active'
+    `.execute(this.db);
+
+    return readCount(result.rows[0]?.total);
+  }
+
+  async listFindings(checkId: string, limit: number): Promise<WorkerKnowledgeCheckFinding[]> {
+    const result = await sql<{ finding: unknown }>`
+      select finding
+      from knowledge_check_findings
+      where check_id = ${checkId}
+        and status = 'active'
+      order by created_at asc, id asc
+      limit ${Math.max(1, limit)}
+    `.execute(this.db);
+
+    return result.rows.map(
+      (row) => normalizeRecord(row.finding) as unknown as WorkerKnowledgeCheckFinding,
+    );
+  }
+
+  async saveFindings(input: {
+    check: WorkerKnowledgeCheckRecord;
+    findings: readonly WorkerKnowledgeCheckFinding[];
+    modelTrace?: Record<string, unknown>;
+    now: string;
+    stage: string;
+  }): Promise<number> {
+    if (input.findings.length === 0) {
+      return this.countFindings(input.check.id);
+    }
+    const scope = await this.resolveKnowledgeBaseScope(input.check.knowledgeBaseId);
+
+    for (const finding of input.findings) {
+      const dedupeKey = createKnowledgeCheckFindingDedupeKey(input.check.id, finding);
+      const findingId = finding.finding_id ?? `finding_${dedupeKey.slice(0, 32)}`;
+
+      await sql`
+        insert into knowledge_check_findings (
+          id,
+          tenant_id,
+          project_id,
+          knowledge_base_id,
+          check_id,
+          finding_type,
+          severity,
+          page_id,
+          affected_object_ids,
+          message,
+          confidence,
+          evidence,
+          source_refs,
+          suggested_action,
+          finding,
+          stage,
+          status,
+          model_trace,
+          dedupe_key,
+          updated_at
+        )
+        values (
+          ${findingId},
+          ${scope.tenantId},
+          ${scope.projectId},
+          ${input.check.knowledgeBaseId},
+          ${input.check.id},
+          ${finding.type},
+          ${finding.severity},
+          ${finding.page_id},
+          ${finding.affected_object_ids ?? []}::text[],
+          ${finding.message},
+          ${finding.confidence ?? null},
+          ${JSON.stringify(finding.evidence ?? [])}::jsonb,
+          ${JSON.stringify(finding.source_refs ?? [])}::jsonb,
+          ${JSON.stringify(finding.suggested_action ?? {})}::jsonb,
+          ${JSON.stringify({ ...finding, finding_id: findingId })}::jsonb,
+          ${input.stage},
+          'active',
+          ${JSON.stringify(input.modelTrace ?? {})}::jsonb,
+          ${dedupeKey},
+          ${input.now}
+        )
+        on conflict (check_id, dedupe_key) do update set
+          severity = excluded.severity,
+          page_id = excluded.page_id,
+          affected_object_ids = excluded.affected_object_ids,
+          message = excluded.message,
+          confidence = excluded.confidence,
+          evidence = excluded.evidence,
+          source_refs = excluded.source_refs,
+          suggested_action = excluded.suggested_action,
+          finding = excluded.finding,
+          stage = excluded.stage,
+          status = excluded.status,
+          model_trace = excluded.model_trace,
+          updated_at = excluded.updated_at
+      `.execute(this.db);
+    }
+
+    const findingsCount = await this.countFindings(input.check.id);
+    const findingsPreview = await this.listFindings(input.check.id, 100);
+
+    await this.saveCheck({
+      ...input.check,
+      findings: findingsPreview,
+      updatedAt: input.now,
+    });
+
+    return findingsCount;
+  }
+
+  async saveWindowCheckpoint(input: {
+    attemptSummary?: Record<string, unknown>;
+    check: WorkerKnowledgeCheckRecord;
+    cursor?: Record<string, unknown>;
+    promptConfigHash?: string | null;
+    providerMetadata?: Record<string, unknown>;
+    retryEligible: boolean;
+    safeError?: Record<string, unknown> | null;
+    stage: string;
+    status: string;
+    structuredOutputMode?: string | null;
+    windowKey: string;
+    now: string;
+  }): Promise<void> {
+    const scope = await this.resolveKnowledgeBaseScope(input.check.knowledgeBaseId);
+    const checkpointId = createKnowledgeCheckWindowCheckpointId({
+      checkId: input.check.id,
+      stage: input.stage,
+      windowKey: input.windowKey,
+    });
+
+    await sql`
+      insert into knowledge_check_window_checkpoints (
+        id,
+        tenant_id,
+        project_id,
+        knowledge_base_id,
+        check_id,
+        stage,
+        window_key,
+        cursor,
+        prompt_config_hash,
+        provider_metadata,
+        structured_output_mode,
+        attempt_summary,
+        status,
+        retry_eligible,
+        safe_error,
+        updated_at
+      )
+      values (
+        ${checkpointId},
+        ${scope.tenantId},
+        ${scope.projectId},
+        ${input.check.knowledgeBaseId},
+        ${input.check.id},
+        ${input.stage},
+        ${input.windowKey},
+        ${JSON.stringify(input.cursor ?? {})}::jsonb,
+        ${input.promptConfigHash ?? null},
+        ${JSON.stringify(input.providerMetadata ?? {})}::jsonb,
+        ${input.structuredOutputMode ?? null},
+        ${JSON.stringify(input.attemptSummary ?? {})}::jsonb,
+        ${input.status},
+        ${input.retryEligible},
+        ${input.safeError === null || input.safeError === undefined ? null : JSON.stringify(input.safeError)}::jsonb,
+        ${input.now}
+      )
+      on conflict (check_id, stage, window_key) do update set
+        cursor = excluded.cursor,
+        prompt_config_hash = excluded.prompt_config_hash,
+        provider_metadata = excluded.provider_metadata,
+        structured_output_mode = excluded.structured_output_mode,
+        attempt_summary = excluded.attempt_summary,
+        status = excluded.status,
+        retry_eligible = excluded.retry_eligible,
+        safe_error = excluded.safe_error,
+        updated_at = excluded.updated_at
+    `.execute(this.db);
+  }
+
+  async getWindowCheckpoint(input: {
+    checkId: string;
+    stage: string;
+    windowKey: string;
+  }): Promise<WorkerKnowledgeCheckWindowCheckpoint | null> {
+    const result = await sql<{
+      retry_eligible: boolean;
+      status: string;
+    }>`
+      select status, retry_eligible
+      from knowledge_check_window_checkpoints
+      where check_id = ${input.checkId}
+        and stage = ${input.stage}
+        and window_key = ${input.windowKey}
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined
+      ? null
+      : {
+          retryEligible: row.retry_eligible,
+          status: row.status,
+        };
   }
 
   async resolveKnowledgeBaseScope(knowledgeBaseId: string): Promise<TenantProjectScope> {
@@ -862,6 +1189,10 @@ function createWorkerSemanticRun(
   };
 }
 
+function isCompletedWindowCheckpoint(checkpoint: WorkerKnowledgeCheckWindowCheckpoint): boolean {
+  return checkpoint.status === "completed" && !checkpoint.retryEligible;
+}
+
 function calculateProgress(processed: number, total: number): number {
   if (total <= 0) {
     return knowledgeCheckRunningBaseProgress + knowledgeCheckProgressSpan;
@@ -910,6 +1241,34 @@ function createFinding(input: WorkerKnowledgeCheckFinding): WorkerKnowledgeCheck
     source_refs: input.source_refs ?? [],
     suggested_action: input.suggested_action ?? { action: "inspect_finding" },
   };
+}
+
+function createKnowledgeCheckFindingDedupeKey(
+  checkId: string,
+  finding: WorkerKnowledgeCheckFinding,
+): string {
+  const stableFinding = { ...finding };
+
+  delete stableFinding.finding_id;
+  const payload = JSON.stringify({
+    check_id: checkId,
+    finding: stableFinding,
+  });
+
+  return createHash("sha256").update(payload).digest("hex");
+}
+
+function createKnowledgeCheckWindowCheckpointId(input: {
+  checkId: string;
+  stage: string;
+  windowKey: string;
+}): string {
+  const digest = createHash("sha256")
+    .update(`${input.checkId}:${input.stage}:${input.windowKey}`)
+    .digest("hex")
+    .slice(0, 32);
+
+  return `kcc_${digest}`;
 }
 
 interface KnowledgeCheckRow {
@@ -986,11 +1345,18 @@ function readSemanticRun(value: unknown): WorkerKnowledgeCheckSemanticRun {
 
   return {
     findings_count: readNumber(record.findings_count),
+    ...(record.output_status === "succeeded" || record.output_status === "failed"
+      ? { output_status: record.output_status }
+      : {}),
     repair_attempts: readNumber(record.repair_attempts),
     status:
       status === "skipped" || status === "completed" || status === "partial" || status === "failed"
         ? status
         : "skipped",
+    ...(record.structured_output_mode === "strict_json_schema" ||
+    record.structured_output_mode === "json_object_fallback"
+      ? { structured_output_mode: record.structured_output_mode }
+      : {}),
     ...(typeof record.failure_reason === "string" ? { failure_reason: record.failure_reason } : {}),
     ...(typeof record.trace === "object" && record.trace !== null && !Array.isArray(record.trace)
       ? { trace: record.trace as Record<string, unknown> }

@@ -14,6 +14,16 @@ export const adminQueryKeys = {
   ingestProgress: (knowledgeBaseId: string) =>
     ["knowledge-bases", knowledgeBaseId, "ingest-progress"] as const,
   knowledgeCheck: (checkId: string) => ["knowledge-checks", checkId] as const,
+  knowledgeCheckFindings: (
+    checkId: string,
+    options?: Record<string, unknown>
+  ) =>
+    [
+      "knowledge-checks",
+      checkId,
+      "findings",
+      ...(options === undefined ? [] : [options]),
+    ] as const,
   jobs: (knowledgeBaseId: string, options?: Record<string, unknown>) =>
     [
       "knowledge-bases",
@@ -61,6 +71,13 @@ export const adminQueryKeys = {
       "source-watch-rules",
       ruleId,
       "scans",
+      ...(options === undefined ? [] : [options]),
+    ] as const,
+  sourceWatchScanItems: (jobId: string, options?: Record<string, unknown>) =>
+    [
+      "scheduled-import-jobs",
+      jobId,
+      "items",
       ...(options === undefined ? [] : [options]),
     ] as const,
   systemSettings: () => ["system", "settings"] as const,

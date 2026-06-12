@@ -36,6 +36,7 @@ import {
   type KnowledgeCheckResponse,
   type KnowledgeCheckSemanticRun,
   type KnowledgeCheckType,
+  type ListKnowledgeCheckFindingsResult,
 } from "./knowledge-check.types.js";
 
 const defaultChecks: KnowledgeCheckType[] = ["missing_sources"];
@@ -175,6 +176,38 @@ export class KnowledgeCheckService {
     await this.assertReadableKnowledgeBase(record.knowledgeBaseId, scope);
 
     return toKnowledgeCheckResponse(record);
+  }
+
+  async listFindings(
+    checkId: string,
+    input: { page: number; pageSize: number },
+    scope?: ApiResourceScope,
+  ): Promise<ListKnowledgeCheckFindingsResult> {
+    const record = await this.operationalReadStore.getKnowledgeCheckById(checkId);
+
+    if (record === undefined || record === null) {
+      throw createKnowledgeCheckNotFoundError();
+    }
+
+    await this.assertReadableKnowledgeBase(record.knowledgeBaseId, scope);
+
+    const result = await this.operationalReadStore.listKnowledgeCheckFindings({
+      checkId,
+      page: input.page,
+      pageSize: input.pageSize,
+    });
+
+    if (result === null) {
+      throw new ApiError("internal_error");
+    }
+
+    return {
+      items: result.items,
+      page: input.page,
+      pageSize: input.pageSize,
+      total: result.total,
+      hasMore: result.hasMore,
+    };
   }
 
   private async assertReadableKnowledgeBase(

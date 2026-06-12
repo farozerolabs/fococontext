@@ -51,10 +51,13 @@ export const expectedSchemaTables = [
   "rollback_records",
   "page_merge_records",
   "knowledge_checks",
+  "knowledge_check_findings",
+  "knowledge_check_window_checkpoints",
   "duplicate_decisions",
   "delete_impact_previews",
   "source_watch_rules",
   "scheduled_import_jobs",
+  "source_watch_scan_items",
   "import_previews",
   "webhooks",
   "webhook_deliveries",
@@ -316,6 +319,33 @@ create index if not exists deletion_cleanup_items_operation_retryable_type_idx
 
 create index if not exists knowledge_checks_kb_updated_idx
   on knowledge_checks(knowledge_base_id, updated_at desc, id desc);
+
+create index if not exists knowledge_check_findings_scope_status_idx
+  on knowledge_check_findings(tenant_id, project_id, knowledge_base_id, check_id, status, created_at asc, id asc);
+
+create index if not exists knowledge_check_findings_check_stage_idx
+  on knowledge_check_findings(check_id, stage, created_at asc, id asc);
+
+create index if not exists knowledge_check_findings_retention_idx
+  on knowledge_check_findings(retained_until asc, id asc)
+  where retained_until is not null;
+
+create index if not exists knowledge_check_window_checkpoints_scope_status_idx
+  on knowledge_check_window_checkpoints(tenant_id, project_id, knowledge_base_id, check_id, status, updated_at desc, id desc);
+
+create index if not exists knowledge_check_window_checkpoints_retention_idx
+  on knowledge_check_window_checkpoints(retained_until asc, id asc)
+  where retained_until is not null;
+
+create index if not exists source_watch_scan_items_scope_kind_idx
+  on source_watch_scan_items(tenant_id, project_id, knowledge_base_id, source_watch_rule_id, scheduled_import_job_id, item_kind, updated_at desc, id desc);
+
+create index if not exists source_watch_scan_items_source_identity_idx
+  on source_watch_scan_items(source_watch_rule_id, source_identity, updated_at desc, id desc);
+
+create index if not exists source_watch_scan_items_retention_idx
+  on source_watch_scan_items(retained_until asc, id asc)
+  where retained_until is not null;
 `;
 
 export function getDefaultMigrationDirectory(): string {

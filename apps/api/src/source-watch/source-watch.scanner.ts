@@ -17,6 +17,8 @@ import type {
   SourceWatchDiscoveredSource,
   SourceWatchRuleRecord,
   SourceWatchScanDiscovery,
+  SourceWatchScanItemKind,
+  SourceWatchScanStageItem,
   SourceWatchSkippedSource,
 } from "./source-watch.types.js";
 
@@ -32,6 +34,8 @@ export interface SourceWatchScanner {
 
 export interface SourceWatchScannerRuntimeOptions {
   onProgress?: (progress: SourceWatchScannerProgress) => Promise<void>;
+  resumeCursor?: Record<string, unknown>;
+  scanRunId?: string;
 }
 
 export interface SourceWatchScannerProgress {
@@ -92,6 +96,11 @@ export interface SourceWatchScannerOptions {
   existingDocumentProvider?: SourceWatchExistingDocumentProvider;
   operationRecorder?: ObjectStorageOperationRecorder;
   s3ClientFactory?: (input: SourceWatchS3ClientFactoryInput) => SourceWatchS3Client;
+  stageScanItems?: (input: {
+    items: readonly SourceWatchScanStageItem[];
+    rule: SourceWatchRuleRecord;
+    scanRunId: string;
+  }) => Promise<void>;
 }
 
 export function createDefaultSourceWatchScanner(
@@ -162,47 +171,25 @@ async function scanMountedDirectory(
     };
   }
 
-  const skipped: SourceWatchSkippedSource[] = [];
-  const scannedSources = await collectMountedDirectorySources(rule, root, skipped);
+  const accumulator = createSourceWatchStageAccumulator(options, runtimeOptions, rule);
+  const scanStats = await collectMountedDirectorySources(rule, root, accumulator);
+  await accumulator.flush();
   await runtimeOptions?.onProgress?.({
     metadata: {
       adapter: "mounted_directory",
-      skipped_count: skipped.length,
+      skipped_count: scanStats.skippedCount,
     },
-    processedCount: scannedSources.length,
+    processedCount: scanStats.discoveredCount,
     stage: "adapter_page",
-    totalCount: scannedSources.length,
-  });
-  const comparison = await compareSourceWatchDiscovery(
-    rule,
-    options.existingDocumentProvider,
-    scannedSources,
-  );
-  await runtimeOptions?.onProgress?.({
-    cursor: {
-      comparison_source_offset: scannedSources.length,
-      source_watch_rule_id: rule.id,
-    },
-    metadata: {
-      changed_count: comparison.changedSources.length,
-      comparison_window_size: options.comparisonWindowSize ?? scannedSources.length,
-      delete_candidate_count: comparison.deleteCandidates.length,
-      failed_count: 0,
-      new_count: comparison.newSources.length,
-      processed_source_count: scannedSources.length,
-      skipped_count: skipped.length,
-    },
-    processedCount: scannedSources.length,
-    stage: "compare",
-    totalCount: scannedSources.length,
+    totalCount: scanStats.discoveredCount,
   });
 
   return {
     status: "completed",
-    newSources: comparison.newSources,
-    changedSources: comparison.changedSources,
-    deleteCandidates: comparison.deleteCandidates,
-    skipped,
+    newSources: [],
+    changedSources: [],
+    deleteCandidates: [],
+    skipped: [],
     execution: {
       enabled: true,
     },
@@ -223,6 +210,10 @@ async function scanUrlList(
 
   const skipped: SourceWatchSkippedSource[] = [];
   const sources = collectUrlListSources(rule, adapter, skipped);
+  await stageSourceWatchItems(options, runtimeOptions, rule, [
+    ...toSourceWatchStageItems("discovered", sources),
+    ...toSourceWatchSkippedStageItems(skipped),
+  ]);
   await runtimeOptions?.onProgress?.({
     metadata: {
       adapter: "url_list",
@@ -234,37 +225,13 @@ async function scanUrlList(
     stage: "adapter_page",
     totalCount: sources.length,
   });
-  const comparison = await compareSourceWatchDiscovery(
-    rule,
-    options.existingDocumentProvider,
-    sources,
-  );
-  await runtimeOptions?.onProgress?.({
-    cursor: {
-      comparison_source_offset: sources.length,
-      source_watch_rule_id: rule.id,
-    },
-    metadata: {
-      changed_count: comparison.changedSources.length,
-      comparison_window_size: options.comparisonWindowSize ?? sources.length,
-      delete_candidate_count: comparison.deleteCandidates.length,
-      failed_count: 0,
-      new_count: comparison.newSources.length,
-      processed_source_count: sources.length,
-      request_local_input: true,
-      skipped_count: skipped.length,
-    },
-    processedCount: sources.length,
-    stage: "compare",
-    totalCount: sources.length,
-  });
 
   return {
     status: "completed",
-    newSources: comparison.newSources,
-    changedSources: comparison.changedSources,
-    deleteCandidates: comparison.deleteCandidates,
-    skipped,
+    newSources: [],
+    changedSources: [],
+    deleteCandidates: [],
+    skipped: [],
     execution: {
       enabled: true,
     },
@@ -376,7 +343,6 @@ async function scanS3Prefix(
     return createFailedDiscovery(rule.location, "invalid_s3_location");
   }
 
-  const skipped: SourceWatchSkippedSource[] = [];
   const client =
     options.s3ClientFactory?.({
       accessKeyId: adapter.accessKeyId,
@@ -400,8 +366,14 @@ async function scanS3Prefix(
     return createFailedDiscovery(rule.location, "source_watch_operation_recorder_missing");
   }
 
-  const discovered: SourceWatchDiscoveredSource[] = [];
-  let continuationToken: string | undefined;
+  const accumulator = createSourceWatchStageAccumulator(options, runtimeOptions, rule);
+  const scanStats = {
+    discoveredCount: 0,
+    skippedCount: 0,
+  };
+  let continuationToken = readOptionalCursorString(
+    runtimeOptions?.resumeCursor?.continuation_token,
+  );
 
   do {
     const page = (await recordObjectStorageOperation({
@@ -414,7 +386,7 @@ async function scanS3Prefix(
           new ListObjectsV2Command({
             Bucket: location.bucket,
             ContinuationToken: continuationToken,
-            MaxKeys: Math.min(adapter.maxItems - discovered.length, 1000),
+            MaxKeys: Math.min(adapter.maxItems - scanStats.discoveredCount, 1000),
             Prefix: location.prefix,
           }),
         ),
@@ -422,8 +394,8 @@ async function scanS3Prefix(
     })) as SourceWatchListObjectsV2Output;
 
     for (const item of page.Contents ?? []) {
-      if (discovered.length >= adapter.maxItems) {
-        skipped.push({
+      if (scanStats.discoveredCount >= adapter.maxItems) {
+        await stageSkippedSource(accumulator, scanStats, {
           ...(item.Key === undefined ? {} : { source_path: item.Key }),
           reason: "s3_object_limit_exceeded",
           metadata: {
@@ -438,14 +410,14 @@ async function scanS3Prefix(
       }
 
       if (!isIncludedExtension(item.Key, rule.includeExtensions)) {
-        skipped.push({
+        await stageSkippedSource(accumulator, scanStats, {
           source_path: item.Key,
           reason: "extension_not_included",
         });
         continue;
       }
       if (matchesAnyGlob(item.Key, rule.excludeGlobs)) {
-        skipped.push({
+        await stageSkippedSource(accumulator, scanStats, {
           source_path: item.Key,
           reason: "excluded_by_glob",
         });
@@ -458,7 +430,7 @@ async function scanS3Prefix(
       const maxBytes = Math.min(adapter.maxBytes, maxRuleBytes);
 
       if (size > maxBytes) {
-        skipped.push({
+        await stageSkippedSource(accumulator, scanStats, {
           source_path: item.Key,
           reason: "file_too_large",
           metadata: {
@@ -506,7 +478,7 @@ async function scanS3Prefix(
       const tempIngest =
         content === undefined ? undefined : await writeTemporaryIngestFile(item.Key, content);
 
-      discovered.push({
+      await stageDiscoveredSource(accumulator, scanStats, {
         name: basename(item.Key),
         source_path: sourcePath,
         content_hash: contentHash,
@@ -545,44 +517,40 @@ async function scanS3Prefix(
       metadata: {
         adapter: "s3_prefix",
         page_item_count: page.Contents?.length ?? 0,
-        skipped_count: skipped.length,
+        skipped_count: scanStats.skippedCount,
       },
-      processedCount: discovered.length,
+      processedCount: scanStats.discoveredCount,
       stage: "adapter_page",
       totalCount: null,
     });
-  } while (continuationToken !== undefined && discovered.length < adapter.maxItems);
+  } while (continuationToken !== undefined && scanStats.discoveredCount < adapter.maxItems);
 
-  const comparison = await compareSourceWatchDiscovery(
-    rule,
-    options.existingDocumentProvider,
-    discovered,
-  );
+  await accumulator.flush();
   await runtimeOptions?.onProgress?.({
     cursor: {
-      comparison_source_offset: discovered.length,
+      comparison_source_offset: scanStats.discoveredCount,
       source_watch_rule_id: rule.id,
     },
     metadata: {
-      changed_count: comparison.changedSources.length,
-      comparison_window_size: options.comparisonWindowSize ?? discovered.length,
-      delete_candidate_count: comparison.deleteCandidates.length,
+      changed_count: 0,
+      comparison_window_size: options.comparisonWindowSize ?? scanStats.discoveredCount,
+      delete_candidate_count: 0,
       failed_count: 0,
-      new_count: comparison.newSources.length,
-      processed_source_count: discovered.length,
-      skipped_count: skipped.length,
+      new_count: 0,
+      processed_source_count: scanStats.discoveredCount,
+      skipped_count: scanStats.skippedCount,
     },
-    processedCount: discovered.length,
+    processedCount: scanStats.discoveredCount,
     stage: "compare",
-    totalCount: discovered.length,
+    totalCount: scanStats.discoveredCount,
   });
 
   return {
     status: "completed",
-    newSources: comparison.newSources,
-    changedSources: comparison.changedSources,
-    deleteCandidates: comparison.deleteCandidates,
-    skipped,
+    newSources: [],
+    changedSources: [],
+    deleteCandidates: [],
+    skipped: [],
     execution: {
       enabled: true,
     },
@@ -630,66 +598,47 @@ async function scanGitRepository(
       timeout: adapter.timeoutSeconds * 1000,
     });
 
-    const skipped: SourceWatchSkippedSource[] = [];
-    const sources = await collectGitRepositorySources(rule, checkoutPath, adapter, skipped);
+    const accumulator = createSourceWatchStageAccumulator(options, runtimeOptions, rule);
+    const scanStats = await collectGitRepositorySources(rule, checkoutPath, adapter, accumulator);
+    await accumulator.flush();
     await runtimeOptions?.onProgress?.({
       metadata: {
         adapter: "git_repo",
-        skipped_count: skipped.length,
+        skipped_count: scanStats.skippedCount,
       },
-      processedCount: sources.length,
+      processedCount: scanStats.discoveredCount,
       stage: "adapter_page",
-      totalCount: sources.length,
-    });
-    const comparison = await compareSourceWatchDiscovery(
-      rule,
-      options.existingDocumentProvider,
-      sources,
-    );
-    await runtimeOptions?.onProgress?.({
-      cursor: {
-        comparison_source_offset: sources.length,
-        source_watch_rule_id: rule.id,
-      },
-      metadata: {
-        changed_count: comparison.changedSources.length,
-        comparison_window_size: options.comparisonWindowSize ?? sources.length,
-        delete_candidate_count: comparison.deleteCandidates.length,
-        failed_count: 0,
-        new_count: comparison.newSources.length,
-        processed_source_count: sources.length,
-        skipped_count: skipped.length,
-      },
-      processedCount: sources.length,
-      stage: "compare",
-      totalCount: sources.length,
+      totalCount: scanStats.discoveredCount,
     });
 
     return {
       status: "completed",
-      newSources: comparison.newSources,
-      changedSources: comparison.changedSources,
-      deleteCandidates: comparison.deleteCandidates,
-      skipped,
+      newSources: [],
+      changedSources: [],
+      deleteCandidates: [],
+      skipped: [],
       execution: {
         enabled: true,
       },
     };
   } catch (error) {
+    const failedItem = {
+      source_path: rule.location,
+      reason: "git_scan_failed",
+      metadata: {
+        error: error instanceof Error ? error.message : String(error),
+      },
+    };
+    await stageSourceWatchItems(options, runtimeOptions, rule, [
+      toSourceWatchSkippedStageItem("failed", failedItem),
+    ]);
+
     return {
       status: "failed",
       newSources: [],
       changedSources: [],
       deleteCandidates: [],
-      skipped: [
-        {
-          source_path: rule.location,
-          reason: "git_scan_failed",
-          metadata: {
-            error: error instanceof Error ? error.message : String(error),
-          },
-        },
-      ],
+      skipped: [failedItem],
       execution: {
         enabled: true,
       },
@@ -703,13 +652,16 @@ async function collectGitRepositorySources(
   rule: SourceWatchRuleRecord,
   root: string,
   adapter: RuntimeConfig["sourceWatch"]["adapters"]["gitRepo"],
-  skipped: SourceWatchSkippedSource[],
-): Promise<SourceWatchDiscoveredSource[]> {
-  const sources: SourceWatchDiscoveredSource[] = [];
+  accumulator: ReturnType<typeof createSourceWatchStageAccumulator>,
+): Promise<{ discoveredCount: number; skippedCount: number }> {
+  const stats = {
+    discoveredCount: 0,
+    skippedCount: 0,
+  };
 
-  await walkGitDirectory(rule, root, root, adapter, skipped, sources);
+  await walkGitDirectory(rule, root, root, adapter, accumulator, stats);
 
-  return sources.sort((a, b) => (a.source_path ?? a.name).localeCompare(b.source_path ?? b.name));
+  return stats;
 }
 
 async function walkGitDirectory(
@@ -717,10 +669,10 @@ async function walkGitDirectory(
   root: string,
   currentDirectory: string,
   adapter: RuntimeConfig["sourceWatch"]["adapters"]["gitRepo"],
-  skipped: SourceWatchSkippedSource[],
-  sources: SourceWatchDiscoveredSource[],
+  accumulator: ReturnType<typeof createSourceWatchStageAccumulator>,
+  stats: { discoveredCount: number; skippedCount: number },
 ): Promise<void> {
-  if (sources.length >= adapter.maxItems) {
+  if (stats.discoveredCount >= adapter.maxItems) {
     return;
   }
 
@@ -732,26 +684,26 @@ async function walkGitDirectory(
 
     if (entry.isDirectory()) {
       if (entry.name === ".git" || isExcludedDirectory(relativePath, rule.excludeDirs)) {
-        skipped.push({
+        await stageSkippedSource(accumulator, stats, {
           source_path: relativePath,
           reason: "excluded_directory",
         });
         continue;
       }
 
-      await walkGitDirectory(rule, root, absolutePath, adapter, skipped, sources);
+      await walkGitDirectory(rule, root, absolutePath, adapter, accumulator, stats);
       continue;
     }
 
     if (!entry.isFile()) {
-      skipped.push({
+      await stageSkippedSource(accumulator, stats, {
         source_path: relativePath,
         reason: "unsupported_file_type",
       });
       continue;
     }
-    if (sources.length >= adapter.maxItems) {
-      skipped.push({
+    if (stats.discoveredCount >= adapter.maxItems) {
+      await stageSkippedSource(accumulator, stats, {
         source_path: relativePath,
         reason: "git_file_limit_exceeded",
         metadata: {
@@ -761,14 +713,14 @@ async function walkGitDirectory(
       continue;
     }
     if (!isIncludedExtension(relativePath, rule.includeExtensions)) {
-      skipped.push({
+      await stageSkippedSource(accumulator, stats, {
         source_path: relativePath,
         reason: "extension_not_included",
       });
       continue;
     }
     if (matchesAnyGlob(relativePath, rule.excludeGlobs)) {
-      skipped.push({
+      await stageSkippedSource(accumulator, stats, {
         source_path: relativePath,
         reason: "excluded_by_glob",
       });
@@ -781,7 +733,7 @@ async function walkGitDirectory(
     const maxBytes = Math.min(adapter.maxBytes, maxRuleBytes);
 
     if (fileStatus.size > maxBytes) {
-      skipped.push({
+      await stageSkippedSource(accumulator, stats, {
         source_path: relativePath,
         reason: "file_too_large",
         metadata: {
@@ -797,7 +749,7 @@ async function walkGitDirectory(
       ? await writeTemporaryIngestFile(relativePath, content)
       : undefined;
 
-    sources.push({
+    await stageDiscoveredSource(accumulator, stats, {
       name: basename(relativePath),
       source_path: relativePath,
       content_hash: `sha256:${createHash("sha256").update(content).digest("hex")}`,
@@ -825,21 +777,42 @@ async function walkGitDirectory(
 async function collectMountedDirectorySources(
   rule: SourceWatchRuleRecord,
   root: string,
-  skipped: SourceWatchSkippedSource[],
-): Promise<SourceWatchDiscoveredSource[]> {
-  const sources: SourceWatchDiscoveredSource[] = [];
+  accumulator: ReturnType<typeof createSourceWatchStageAccumulator>,
+): Promise<{ discoveredCount: number; skippedCount: number }> {
+  const stats = {
+    discoveredCount: 0,
+    skippedCount: 0,
+  };
 
-  await walkMountedDirectory(rule, root, root, skipped, sources);
+  await walkMountedDirectory(rule, root, root, accumulator, stats);
 
-  return sources.sort((a, b) => (a.source_path ?? a.name).localeCompare(b.source_path ?? b.name));
+  return stats;
+}
+
+async function stageDiscoveredSource(
+  accumulator: ReturnType<typeof createSourceWatchStageAccumulator>,
+  stats: { discoveredCount: number; skippedCount: number },
+  source: SourceWatchDiscoveredSource,
+): Promise<void> {
+  stats.discoveredCount += 1;
+  await accumulator.add(toSourceWatchStageItem("discovered", source));
+}
+
+async function stageSkippedSource(
+  accumulator: ReturnType<typeof createSourceWatchStageAccumulator>,
+  stats: { discoveredCount: number; skippedCount: number },
+  source: SourceWatchSkippedSource,
+): Promise<void> {
+  stats.skippedCount += 1;
+  await accumulator.add(toSourceWatchSkippedStageItem("skipped", source));
 }
 
 async function walkMountedDirectory(
   rule: SourceWatchRuleRecord,
   root: string,
   currentDirectory: string,
-  skipped: SourceWatchSkippedSource[],
-  sources: SourceWatchDiscoveredSource[],
+  accumulator: ReturnType<typeof createSourceWatchStageAccumulator>,
+  stats: { discoveredCount: number; skippedCount: number },
 ): Promise<void> {
   const directory = await opendir(currentDirectory);
 
@@ -849,19 +822,19 @@ async function walkMountedDirectory(
 
     if (entry.isDirectory()) {
       if (isExcludedDirectory(relativePath, rule.excludeDirs)) {
-        skipped.push({
+        await stageSkippedSource(accumulator, stats, {
           source_path: relativePath,
           reason: "excluded_directory",
         });
         continue;
       }
 
-      await walkMountedDirectory(rule, root, absolutePath, skipped, sources);
+      await walkMountedDirectory(rule, root, absolutePath, accumulator, stats);
       continue;
     }
 
     if (!entry.isFile()) {
-      skipped.push({
+      await stageSkippedSource(accumulator, stats, {
         source_path: relativePath,
         reason: "unsupported_file_type",
       });
@@ -869,7 +842,7 @@ async function walkMountedDirectory(
     }
 
     if (matchesAnyGlob(relativePath, rule.excludeGlobs)) {
-      skipped.push({
+      await stageSkippedSource(accumulator, stats, {
         source_path: relativePath,
         reason: "excluded_by_glob",
       });
@@ -877,7 +850,7 @@ async function walkMountedDirectory(
     }
 
     if (!isIncludedExtension(relativePath, rule.includeExtensions)) {
-      skipped.push({
+      await stageSkippedSource(accumulator, stats, {
         source_path: relativePath,
         reason: "extension_not_included",
       });
@@ -889,7 +862,7 @@ async function walkMountedDirectory(
       rule.maxFileSizeMb === null ? Number.POSITIVE_INFINITY : rule.maxFileSizeMb * 1024 * 1024;
 
     if (fileStatus.size > maxFileSizeBytes) {
-      skipped.push({
+      await stageSkippedSource(accumulator, stats, {
         source_path: relativePath,
         reason: "file_too_large",
         metadata: {
@@ -903,7 +876,7 @@ async function walkMountedDirectory(
     const content = await readFile(absolutePath);
     const contentHash = `sha256:${createHash("sha256").update(content).digest("hex")}`;
 
-    sources.push({
+    await stageDiscoveredSource(accumulator, stats, {
       name: basename(relativePath),
       source_path: relativePath,
       content_hash: contentHash,
@@ -920,28 +893,6 @@ async function walkMountedDirectory(
       },
     });
   }
-}
-
-async function compareSourceWatchDiscovery(
-  rule: SourceWatchRuleRecord,
-  existingDocumentProvider: SourceWatchExistingDocumentProvider | undefined,
-  scannedSources: readonly SourceWatchDiscoveredSource[],
-): Promise<{
-  changedSources: SourceWatchDiscoveredSource[];
-  deleteCandidates: SourceWatchScanDiscovery["deleteCandidates"];
-  newSources: SourceWatchDiscoveredSource[];
-}> {
-  const comparison = await existingDocumentProvider?.compareDiscoveredSources(rule, scannedSources);
-
-  if (comparison !== undefined && comparison !== null) {
-    return comparison;
-  }
-
-  return {
-    changedSources: [],
-    deleteCandidates: [],
-    newSources: [...scannedSources],
-  };
 }
 
 async function hasMatchingSourceWatchFingerprint(
@@ -1171,8 +1122,120 @@ async function writeTemporaryIngestFile(
   };
 }
 
+async function stageSourceWatchItems(
+  options: SourceWatchScannerOptions,
+  runtimeOptions: SourceWatchScannerRuntimeOptions | undefined,
+  rule: SourceWatchRuleRecord,
+  items: readonly SourceWatchScanStageItem[],
+): Promise<void> {
+  if (items.length === 0 || runtimeOptions?.scanRunId === undefined) {
+    return;
+  }
+
+  await options.stageScanItems?.({
+    items,
+    rule,
+    scanRunId: runtimeOptions.scanRunId,
+  });
+}
+
+function createSourceWatchStageAccumulator(
+  options: SourceWatchScannerOptions,
+  runtimeOptions: SourceWatchScannerRuntimeOptions | undefined,
+  rule: SourceWatchRuleRecord,
+): {
+  add: (item: SourceWatchScanStageItem) => Promise<void>;
+  addMany: (items: readonly SourceWatchScanStageItem[]) => Promise<void>;
+  flush: () => Promise<void>;
+} {
+  const windowSize = Math.max(1, Math.floor(options.comparisonWindowSize ?? 100));
+  const pending: SourceWatchScanStageItem[] = [];
+  const flush = async () => {
+    if (pending.length === 0) {
+      return;
+    }
+
+    const items = pending.splice(0, pending.length);
+
+    await stageSourceWatchItems(options, runtimeOptions, rule, items);
+  };
+  const add = async (item: SourceWatchScanStageItem) => {
+    pending.push(item);
+
+    if (pending.length >= windowSize) {
+      await flush();
+    }
+  };
+
+  return {
+    add,
+    async addMany(items) {
+      for (const item of items) {
+        await add(item);
+      }
+    },
+    flush,
+  };
+}
+
+function toSourceWatchStageItem(
+  itemKind: Extract<SourceWatchScanItemKind, "discovered" | "new" | "changed" | "unchanged">,
+  source: SourceWatchDiscoveredSource,
+): SourceWatchScanStageItem {
+  return {
+    comparison_status: itemKind,
+    item_kind: itemKind,
+    payload: { ...source },
+    source_identity: createSourceWatchSourceIdentity(source),
+    ...(source.content_hash === undefined ? {} : { content_hash: source.content_hash }),
+    ...(source.source_path === undefined ? {} : { source_path: source.source_path }),
+    ...(source.source_url === undefined ? {} : { source_url: source.source_url }),
+  };
+}
+
+function toSourceWatchStageItems(
+  itemKind: Extract<SourceWatchScanItemKind, "discovered" | "new" | "changed" | "unchanged">,
+  sources: readonly SourceWatchDiscoveredSource[],
+): SourceWatchScanStageItem[] {
+  return sources.map((source) => toSourceWatchStageItem(itemKind, source));
+}
+
+function toSourceWatchSkippedStageItems(
+  skipped: readonly SourceWatchSkippedSource[],
+): SourceWatchScanStageItem[] {
+  return skipped.map((source) => toSourceWatchSkippedStageItem("skipped", source));
+}
+
+function toSourceWatchSkippedStageItem(
+  itemKind: Extract<SourceWatchScanItemKind, "skipped" | "failed">,
+  source: SourceWatchSkippedSource,
+): SourceWatchScanStageItem {
+  return {
+    comparison_status: itemKind,
+    item_kind: itemKind,
+    payload: { ...source },
+    safe_error:
+      itemKind === "failed"
+        ? {
+            reason: source.reason,
+            ...(source.metadata === undefined ? {} : { metadata: source.metadata }),
+          }
+        : null,
+    source_identity: source.source_path ?? source.reason,
+    ...(source.source_path === undefined ? {} : { source_path: source.source_path }),
+  };
+}
+
+function createSourceWatchSourceIdentity(source: SourceWatchDiscoveredSource): string {
+  return source.source_path ?? source.source_url ?? source.name;
+}
+
 function normalizeSourcePath(value: string): string {
   return value.split(sep).join("/").replace(/^\/+/u, "");
+}
+
+function readOptionalCursorString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 function createFailedDiscovery(sourcePath: string, reason: string): SourceWatchScanDiscovery {

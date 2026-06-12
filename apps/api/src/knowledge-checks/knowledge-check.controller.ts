@@ -1,7 +1,8 @@
-import { Controller, Get, HttpCode, Param, Post, Req } from "@nestjs/common";
-import { createRequestId, createSuccessEnvelope } from "@fococontext/contracts";
+import { Controller, Get, HttpCode, Param, Post, Query, Req } from "@nestjs/common";
+import { createListEnvelope, createRequestId, createSuccessEnvelope } from "@fococontext/contracts";
 
 import { requireApiKeyScope, type ApiKeyRequest } from "../auth/api-key.guard.js";
+import { parsePaginationQuery, type PaginationQuery } from "../http/pagination.js";
 import { KnowledgeBaseService } from "../knowledge-bases/knowledge-base.service.js";
 import { KnowledgeCheckService } from "./knowledge-check.service.js";
 import type { CreateKnowledgeCheckInput } from "./knowledge-check.types.js";
@@ -39,5 +40,26 @@ export class KnowledgeCheckController {
       await this.knowledgeCheckService.get(checkId, requireApiKeyScope(request)),
       createRequestId(),
     );
+  }
+
+  @Get(":checkId/findings")
+  async findings(
+    @Param("checkId") checkId: string,
+    @Query() query: PaginationQuery,
+    @Req() request: ApiKeyRequest,
+  ) {
+    const result = await this.knowledgeCheckService.listFindings(
+      checkId,
+      parsePaginationQuery(query),
+      requireApiKeyScope(request),
+    );
+
+    return createListEnvelope(result.items, {
+      page: result.page,
+      page_size: result.pageSize,
+      total: result.total,
+      has_more: result.hasMore,
+      requestId: createRequestId(),
+    });
   }
 }
