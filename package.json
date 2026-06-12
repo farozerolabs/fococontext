@@ -15,13 +15,14 @@
     "docs:preview": "pnpm --filter @fococontext/docs-site preview",
     "docs:validate": "pnpm --filter @fococontext/docs-site docs:validate",
     "docker:cleanup": "node scripts/docker-cleanup.mjs",
-    "docker:up": "docker compose -f docker-compose.dev.example.yml up --build -d --force-recreate --remove-orphans && node scripts/docker-cleanup.mjs --compose-file docker-compose.dev.example.yml",
-    "docker:up:ocr": "docker compose -f docker-compose.dev.example.yml up --build -d --force-recreate --remove-orphans && node scripts/docker-cleanup.mjs --compose-file docker-compose.dev.example.yml",
+    "docker:up": "node scripts/docker-dev-up.mjs",
+    "docker:up:ocr": "node scripts/docker-dev-up.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint . --ext .js,.mjs,.cjs,.ts,.tsx",
     "test": "vitest run --passWithNoTests",
     "typecheck": "tsc -b --pretty false",
+    "validation:white-box": "node scripts/validation/white-box-real-data-validation.mjs",
     "verify": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm run test"
   },
   "devDependencies": {

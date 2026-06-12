@@ -8,10 +8,18 @@ x-fococontext-env: &fococontext-env
   env_file:
     - ${FOCOCONTEXT_ENV_FILE:-.env}
 
+x-fococontext-build: &fococontext-build
+  args:
+    FOCOCONTEXT_RELEASE_VERSION: ${FOCOCONTEXT_RELEASE_VERSION:-dev}
+    FOCOCONTEXT_RELEASE_REVISION: ${FOCOCONTEXT_RELEASE_REVISION:-local}
+    FOCOCONTEXT_RELEASE_BUILD_TIME: ${FOCOCONTEXT_RELEASE_BUILD_TIME:-local}
+    FOCOCONTEXT_RELEASE_SOURCE: ${FOCOCONTEXT_RELEASE_SOURCE:-local}
+
 services:
   migrate:
     <<: *fococontext-env
     build:
+      <<: *fococontext-build
       context: .
       dockerfile: apps/api/Dockerfile
     command: ["node", "packages/db/dist/migrate.js"]
@@ -23,6 +31,7 @@ services:
   api:
     <<: *fococontext-env
     build:
+      <<: *fococontext-build
       context: .
       dockerfile: apps/api/Dockerfile
     depends_on:
@@ -52,6 +61,7 @@ services:
   worker:
     <<: *fococontext-env
     build:
+      <<: *fococontext-build
       context: .
       dockerfile: apps/worker/Dockerfile
     depends_on:
@@ -71,6 +81,7 @@ services:
   ocr-service:
     <<: *fococontext-env
     build:
+      <<: *fococontext-build
       context: .
       dockerfile: apps/ocr-service/Dockerfile
     expose:
@@ -91,6 +102,7 @@ services:
   admin:
     <<: *fococontext-env
     build:
+      <<: *fococontext-build
       context: .
       dockerfile: apps/admin-web/Dockerfile
     depends_on:
