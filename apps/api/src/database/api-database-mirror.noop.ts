@@ -20,6 +20,12 @@ export function createNoopApiDatabaseMirror(): ApiDatabaseMirror {
     async updateDeletionCleanupItem() {},
     async saveJob() {},
     async updateJob() {},
+    async cancelOpenJobsForKnowledgeBase() {
+      return 0;
+    },
+    async cancelOpenJobsForSourceDocument() {
+      return 0;
+    },
     async appendJobEvent() {},
     async saveSourceWatchRule() {},
     async updateSourceWatchRule() {},

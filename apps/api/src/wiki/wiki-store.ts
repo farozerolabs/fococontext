@@ -6,16 +6,12 @@ import {
   type DatabaseSchema,
 } from "@fococontext/db";
 import {
-  createBoundedRetrievalExecutionContext,
   createEmbeddingUnits,
   type GraphInsightsResponse,
   type GraphInsightStatus,
-  type RetrievalEmbeddingObjectType,
   type RetrievalEmbeddingProvider,
   type RetrievalEmbeddingRecord,
-  type RetrievalKnowledgeBaseScopeRecord,
   type RetrievalPageRecord,
-  type RetrievalRepository,
   type RetrievalSourceRef,
   type RetrievalTraceRecord,
   type RetrievalVisibilityOrigin,
@@ -49,7 +45,7 @@ export interface WikiStore {
     pageId: string,
     input: WikiPaginationInput,
   ): Promise<PaginatedWikiRecordResult>;
-  listRelatedPagesByPageIds?(
+  listRelatedPagesByPageIds(
     pageIds: readonly string[],
   ): Promise<Map<string, Record<string, unknown>[]>>;
   listPageVersions(pageId: string): Promise<Record<string, unknown>[]>;
@@ -86,8 +82,10 @@ export interface WikiStore {
     input: RollbackKnowledgeBaseInput,
   ): Promise<Record<string, unknown>>;
   rollbackPage(pageId: string, input: RollbackPageInput): Promise<Record<string, unknown>>;
+  listForkSyncPageConflicts(
+    input: ForkSyncPageConflictInput,
+  ): Promise<ForkSyncPageConflictRecord[]>;
   syncForkFromUpstream(input: SyncForkFromUpstreamInput): Promise<SyncForkFromUpstreamResult>;
-  loadRetrievalRepository(knowledgeBaseId: string): Promise<RetrievalRepository>;
   rebuildRetrievalIndex(
     knowledgeBaseId: string,
     provider: RetrievalEmbeddingProvider,
@@ -131,6 +129,20 @@ export interface RetrievalIndexStats {
   indexedEdgeCount: number;
   indexedEmbeddingCount: number;
   indexedPageCount: number;
+}
+
+export interface ForkSyncPageConflictInput {
+  forkKnowledgeBaseId: string;
+  upstreamKnowledgeBaseId: string;
+}
+
+export interface ForkSyncPageConflictRecord {
+  [key: string]: unknown;
+  type: "fork_page_conflict";
+  upstream_page_id: string;
+  fork_page_id: string;
+  slug: string;
+  title: string;
 }
 
 export interface WikiPageApiRecord {
@@ -259,6 +271,9 @@ export function createNoopWikiStore(): WikiStore {
     async listRelatedPages() {
       return [];
     },
+    async listRelatedPagesByPageIds(pageIds) {
+      return new Map(pageIds.map((pageId) => [pageId, []]));
+    },
     async listRelatedPagesPaginated() {
       return {
         items: [],
@@ -348,10 +363,8 @@ export function createNoopWikiStore(): WikiStore {
         knowledgeVersionId: createResourceId("knowledgeVersion"),
       };
     },
-    async loadRetrievalRepository() {
-      throw new ApiError("retrieve_index_not_ready", {
-        messageKey: "api.error.retrieve_index_not_ready",
-      });
+    async listForkSyncPageConflicts() {
+      return [];
     },
     async rebuildRetrievalIndex() {
       return {
@@ -1960,6 +1973,73 @@ class PostgresWikiStore implements WikiStore {
     };
   }
 
+  async listForkSyncPageConflicts(
+    input: ForkSyncPageConflictInput,
+  ): Promise<ForkSyncPageConflictRecord[]> {
+    const result = await sql<{
+      fork_page_id: string;
+      slug: string;
+      title: string;
+      upstream_page_id: string;
+    }>`
+      with scoped_kbs as (
+        select
+          fork.id as fork_id,
+          upstream.id as upstream_id,
+          fork.tenant_id,
+          fork.project_id
+        from knowledge_bases fork
+        inner join knowledge_bases upstream
+          on upstream.id = ${input.upstreamKnowledgeBaseId}
+          and upstream.tenant_id = fork.tenant_id
+          and upstream.project_id = fork.project_id
+        where fork.id = ${input.forkKnowledgeBaseId}
+          and fork.upstream_knowledge_base_id = upstream.id
+          and fork.knowledge_base_type = 'fork'
+          and upstream.knowledge_base_type = 'canonical'
+          and fork.deleted_at is null
+          and upstream.deleted_at is null
+          and fork.status <> 'deleted'
+          and upstream.status <> 'deleted'
+        limit 1
+      ),
+      fork_pages as (
+        select wiki_pages.id, wiki_pages.slug, wiki_pages.title
+        from wiki_pages
+        inner join scoped_kbs on true
+        where (wiki_pages.knowledge_base_id = scoped_kbs.fork_id
+            or wiki_pages.owner_knowledge_base_id = scoped_kbs.fork_id)
+          and wiki_pages.deleted_at is null
+          and wiki_pages.fork_tombstoned_at is null
+      ),
+      upstream_pages as (
+        select wiki_pages.id, wiki_pages.slug
+        from wiki_pages
+        inner join scoped_kbs on true
+        where wiki_pages.knowledge_base_id = scoped_kbs.upstream_id
+          and wiki_pages.owner_knowledge_base_id is null
+          and wiki_pages.deleted_at is null
+          and wiki_pages.fork_tombstoned_at is null
+      )
+      select
+        upstream_pages.id as upstream_page_id,
+        fork_pages.id as fork_page_id,
+        fork_pages.slug,
+        fork_pages.title
+      from fork_pages
+      inner join upstream_pages on upstream_pages.slug = fork_pages.slug
+      order by fork_pages.slug asc, fork_pages.id asc
+    `.execute(this.db);
+
+    return result.rows.map((row) => ({
+      type: "fork_page_conflict",
+      upstream_page_id: row.upstream_page_id,
+      fork_page_id: row.fork_page_id,
+      slug: row.slug,
+      title: row.title,
+    }));
+  }
+
   async syncForkFromUpstream(
     input: SyncForkFromUpstreamInput,
   ): Promise<SyncForkFromUpstreamResult> {
@@ -2066,111 +2146,6 @@ class PostgresWikiStore implements WikiStore {
       changeSetId,
       knowledgeVersionId,
     };
-  }
-
-  async loadRetrievalRepository(knowledgeBaseId: string): Promise<RetrievalRepository> {
-    const repository = createBoundedRetrievalExecutionContext();
-    const scope = await this.getKnowledgeBaseScope(knowledgeBaseId);
-    const pages = await this.listPages(knowledgeBaseId);
-    const edges = await this.listEdges(knowledgeBaseId);
-    const embeddings = await this.listEmbeddings(knowledgeBaseId);
-    const sourceDocumentsById = await this.loadSourceDocumentRetrievalMetadata(
-      collectPageSourceDocumentIds(pages),
-    );
-
-    repository.upsertKnowledgeBaseScope(toRetrievalKnowledgeBaseScope(knowledgeBaseId, scope));
-    if (scope.knowledgeBaseType === "fork" && scope.upstreamKnowledgeBaseId !== null) {
-      repository.upsertKnowledgeBaseScope({
-        knowledge_base_id: scope.upstreamKnowledgeBaseId,
-        knowledge_base_type: "canonical",
-        upstream_knowledge_base_id: null,
-        upstream_synced_version_id: scope.upstreamSyncedVersionId,
-      });
-    }
-
-    for (const page of pages) {
-      const visibility = normalizeStoredVisibilityFields(page, scope);
-      repository.upsertPage({
-        knowledge_base_id: visibility.knowledge_base_id,
-        page_id: page.id,
-        page_version_id: page.current_version_id ?? page.id,
-        title: page.title,
-        type: page.type,
-        markdown: page.markdown,
-        frontmatter: page.frontmatter,
-        is_system_page: false,
-        system_page_key: null,
-        source_refs: enrichSourceRefsWithDocumentMetadata(
-          normalizeStoredPageSourceRefs(page, scope),
-          sourceDocumentsById,
-        ),
-        metadata: page.metadata,
-        visibility_origin: visibility.visibility_origin,
-        owner_knowledge_base_id: visibility.owner_knowledge_base_id,
-        upstream_resource_id: visibility.upstream_resource_id,
-        fork_tombstoned_at: visibility.fork_tombstoned_at,
-      });
-    }
-    for (const edge of edges) {
-      const visibility = normalizeStoredVisibilityFields(edge, scope);
-
-      repository.upsertEdge({
-        ...edge,
-        knowledge_base_id: visibility.knowledge_base_id,
-        visibility_origin: visibility.visibility_origin,
-        owner_knowledge_base_id: visibility.owner_knowledge_base_id,
-        upstream_resource_id: visibility.upstream_resource_id,
-        fork_tombstoned_at: visibility.fork_tombstoned_at,
-      });
-    }
-    for (const embedding of embeddings) {
-      const visibility = normalizeStoredVisibilityFields(embedding, scope);
-
-      repository.saveEmbedding({
-        ...embedding,
-        knowledge_base_id: visibility.knowledge_base_id,
-        visibility_origin: visibility.visibility_origin,
-        owner_knowledge_base_id: visibility.owner_knowledge_base_id,
-        upstream_resource_id: visibility.upstream_resource_id,
-        fork_tombstoned_at: visibility.fork_tombstoned_at,
-      });
-    }
-
-    return repository;
-  }
-
-  private async loadSourceDocumentRetrievalMetadata(
-    documentIds: readonly string[],
-  ): Promise<Map<string, RetrievalSourceDocumentMetadata>> {
-    const uniqueIds = [...new Set(documentIds)].filter((documentId) => documentId.length > 0);
-
-    if (uniqueIds.length === 0) {
-      return new Map();
-    }
-
-    const result = await sql<{
-      id: string;
-      metadata: unknown;
-      name: string;
-    }>`
-      select
-        id,
-        name,
-        metadata
-      from source_documents
-      where id = any(${uniqueIds})
-    `.execute(this.db);
-
-    return new Map(
-      result.rows.map((row) => [
-        row.id,
-        {
-          id: row.id,
-          metadata: normalizeJsonObject(row.metadata),
-          name: row.name,
-        },
-      ]),
-    );
   }
 
   async rebuildRetrievalIndex(
@@ -2312,281 +2287,6 @@ class PostgresWikiStore implements WikiStore {
         warnings = excluded.warnings,
         metadata = excluded.metadata
     `.execute(this.db);
-  }
-
-  private async listEdges(knowledgeBaseId: string) {
-    const scope = await this.getKnowledgeBaseScope(knowledgeBaseId);
-    const visiblePageIds = (await this.listPages(knowledgeBaseId)).map((page) => page.id);
-
-    if (scope.knowledgeBaseType === "fork" && scope.upstreamKnowledgeBaseId !== null) {
-      const result = await sql<{
-        knowledge_base_id: string;
-        edge_id: string;
-        from_page_id: string;
-        to_page_id: string;
-        relation_type:
-          | "wikilink"
-          | "shared_source"
-          | "common_neighbor"
-          | "type_affinity"
-          | "generated_relationship"
-          | "evidence_relationship"
-          | "manual";
-        weight: number;
-        explanation: string;
-        source_document_ids: string[];
-        visibility_origin: RetrievalVisibilityOrigin;
-        owner_knowledge_base_id: string | null;
-        upstream_resource_id: string | null;
-        fork_tombstoned_at: string | null;
-      }>`
-        with visible_pages as (
-          select unnest(${formatTextArray(visiblePageIds)}) as id
-        ),
-        fork_edge_tombstones as (
-          select upstream_resource_id
-          from wiki_edges
-          where owner_knowledge_base_id = ${knowledgeBaseId}
-            and fork_tombstoned_at is not null
-            and upstream_resource_id is not null
-        )
-        select *
-        from (
-          select
-            ${knowledgeBaseId}::text as knowledge_base_id,
-            wiki_edges.id as edge_id,
-            wiki_edges.from_page_id,
-            wiki_edges.to_page_id,
-            wiki_edges.relation_type,
-            wiki_edges.weight::float as weight,
-            coalesce(wiki_edges.explanation, '') as explanation,
-            wiki_edges.source_document_ids,
-            'upstream_inherited'::text as visibility_origin,
-            ${knowledgeBaseId}::text as owner_knowledge_base_id,
-            wiki_edges.id as upstream_resource_id,
-            null::timestamptz as fork_tombstoned_at
-          from wiki_edges
-          where wiki_edges.knowledge_base_id = ${scope.upstreamKnowledgeBaseId}
-            and wiki_edges.owner_knowledge_base_id is null
-            and wiki_edges.fork_tombstoned_at is null
-            and exists (select 1 from visible_pages where visible_pages.id = wiki_edges.from_page_id)
-            and exists (select 1 from visible_pages where visible_pages.id = wiki_edges.to_page_id)
-            and not exists (
-              select 1
-              from fork_edge_tombstones
-              where fork_edge_tombstones.upstream_resource_id = wiki_edges.id
-            )
-          union all
-          select
-            ${knowledgeBaseId}::text as knowledge_base_id,
-            wiki_edges.id as edge_id,
-            wiki_edges.from_page_id,
-            wiki_edges.to_page_id,
-            wiki_edges.relation_type,
-            wiki_edges.weight::float as weight,
-            coalesce(wiki_edges.explanation, '') as explanation,
-            wiki_edges.source_document_ids,
-            'fork_owned'::text as visibility_origin,
-            ${knowledgeBaseId}::text as owner_knowledge_base_id,
-            wiki_edges.upstream_resource_id,
-            wiki_edges.fork_tombstoned_at
-          from wiki_edges
-          where (wiki_edges.knowledge_base_id = ${knowledgeBaseId}
-              or wiki_edges.owner_knowledge_base_id = ${knowledgeBaseId})
-            and wiki_edges.fork_tombstoned_at is null
-            and exists (select 1 from visible_pages where visible_pages.id = wiki_edges.from_page_id)
-            and exists (select 1 from visible_pages where visible_pages.id = wiki_edges.to_page_id)
-        ) visible_edges
-      `.execute(this.db);
-
-      return result.rows.map((row) => ({
-        ...row,
-        visibility_origin: readVisibilityOrigin(row.visibility_origin),
-      }));
-    }
-
-    const result = await sql<{
-      knowledge_base_id: string;
-      edge_id: string;
-      from_page_id: string;
-      to_page_id: string;
-      relation_type:
-        | "wikilink"
-        | "shared_source"
-        | "common_neighbor"
-        | "type_affinity"
-        | "generated_relationship"
-        | "evidence_relationship"
-        | "manual";
-      weight: number;
-      explanation: string;
-      source_document_ids: string[];
-      visibility_origin: RetrievalVisibilityOrigin;
-      owner_knowledge_base_id: string | null;
-      upstream_resource_id: string | null;
-      fork_tombstoned_at: string | null;
-    }>`
-      select
-        knowledge_base_id,
-        id as edge_id,
-        from_page_id,
-        to_page_id,
-        relation_type,
-        weight::float as weight,
-        coalesce(explanation, '') as explanation,
-        source_document_ids,
-        'canonical'::text as visibility_origin,
-        null::text as owner_knowledge_base_id,
-        null::text as upstream_resource_id,
-        null::timestamptz as fork_tombstoned_at
-      from wiki_edges
-      where knowledge_base_id = ${knowledgeBaseId}
-        and owner_knowledge_base_id is null
-        and fork_tombstoned_at is null
-        and from_page_id = any(${formatTextArray(visiblePageIds)})
-        and to_page_id = any(${formatTextArray(visiblePageIds)})
-    `.execute(this.db);
-
-    return result.rows.map((row) => ({
-      ...row,
-      visibility_origin: readVisibilityOrigin(row.visibility_origin),
-    }));
-  }
-
-  private async listEmbeddings(knowledgeBaseId: string): Promise<RetrievalEmbeddingRecord[]> {
-    const scope = await this.getKnowledgeBaseScope(knowledgeBaseId);
-    const visiblePageIds = (await this.listPages(knowledgeBaseId)).map((page) => page.id);
-
-    if (scope.knowledgeBaseType === "fork" && scope.upstreamKnowledgeBaseId !== null) {
-      const result = await sql<{
-        id: string;
-        knowledge_base_id: string;
-        page_id: string | null;
-        page_version_id: string | null;
-        object_type: string;
-        object_id: string;
-        model: string;
-        dimensions: number;
-        vector: string | null;
-        metadata: Record<string, unknown>;
-        visibility_origin: RetrievalVisibilityOrigin;
-        owner_knowledge_base_id: string | null;
-        upstream_resource_id: string | null;
-        fork_tombstoned_at: string | null;
-      }>`
-        with visible_pages as (
-          select unnest(${formatTextArray(visiblePageIds)}) as id
-        ),
-        fork_embedding_tombstones as (
-          select upstream_resource_id
-          from page_embeddings
-          where owner_knowledge_base_id = ${knowledgeBaseId}
-            and fork_tombstoned_at is not null
-            and upstream_resource_id is not null
-        )
-        select *
-        from (
-          select
-            page_embeddings.id,
-            ${knowledgeBaseId}::text as knowledge_base_id,
-            page_embeddings.page_id,
-            page_embeddings.page_version_id,
-            page_embeddings.object_type,
-            page_embeddings.object_id,
-            page_embeddings.model,
-            page_embeddings.dimensions,
-            page_embeddings.embedding::text as vector,
-            page_embeddings.metadata,
-            'upstream_inherited'::text as visibility_origin,
-            ${knowledgeBaseId}::text as owner_knowledge_base_id,
-            page_embeddings.id as upstream_resource_id,
-            null::timestamptz as fork_tombstoned_at
-          from page_embeddings
-          where page_embeddings.knowledge_base_id = ${scope.upstreamKnowledgeBaseId}
-            and page_embeddings.owner_knowledge_base_id is null
-            and page_embeddings.fork_tombstoned_at is null
-            and page_embeddings.page_id in (select id from visible_pages)
-            and not exists (
-              select 1
-              from fork_embedding_tombstones
-              where fork_embedding_tombstones.upstream_resource_id = page_embeddings.id
-            )
-          union all
-          select
-            page_embeddings.id,
-            ${knowledgeBaseId}::text as knowledge_base_id,
-            page_embeddings.page_id,
-            page_embeddings.page_version_id,
-            page_embeddings.object_type,
-            page_embeddings.object_id,
-            page_embeddings.model,
-            page_embeddings.dimensions,
-            page_embeddings.embedding::text as vector,
-            page_embeddings.metadata,
-            'fork_owned'::text as visibility_origin,
-            ${knowledgeBaseId}::text as owner_knowledge_base_id,
-            page_embeddings.upstream_resource_id,
-            page_embeddings.fork_tombstoned_at
-          from page_embeddings
-          where (page_embeddings.knowledge_base_id = ${knowledgeBaseId}
-              or page_embeddings.owner_knowledge_base_id = ${knowledgeBaseId})
-            and page_embeddings.fork_tombstoned_at is null
-            and page_embeddings.page_id in (select id from visible_pages)
-        ) visible_embeddings
-        order by id asc
-      `.execute(this.db);
-
-      return result.rows.flatMap((row) => toRetrievalEmbeddingRecord(row));
-    }
-
-    const result = await sql<{
-      id: string;
-      knowledge_base_id: string;
-      page_id: string | null;
-      page_version_id: string | null;
-      object_type: string;
-      object_id: string;
-      model: string;
-      dimensions: number;
-      vector: string | null;
-      metadata: Record<string, unknown>;
-      visibility_origin: RetrievalVisibilityOrigin;
-      owner_knowledge_base_id: string | null;
-      upstream_resource_id: string | null;
-      fork_tombstoned_at: string | null;
-    }>`
-      select
-        id,
-        knowledge_base_id,
-        page_id,
-        page_version_id,
-        object_type,
-        object_id,
-        model,
-        dimensions,
-        embedding::text as vector,
-        metadata,
-        'canonical'::text as visibility_origin,
-        null::text as owner_knowledge_base_id,
-        null::text as upstream_resource_id,
-        null::timestamptz as fork_tombstoned_at
-      from page_embeddings
-      where knowledge_base_id = ${knowledgeBaseId}
-        and owner_knowledge_base_id is null
-        and fork_tombstoned_at is null
-        and page_id = any(${formatTextArray(visiblePageIds)})
-      order by created_at asc, id asc
-    `.execute(this.db);
-
-    return result.rows.flatMap((row) => toRetrievalEmbeddingRecord(row));
-  }
-
-  private async replaceEmbeddings(
-    knowledgeBaseId: string,
-    embeddings: readonly RetrievalEmbeddingRecord[],
-  ): Promise<void> {
-    await this.deleteEmbeddingsForKnowledgeBase(knowledgeBaseId);
-    await this.insertEmbeddingBatch(embeddings);
   }
 
   private async deleteEmbeddingsForKnowledgeBase(knowledgeBaseId: string): Promise<void> {
@@ -3597,59 +3297,6 @@ interface SystemPageRow {
   updated_at: unknown;
 }
 
-interface RetrievalEmbeddingRow {
-  id: string;
-  knowledge_base_id: string;
-  page_id: string | null;
-  page_version_id: string | null;
-  object_type: string;
-  object_id: string;
-  model: string;
-  dimensions: number;
-  vector: string | null;
-  metadata: Record<string, unknown>;
-  visibility_origin: RetrievalVisibilityOrigin;
-  owner_knowledge_base_id: string | null;
-  upstream_resource_id: string | null;
-  fork_tombstoned_at: string | null;
-}
-
-function toRetrievalEmbeddingRecord(row: RetrievalEmbeddingRow): RetrievalEmbeddingRecord[] {
-  const objectType = readEmbeddingObjectType(row.object_type);
-  const vector = parsePgVector(row.vector);
-  const text = readMetadataText(row.metadata);
-
-  if (
-    objectType === null ||
-    row.page_id === null ||
-    row.page_version_id === null ||
-    vector.length === 0 ||
-    text === null
-  ) {
-    return [];
-  }
-
-  return [
-    {
-      id: row.id,
-      knowledge_base_id: row.knowledge_base_id,
-      page_id: row.page_id,
-      page_version_id: row.page_version_id,
-      object_type: objectType,
-      object_id: row.object_id,
-      text,
-      model: row.model,
-      dimensions: Number(row.dimensions),
-      vector,
-      metadata: removeMetadataText(row.metadata),
-      visibility_origin: readVisibilityOrigin(row.visibility_origin),
-      owner_knowledge_base_id: row.owner_knowledge_base_id,
-      upstream_resource_id: row.upstream_resource_id,
-      fork_tombstoned_at: row.fork_tombstoned_at,
-    },
-  ];
-}
-
 function readVisibilityOrigin(value: unknown): RetrievalVisibilityOrigin {
   if (value === "canonical" || value === "upstream_inherited" || value === "fork_owned") {
     return value;
@@ -3670,10 +3317,6 @@ function readSystemPageType(value: unknown): SystemPageType {
   }
 
   return "overview";
-}
-
-function formatTextArray(values: readonly string[]) {
-  return values.length === 0 ? sql`array[]::text[]` : sql`array[${sql.join(values)}]::text[]`;
 }
 
 function normalizeJsonObject(value: unknown): Record<string, unknown> {
@@ -3699,19 +3342,6 @@ function normalizePageSourceRefs(page: WikiPageApiRecord): RetrievalSourceRef[] 
     : page.source_document_ids.map((documentId) => ({
         document_id: documentId,
       }));
-}
-
-function collectPageSourceDocumentIds(pages: readonly WikiPageApiRecord[]): string[] {
-  return [
-    ...new Set(
-      pages.flatMap((page) => [
-        ...page.source_document_ids,
-        ...normalizeRecordArray(page.source_refs)
-          .map((sourceRef) => readString(sourceRef.document_id))
-          .filter((documentId): documentId is string => documentId !== null),
-      ]),
-    ),
-  ];
 }
 
 export function enrichSourceRefsWithDocumentMetadata(
@@ -3745,83 +3375,6 @@ export function enrichSourceRefsWithDocumentMetadata(
       ...(summary === null || summary === undefined ? {} : { summary }),
     };
   });
-}
-
-function toRetrievalKnowledgeBaseScope(
-  knowledgeBaseId: string,
-  scope: KnowledgeBaseScopeContext,
-): RetrievalKnowledgeBaseScopeRecord {
-  return {
-    knowledge_base_id: knowledgeBaseId,
-    knowledge_base_type: scope.knowledgeBaseType,
-    upstream_knowledge_base_id: scope.upstreamKnowledgeBaseId,
-    upstream_synced_version_id: scope.upstreamSyncedVersionId,
-  };
-}
-
-function normalizeStoredPageSourceRefs(
-  page: WikiPageApiRecord,
-  scope: KnowledgeBaseScopeContext,
-): RetrievalSourceRef[] {
-  const sourceRefs = normalizePageSourceRefs(page);
-
-  if (!isUpstreamInheritedRecord(page, scope)) {
-    return sourceRefs;
-  }
-
-  return sourceRefs.map((sourceRef) => {
-    const nextSourceRef = { ...sourceRef };
-
-    delete nextSourceRef.visibility_origin;
-
-    return nextSourceRef;
-  });
-}
-
-function normalizeStoredVisibilityFields(
-  record: {
-    knowledge_base_id: string;
-    visibility_origin?: RetrievalVisibilityOrigin;
-    owner_knowledge_base_id?: string | null;
-    upstream_resource_id?: string | null;
-    fork_tombstoned_at?: string | null;
-  },
-  scope: KnowledgeBaseScopeContext,
-): {
-  knowledge_base_id: string;
-  visibility_origin: RetrievalVisibilityOrigin;
-  owner_knowledge_base_id: string | null;
-  upstream_resource_id: string | null;
-  fork_tombstoned_at: string | null;
-} {
-  if (isUpstreamInheritedRecord(record, scope) && scope.upstreamKnowledgeBaseId !== null) {
-    return {
-      knowledge_base_id: scope.upstreamKnowledgeBaseId,
-      visibility_origin: "canonical",
-      owner_knowledge_base_id: null,
-      upstream_resource_id: null,
-      fork_tombstoned_at: null,
-    };
-  }
-
-  return {
-    knowledge_base_id: record.knowledge_base_id,
-    visibility_origin: record.visibility_origin ?? "canonical",
-    owner_knowledge_base_id: record.owner_knowledge_base_id ?? null,
-    upstream_resource_id: record.upstream_resource_id ?? null,
-    fork_tombstoned_at: record.fork_tombstoned_at ?? null,
-  };
-}
-
-function isUpstreamInheritedRecord(
-  record: { visibility_origin?: RetrievalVisibilityOrigin },
-  scope: KnowledgeBaseScopeContext,
-): boolean {
-  return (
-    scope.knowledgeBaseType === "fork" &&
-    scope.upstreamKnowledgeBaseId !== null &&
-    record.visibility_origin === "upstream_inherited"
-  );
 }
 
 function toRetrievalSourceRef(value: Record<string, unknown>): RetrievalSourceRef[] {
@@ -3950,46 +3503,8 @@ function toPostgresTextArray(values: readonly string[]) {
   return values.length === 0 ? sql`array[]::text[]` : sql`array[${sql.join(values)}]::text[]`;
 }
 
-function readEmbeddingObjectType(value: string): RetrievalEmbeddingObjectType | null {
-  if (value === "page" || value === "page_section" || value === "system_page") {
-    return value;
-  }
-
-  return null;
-}
-
-function parsePgVector(value: string | null): number[] {
-  if (value === null) {
-    return [];
-  }
-
-  const body = value.trim().replace(/^\[/u, "").replace(/\]$/u, "");
-
-  if (body.length === 0) {
-    return [];
-  }
-
-  return body
-    .split(",")
-    .map((item) => Number(item.trim()))
-    .filter((item) => Number.isFinite(item));
-}
-
 function formatPgVector(vector: readonly number[]): string {
   return `[${vector.map((value) => Number(value)).join(",")}]`;
-}
-
-function readMetadataText(metadata: Record<string, unknown>): string | null {
-  const value = metadata.text;
-
-  return typeof value === "string" && value.length > 0 ? value : null;
-}
-
-function removeMetadataText(metadata: Record<string, unknown>): Record<string, unknown> {
-  const rest = { ...metadata };
-
-  delete rest.text;
-  return rest;
 }
 
 function createDefaultGraphInsightStatus(): GraphInsightStatus {

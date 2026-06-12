@@ -210,11 +210,18 @@ export class RetrieveService {
         return graph;
       }
 
-      const pages = await this.wikiStore.listPages(knowledgeBaseId);
+      const pageSize = Math.max(
+        1,
+        Math.min(input.limit ?? 1, this.runtimeConfig.limits.retrieve.maxTopK),
+      );
+      const pages = await this.wikiStore.listPagesPaginated(knowledgeBaseId, {
+        page: 1,
+        pageSize,
+      });
 
       return {
         ...graph,
-        nodes: pages
+        nodes: pages.items
           .filter((page) => input.page_type === undefined || page.type === input.page_type)
           .filter(
             (page) =>

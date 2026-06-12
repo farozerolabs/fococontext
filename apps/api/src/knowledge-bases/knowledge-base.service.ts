@@ -21,7 +21,7 @@ import {
 } from "../queues/deletion-cleanup.queue.js";
 import type { JobDetailResponse, JobEventRecord, JobRecord } from "../documents/document.types.js";
 import { reindexQueueToken, type ReindexQueue } from "../queues/reindex.queue.js";
-import { wikiStoreToken, type WikiPageApiRecord, type WikiStore } from "../wiki/wiki-store.js";
+import { wikiStoreToken, type WikiStore } from "../wiki/wiki-store.js";
 import {
   findKnowledgeBaseTemplate,
   listKnowledgeBaseTemplates,
@@ -682,36 +682,10 @@ export class KnowledgeBaseService {
     upstreamKnowledgeBaseId: string,
     forkId: string,
   ): Promise<ForkSyncConflictResponse[]> {
-    const [upstreamPages, forkPages] = await Promise.all([
-      this.wikiStore.listPages(upstreamKnowledgeBaseId),
-      this.wikiStore.listPages(forkId),
-    ]);
-    const upstreamBySlug = new Map(
-      upstreamPages.map((page) => [page.slug, page] satisfies [string, WikiPageApiRecord]),
-    );
-    const conflicts: ForkSyncConflictResponse[] = [];
-
-    for (const forkPage of forkPages) {
-      if (forkPage.visibility_origin !== "fork_owned") {
-        continue;
-      }
-
-      const upstreamPage = upstreamBySlug.get(forkPage.slug);
-
-      if (upstreamPage === undefined) {
-        continue;
-      }
-
-      conflicts.push({
-        type: "fork_page_conflict",
-        upstream_page_id: upstreamPage.id,
-        fork_page_id: forkPage.id,
-        slug: forkPage.slug,
-        title: forkPage.title,
-      });
-    }
-
-    return conflicts;
+    return this.wikiStore.listForkSyncPageConflicts({
+      forkKnowledgeBaseId: forkId,
+      upstreamKnowledgeBaseId,
+    });
   }
 
   private async cancelOpenJobsForDeletedKnowledgeBase(
@@ -719,50 +693,14 @@ export class KnowledgeBaseService {
     now: string,
   ): Promise<void> {
     const message = "Canceled because the knowledge base was deleted.";
-    const jobs: JobRecord[] = [];
-    let page = 1;
-    let hasMore = true;
-
-    while (hasMore) {
-      const result = await this.operationalReadStore.listJobs({
-        knowledgeBaseId,
-        page,
-        pageSize: 500,
-      });
-
-      if (result === null) {
-        throw new ApiError("internal_error");
-      }
-
-      jobs.push(...result.items);
-      hasMore = result.hasMore;
-      page += 1;
-    }
-
-    const openJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
-
-    for (const job of openJobs) {
-      const updated: JobRecord = {
-        ...job,
-        status: "canceled",
-        progressMessage: message,
-        updatedAt: now,
-      };
-      const event: JobEventRecord = {
-        jobId: updated.id,
-        type: "job.canceled",
-        stage: updated.stage,
-        status: updated.status,
-        message,
-        metadata: {
-          knowledge_base_deleted: true,
-        },
-        createdAt: now,
-      };
-
-      await this.databaseMirror.updateJob(updated);
-      await this.databaseMirror.appendJobEvent(event);
-    }
+    await this.databaseMirror.cancelOpenJobsForKnowledgeBase({
+      knowledgeBaseId,
+      message,
+      metadata: {
+        knowledge_base_deleted: true,
+      },
+      now,
+    });
   }
 
   private async enqueueDeletionCleanupOperation(

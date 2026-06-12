@@ -54,6 +54,18 @@ export interface ApiDatabaseMirror {
   updateDeletionCleanupItem(record: DeletionCleanupItemRecord): Promise<void>;
   saveJob(record: JobRecord): Promise<void>;
   updateJob(record: JobRecord): Promise<void>;
+  cancelOpenJobsForKnowledgeBase(input: {
+    knowledgeBaseId: string;
+    message: string;
+    metadata: Record<string, unknown>;
+    now: string;
+  }): Promise<number>;
+  cancelOpenJobsForSourceDocument(input: {
+    sourceDocumentId: string;
+    message: string;
+    metadata: Record<string, unknown>;
+    now: string;
+  }): Promise<number>;
   appendJobEvent(record: JobEventRecord): Promise<void>;
   saveSourceWatchRule(record: SourceWatchRuleRecord): Promise<void>;
   updateSourceWatchRule(record: SourceWatchRuleRecord): Promise<void>;
@@ -734,6 +746,110 @@ class PostgresApiDatabaseMirror implements ApiDatabaseMirror {
 
   async updateJob(record: JobRecord): Promise<void> {
     await this.saveJob(record);
+  }
+
+  async cancelOpenJobsForKnowledgeBase(input: {
+    knowledgeBaseId: string;
+    message: string;
+    metadata: Record<string, unknown>;
+    now: string;
+  }): Promise<number> {
+    const result = await sql<{ count: string | number | bigint }>`
+      with canceled_jobs as (
+        update jobs
+        set status = 'canceled',
+            progress_message = ${input.message},
+            updated_at = ${input.now}
+        where knowledge_base_id = ${input.knowledgeBaseId}
+          and status in ('queued', 'running')
+        returning id, tenant_id, project_id, stage, status
+      ),
+      inserted_events as (
+        insert into job_events (
+          id,
+          tenant_id,
+          project_id,
+          job_id,
+          event_type,
+          message,
+          metadata,
+          created_at
+        )
+        select
+          canceled_jobs.id || ':job.canceled:' || ${input.now},
+          canceled_jobs.tenant_id,
+          canceled_jobs.project_id,
+          canceled_jobs.id,
+          'job.canceled',
+          ${input.message},
+          ${JSON.stringify(input.metadata)}::jsonb
+            || jsonb_build_object('stage', canceled_jobs.stage, 'status', canceled_jobs.status),
+          ${input.now}
+        from canceled_jobs
+        on conflict (id) do nothing
+        returning job_id
+      ),
+      job_counts as (
+        select count(*)::text as count from canceled_jobs
+      )
+      select job_counts.count
+      from job_counts
+      cross join (select count(*) from inserted_events) inserted_event_counts
+    `.execute(this.db);
+
+    return Number(result.rows[0]?.count ?? 0);
+  }
+
+  async cancelOpenJobsForSourceDocument(input: {
+    sourceDocumentId: string;
+    message: string;
+    metadata: Record<string, unknown>;
+    now: string;
+  }): Promise<number> {
+    const result = await sql<{ count: string | number | bigint }>`
+      with canceled_jobs as (
+        update jobs
+        set status = 'canceled',
+            progress_message = ${input.message},
+            updated_at = ${input.now}
+        where source_document_id = ${input.sourceDocumentId}
+          and status in ('queued', 'running')
+        returning id, tenant_id, project_id, stage, status
+      ),
+      inserted_events as (
+        insert into job_events (
+          id,
+          tenant_id,
+          project_id,
+          job_id,
+          event_type,
+          message,
+          metadata,
+          created_at
+        )
+        select
+          canceled_jobs.id || ':job.canceled:' || ${input.now},
+          canceled_jobs.tenant_id,
+          canceled_jobs.project_id,
+          canceled_jobs.id,
+          'job.canceled',
+          ${input.message},
+          ${JSON.stringify(input.metadata)}::jsonb
+            || jsonb_build_object('stage', canceled_jobs.stage, 'status', canceled_jobs.status),
+          ${input.now}
+        from canceled_jobs
+        on conflict (id) do nothing
+        returning job_id
+      ),
+      job_counts as (
+        select count(*)::text as count from canceled_jobs
+      )
+      select job_counts.count
+      from job_counts
+      cross join (select count(*) from inserted_events) inserted_event_counts
+    `.execute(this.db);
+
+    return Number(result.rows[0]?.count ?? 0);
   }
 
   async appendJobEvent(record: JobEventRecord): Promise<void> {

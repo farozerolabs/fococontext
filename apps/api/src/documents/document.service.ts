@@ -54,7 +54,6 @@ import type {
   DocumentUploadResponse,
   CreateUploadSessionResponse,
   DeleteImpactPreviewResponse,
-  JobEventRecord,
   JobRecord,
   JobResponse,
   ListMediaAssetsInput,
@@ -2120,32 +2119,14 @@ export class DocumentService {
     now: string,
   ): Promise<void> {
     const message = "Canceled because the source document was deleted.";
-    const openJobs = (await this.operationalReadStore.listJobsByDocumentId(document.id)).filter(
-      (job) => job.status === "queued" || job.status === "running",
-    );
-
-    for (const job of openJobs) {
-      const updated: JobRecord = {
-        ...job,
-        status: "canceled",
-        progressMessage: message,
-        updatedAt: now,
-      };
-      const event = {
-        jobId: updated.id,
-        type: "job.canceled",
-        stage: updated.stage,
-        status: updated.status,
-        message,
-        metadata: {
-          source_document_deleted: true,
-        },
-        createdAt: now,
-      } satisfies JobEventRecord;
-
-      await this.databaseMirror.updateJob(updated);
-      await this.databaseMirror.appendJobEvent(event);
-    }
+    await this.databaseMirror.cancelOpenJobsForSourceDocument({
+      sourceDocumentId: document.id,
+      message,
+      metadata: {
+        source_document_deleted: true,
+      },
+      now,
+    });
   }
 
   private async enqueueDeletionCleanupOperation(
