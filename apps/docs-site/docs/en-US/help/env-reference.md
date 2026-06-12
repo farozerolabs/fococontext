@@ -260,7 +260,6 @@ Rerank uses an all-or-none contract. Leave every `RERANK_*` value empty to disab
 | `COMPILE_QUEUE_DEPTH_DEGRADED_THRESHOLD`     | Compile queue degraded threshold               | Default `10`                                      |
 | `COMPILE_QUEUE_DEPTH_SATURATED_THRESHOLD`    | Compile queue saturated threshold              | Default `50`                                      |
 | `PROVIDER_FAILURE_DEGRADED_THRESHOLD`        | Provider failure degraded threshold            | Default `3`                                       |
-| `EXPENSIVE_VALIDATION_ENABLED`               | Whether to run expensive external probes       | Default `false`                                   |
 | `PARSER_MAX_FILE_SIZE_MB`                    | Parser file size limit                         | Default `50`                                      |
 | `PARSER_TIMEOUT_SECONDS`                     | Parser timeout                                 | Default `120`                                     |
 | `PARSER_CONCURRENCY`                         | Parser concurrency compatibility fallback      | Default `2`                                       |

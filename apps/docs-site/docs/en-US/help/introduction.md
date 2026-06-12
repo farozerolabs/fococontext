@@ -68,7 +68,7 @@ Use Retrieval Lab to test a query, inspect candidate pages, citations, graph exp
 
 ## When to Use Admin
 
-Admin is for deployment verification, data inspection, operational debugging, and developer testing.
+Admin is for deployment checks, data inspection, operational troubleshooting, and knowledge-base operation.
 
 | Page            | Common action                                                                   |
 | --------------- | ------------------------------------------------------------------------------- |

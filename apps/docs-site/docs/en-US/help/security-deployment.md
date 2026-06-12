@@ -14,7 +14,7 @@ FocoContext is designed for self-hosted deployments where the public edge, the A
 
 ## Production Compose Boundary
 
-Use `docker-compose.example.yml` for release-image deployment. Keep the default loopback bind host when a reverse proxy is on the same server:
+Use `docker-compose.example.yml` for image-based self-hosted deployment. Keep the default loopback bind host when a reverse proxy is on the same server:
 
 ```dotenv
 FOCOCONTEXT_BIND_HOST=127.0.0.1
@@ -22,7 +22,7 @@ FOCOCONTEXT_API_PORT=18080
 FOCOCONTEXT_ADMIN_PORT=18081
 ```
 
-PostgreSQL, Redis, Worker, and OCR stay inside the Docker network in the release templates. Use `docker-compose.dev.example.yml` only for local development because it can publish database and Redis ports on the configured bind host.
+PostgreSQL, Redis, Worker, and OCR stay inside the Docker network in the image-based Compose templates. Do not use the dev Compose template for internet-facing deployments because it can publish database and Redis ports on the configured bind host.
 
 ## HTTPS and Cookie Settings
 
@@ -137,17 +137,16 @@ SOURCE_WATCH_PRIVATE_NETWORK_ALLOWLIST=
 
 Enable private-network Source Watch only for trusted intranet ingestion and only with an explicit host, IP, or CIDR allowlist.
 
-## Debug and Release Checks
+## Deployment Security Checklist
 
-Before publishing a new release or opening a deployment to external traffic:
+Before opening a deployment to external traffic:
 
-1. Confirm debug endpoints and development-only routes are disabled.
+1. Confirm only the intended API and Admin domains are reachable from the public internet.
 2. Confirm stack traces, raw provider responses, raw prompts, object keys, signed URLs, and secrets are redacted from responses and logs.
-3. Confirm Admin bundles do not expose server secrets or local-only routes.
-4. Run secret scanning over the repository and release artifacts.
-5. Run dependency review on changed lockfiles and review high-impact advisories.
-6. Keep image provenance through release labels, Git revision, image tag, and release notes.
-7. Review generated artifacts and exported packages before sharing them outside trusted channels.
+3. Confirm Admin browser storage does not contain Bearer API Keys or provider credentials.
+4. Confirm PostgreSQL, Redis, Worker, OCR, and object storage remain on private networks or trusted provider boundaries.
+5. Confirm Source Watch private-network access is disabled unless an explicit allowlist is configured.
+6. Rotate any credential that was copied into a shell history, screenshot, support ticket, or shared document.
 
 ## Incident Response
 
@@ -158,4 +157,4 @@ Use [SECURITY.md](https://github.com/farozerolabs/fococontext/blob/main/SECURITY
 - Upload abuse: lower upload limits, disable direct upload if needed, review failed parser and scanner records, and remove suspicious source artifacts.
 - SSRF attempt: keep `SOURCE_WATCH_PRIVATE_NETWORK_ENABLED=false`, inspect unsafe source rejection audit events, and verify proxy egress rules.
 - Object-storage exposure: rotate S3 credentials, remove public bucket policies, review presigned URL TTLs, and audit exported packages.
-- Dependency vulnerability: patch, rebuild images, publish security-impact release notes, and document any temporary mitigations.
+- Dependency vulnerability: patch, rebuild images, and document any temporary mitigations for operators.

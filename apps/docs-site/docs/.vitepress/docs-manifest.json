@@ -68,14 +68,6 @@
           }
         },
         {
-          "id": "help-release-validation",
-          "slug": "release-validation",
-          "title": {
-            "en-US": "Release Validation",
-            "zh-CN": "发布验证"
-          }
-        },
-        {
           "id": "help-knowledge-bases",
           "slug": "knowledge-bases",
           "title": {

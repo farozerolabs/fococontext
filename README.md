@@ -107,20 +107,6 @@ optional RapidOCR sidecar.
 Chat, embedding, rerank, vision caption, OCR, storage, and runtime limits are
 configured through env. OpenAI-compatible endpoints are first-class.
 
-## Test Notes
-
-This section summarizes recent controlled tests over a small set of cleaned
-documents. The test window was limited, so only a small sample was used. Larger
-production deployments should run their own evaluation and may need additional
-logic and algorithm tuning for their document scale, domain, models, and quality
-requirements.
-
-| Test area                         | Coverage                                                                                                         | Test results                                                                                                                                                                                                                                                                                                                                                                 |
-| --------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Mixed-document OpenAPI quality    | 6 representative sources across Markdown, PDF-derived content, table/OCR content, and Office; 20 retrieval tasks | 100% upload success, 100% ingest completion, 100% metadata preservation, 100% selected-document Wiki coverage, 100% title Recall@1/3, 100% context precision@5, 100% citation exactness, 99% answer relevance, p95 Retrieve latency 7.9s                                                                                                                                     |
-| No-answer and confidence contract | The same mixed-document set plus answerability probes; 23 tasks                                                  | 100% no-answer precision, 0% no-answer false positives, 0% answerable false negatives, 100% unsupported-answer prevention, 100% confidence calibration pass rate                                                                                                                                                                                                             |
-| Legal Markdown OpenAPI quality    | 10 structured legal Markdown sources; 40 retrieval, metadata, locator, and agent-intent tasks                    | 100% upload, ingest, frontmatter preservation, Wiki coverage, evidence dereference, visible top-result correctness, source ranking, anchor ranking, citation source hit, exact locator resolution, title Recall@1/3, Recall@5, MRR@10, nDCG@10, citation exactness, and agent-task success; 96% context-pack source precision; 96.3% groundedness; p95 Retrieve latency 4.2s |
-
 ## Quick Start
 
 ### Requirements
@@ -175,7 +161,7 @@ EMBEDDING_MODEL=...
 EMBEDDING_DIMENSIONS=1536
 ```
 
-### 2. Start the Release Stack
+### 2. Start FocoContext
 
 ```bash
 docker compose up -d
@@ -194,9 +180,6 @@ Keep `FOCOCONTEXT_API_PORT`, `FOCOCONTEXT_ADMIN_PORT`,
 `FOCOCONTEXT_POSTGRES_PORT`, and `FOCOCONTEXT_REDIS_PORT` as numeric values such
 as `18080`; do not put host-prefixed values such as `127.0.0.1:18080` in those
 port fields.
-
-Before announcing a new release image, maintainers should confirm the GHCR
-packages are public and visible under the FocoContext repository packages page.
 
 ### 3. Open the Console
 
@@ -227,9 +210,8 @@ authenticated Admin Console session or send
 
 ### Self-host With Docker Compose
 
-Use the image-based Compose template for release-style self-hosted deployments.
-The template expects external S3-compatible storage and env-configured model
-providers.
+Use the image-based Compose template for self-hosted deployments. The template
+expects external S3-compatible storage and env-configured model providers.
 
 ```bash
 docker compose up -d
@@ -316,6 +298,23 @@ The dev stack also starts OCR by default:
 pnpm run docker:up:ocr
 ```
 
+Common development checks:
+
+```bash
+pnpm run format:check
+pnpm run lint
+pnpm run typecheck
+pnpm run test
+pnpm run build
+pnpm run verify
+```
+
+Run the documentation site:
+
+```bash
+pnpm run docs:dev
+```
+
 ### Integrate by API
 
 Run the OpenAPI quickstart example:
@@ -382,23 +381,6 @@ if (retrieval.answerability.no_answer) {
 
 See `examples/sdk-ready-quickstart.ts` for a complete script.
 
-### Validate a Release Candidate
-
-FocoContext keeps release validation split into white-box and black-box paths.
-White-box checks internal contracts, migrations, runtime configuration, and UI
-state. Black-box starts the Docker Compose runtime and verifies the product
-through public OpenAPI and Admin Web flows with a small representative document
-sample.
-
-```bash
-pnpm run validation:report-contract
-pnpm run validation:release -- --env .env
-```
-
-Reports are written under `test-results/whitebox-blackbox-validation` by
-default and are local validation artifacts. Read the full guide at
-[docs.fococontext.com](https://docs.fococontext.com/en-US/help/release-validation).
-
 ## Core API Surface
 
 | Endpoint                                                                                              | Purpose                                      |
@@ -428,22 +410,22 @@ default and are local validation artifacts. Read the full guide at
 All runtime configuration is env-first. The Admin Console shows safe runtime
 status and Knowledge Base settings. Provider secrets stay in `.env`.
 
-| Area                    | Required keys                                                                                                                                                                                                     |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Ports                   | `FOCOCONTEXT_BIND_HOST`, `FOCOCONTEXT_API_PORT`, `FOCOCONTEXT_ADMIN_PORT`, `FOCOCONTEXT_POSTGRES_PORT`, `FOCOCONTEXT_REDIS_PORT`                                                                                  |
-| Admin auth              | `FOCOCONTEXT_ADMIN_USERNAME`, `FOCOCONTEXT_ADMIN_PASSWORD`                                                                                                                                                        |
-| Developer API auth      | `FOCOCONTEXT_API_KEY`, `FOCOCONTEXT_CORS_ORIGINS`                                                                                                                                                                 |
-| PostgreSQL              | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `DATABASE_URL`                                                                                                                                               |
-| Redis                   | `REDIS_URL`                                                                                                                                                                                                       |
-| Object storage          | `S3_PROVIDER_NAME`, `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_OPERATION_*`, `S3_PREVIEW_*`, `S3_MULTIPART_PART_SIZE_BYTES`                                         |
-| Chat model              | `CHAT_PROVIDER_NAME`, `CHAT_BASE_URL`, `CHAT_API_KEY`, `CHAT_*_MODEL`                                                                                                                                             |
-| Embeddings              | `EMBEDDING_PROVIDER_NAME`, `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`                                                                                                   |
-| Optional rerank         | `RERANK_PROVIDER_NAME`, `RERANK_BASE_URL`, `RERANK_API_KEY`, `RERANK_MODEL`                                                                                                                                       |
-| Optional image captions | `VISION_CAPTION_ENABLED`, `VISION_CAPTION_BASE_URL`, `VISION_CAPTION_API_KEY`, `VISION_CAPTION_MODEL`                                                                                                             |
-| OCR                     | `OCR_ENABLED`, `OCR_PROVIDER`, `OCR_SERVICE_BASE_URL`, `OCR_LANGS`, `OCR_*` limits                                                                                                                                |
-| Source Watch            | `FOCOCONTEXT_SOURCE_WATCH_HOST_DIR`, `FOCOCONTEXT_SOURCE_WATCH_CONTAINER_DIR`, `SOURCE_WATCH_URL_LIST_*`, `SOURCE_WATCH_S3_*`, `SOURCE_WATCH_GIT_*`                                                               |
-| Runtime limits          | `UPLOAD_*`, `PARSER_*`, `*_CONCURRENCY`, `DELETION_CLEANUP_*`, `COMPILE_MAX_CONTEXT_CHARS`, `RETRIEVE_*`, `SOURCE_EVIDENCE_*`, `RUNTIME_*`, `PROVIDER_FAILURE_DEGRADED_THRESHOLD`, `EXPENSIVE_VALIDATION_ENABLED` |
-| Webhook delivery        | `FOCOCONTEXT_WEBHOOK_SECRET`, `WEBHOOK_DELIVERY_*`, `WEBHOOK_SIGNING_TOLERANCE_SECONDS`                                                                                                                           |
+| Area                    | Required keys                                                                                                                                                                     |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Ports                   | `FOCOCONTEXT_BIND_HOST`, `FOCOCONTEXT_API_PORT`, `FOCOCONTEXT_ADMIN_PORT`, `FOCOCONTEXT_POSTGRES_PORT`, `FOCOCONTEXT_REDIS_PORT`                                                  |
+| Admin auth              | `FOCOCONTEXT_ADMIN_USERNAME`, `FOCOCONTEXT_ADMIN_PASSWORD`                                                                                                                        |
+| Developer API auth      | `FOCOCONTEXT_API_KEY`, `FOCOCONTEXT_CORS_ORIGINS`                                                                                                                                 |
+| PostgreSQL              | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `DATABASE_URL`                                                                                                               |
+| Redis                   | `REDIS_URL`                                                                                                                                                                       |
+| Object storage          | `S3_PROVIDER_NAME`, `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_OPERATION_*`, `S3_PREVIEW_*`, `S3_MULTIPART_PART_SIZE_BYTES`         |
+| Chat model              | `CHAT_PROVIDER_NAME`, `CHAT_BASE_URL`, `CHAT_API_KEY`, `CHAT_*_MODEL`                                                                                                             |
+| Embeddings              | `EMBEDDING_PROVIDER_NAME`, `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`                                                                   |
+| Optional rerank         | `RERANK_PROVIDER_NAME`, `RERANK_BASE_URL`, `RERANK_API_KEY`, `RERANK_MODEL`                                                                                                       |
+| Optional image captions | `VISION_CAPTION_ENABLED`, `VISION_CAPTION_BASE_URL`, `VISION_CAPTION_API_KEY`, `VISION_CAPTION_MODEL`                                                                             |
+| OCR                     | `OCR_ENABLED`, `OCR_PROVIDER`, `OCR_SERVICE_BASE_URL`, `OCR_LANGS`, `OCR_*` limits                                                                                                |
+| Source Watch            | `FOCOCONTEXT_SOURCE_WATCH_HOST_DIR`, `FOCOCONTEXT_SOURCE_WATCH_CONTAINER_DIR`, `SOURCE_WATCH_URL_LIST_*`, `SOURCE_WATCH_S3_*`, `SOURCE_WATCH_GIT_*`                               |
+| Runtime limits          | `UPLOAD_*`, `PARSER_*`, `*_CONCURRENCY`, `DELETION_CLEANUP_*`, `COMPILE_MAX_CONTEXT_CHARS`, `RETRIEVE_*`, `SOURCE_EVIDENCE_*`, `RUNTIME_*`, `PROVIDER_FAILURE_DEGRADED_THRESHOLD` |
+| Webhook delivery        | `FOCOCONTEXT_WEBHOOK_SECRET`, `WEBHOOK_DELIVERY_*`, `WEBHOOK_SIGNING_TOLERANCE_SECONDS`                                                                                           |
 
 ### OpenAI-compatible Providers
 
@@ -543,30 +525,6 @@ Typical API flow:
 6. Retrieve from `/v1/knowledge-bases/{fork_id}/retrieve`.
 7. Sync or delete the fork when needed.
 
-## Development
-
-```bash
-pnpm install
-pnpm run typecheck
-pnpm run lint
-pnpm run test
-pnpm run build
-pnpm run verify
-```
-
-Validate Compose templates:
-
-```bash
-docker compose -f docker-compose.example.yml config --quiet
-docker compose -f docker-compose.dev.example.yml config --quiet
-```
-
-Run the documentation site locally:
-
-```bash
-pnpm run docs:dev
-```
-
 ## Project Layout
 
 ```text
@@ -597,12 +555,6 @@ examples          API-only and SDK quickstarts
 
 For code, documentation, deployment, and developer-experience contributions,
 see the [Contribution Guide](CONTRIBUTING.md).
-
-Ordinary development targets the `dev` branch. Create short-lived feature
-branches from `dev`, open pull requests back to `dev`, and promote release-ready
-work from `dev` to the protected `main` branch through a stabilization pull
-request. `main` holds stable history for release tags, Docker image publication,
-and public documentation snapshots.
 
 Focused bug fixes, OpenAPI improvements, parser and retrieval work, Admin UI
 polish, and self-hosting documentation are all welcome.

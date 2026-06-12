@@ -260,7 +260,6 @@ Rerank 使用全有或全无配置规则。所有 `RERANK_*` 都留空时禁用 
 | `COMPILE_QUEUE_DEPTH_DEGRADED_THRESHOLD`     | 编译队列 degraded 阈值         | 默认 `10`                            |
 | `COMPILE_QUEUE_DEPTH_SATURATED_THRESHOLD`    | 编译队列 saturated 阈值        | 默认 `50`                            |
 | `PROVIDER_FAILURE_DEGRADED_THRESHOLD`        | provider 失败 degraded 阈值    | 默认 `3`                             |
-| `EXPENSIVE_VALIDATION_ENABLED`               | 是否执行昂贵外部探测           | 默认 `false`                         |
 | `PARSER_MAX_FILE_SIZE_MB`                    | parser 接受文件大小上限        | 默认 `50`                            |
 | `PARSER_TIMEOUT_SECONDS`                     | parser 超时秒数                | 默认 `120`                           |
 | `PARSER_CONCURRENCY`                         | 解析并发兼容回退               | 默认 `2`                             |
