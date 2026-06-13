@@ -73,7 +73,7 @@ export class SystemStatusService {
       status: "ready",
       runtime: this.getRuntimeStatus(),
       dependencies: await this.getDependencyStatus(),
-      limits: this.getRuntimeLimits(),
+      limits: await this.getRuntimeLimits(),
     };
   }
 
@@ -104,7 +104,7 @@ export class SystemStatusService {
       models: this.getModelStatus(),
       storage: this.getStorageStatus(),
       dependencies: await this.getDependencyStatus(),
-      limits: this.getRuntimeLimits(),
+      limits: await this.getRuntimeLimits(),
     };
   }
 
@@ -169,8 +169,8 @@ export class SystemStatusService {
       },
       runtimeState: this.getRuntimeStateStatus(metrics),
       retrieval: this.getRetrievalRuntimeStatus(),
-      upload: this.getUploadRuntimeStatus(),
-      pressure: this.getPressureStatus(metrics),
+      upload: await this.getUploadRuntimeStatus(),
+      pressure: await this.getPressureStatus(metrics),
       metrics,
       migration: this.getMigrationRuntimeStatus(),
       cleanupQueue: await this.getCleanupQueueStatus(),
@@ -242,8 +242,8 @@ export class SystemStatusService {
     };
   }
 
-  private getRuntimeLimits() {
-    const uploadRuntimeStatus = this.getUploadRuntimeStatus();
+  private async getRuntimeLimits() {
+    const uploadRuntimeStatus = await this.getUploadRuntimeStatus();
 
     return {
       upload: {
@@ -359,9 +359,10 @@ export class SystemStatusService {
     };
   }
 
-  private getPressureStatus(metrics: RuntimeMetricsStatus) {
-    const admission = this.uploadAdmissionService?.getSnapshot() ?? {
+  private async getPressureStatus(metrics: RuntimeMetricsStatus) {
+    const admission = (await this.uploadAdmissionService?.getSnapshot()) ?? {
       activeMultipartUploads: 0,
+      backend: "redis" as const,
       multipartAdmissionLimit: this.config.limits.upload.admissionConcurrency,
       pressureDegradedThreshold: this.config.limits.upload.pressureDegradedThreshold,
       pressure: "normal",
@@ -388,6 +389,7 @@ export class SystemStatusService {
         pressure: admission.pressure,
         activeMultipartUploads: admission.activeMultipartUploads,
         admissionLimit: admission.multipartAdmissionLimit,
+        backend: admission.backend,
         degradedThreshold: this.config.limits.pressure.uploadDegradedThreshold,
       },
       queue: {
@@ -467,9 +469,10 @@ export class SystemStatusService {
     };
   }
 
-  private getUploadRuntimeStatus() {
-    const admission = this.uploadAdmissionService?.getSnapshot() ?? {
+  private async getUploadRuntimeStatus() {
+    const admission = (await this.uploadAdmissionService?.getSnapshot()) ?? {
       activeMultipartUploads: 0,
+      backend: "redis" as const,
       multipartAdmissionLimit: this.config.limits.upload.admissionConcurrency,
       pressureDegradedThreshold: this.config.limits.upload.pressureDegradedThreshold,
       pressure: "normal",

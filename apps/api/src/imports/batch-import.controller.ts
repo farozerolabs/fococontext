@@ -1,4 +1,4 @@
-import { Body, Controller, HttpCode, Param, Post, Req } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Param, Post, Query, Req } from "@nestjs/common";
 import { createRequestId, createSuccessEnvelope } from "@fococontext/contracts";
 
 import { requireApiKeyScope, type ApiKeyRequest } from "../auth/api-key.guard.js";
@@ -28,4 +28,45 @@ export class BatchImportController {
       createRequestId(),
     );
   }
+
+  @Get(":importJobId")
+  async get(
+    @Param("knowledgeBaseId") knowledgeBaseId: string,
+    @Param("importJobId") importJobId: string,
+    @Query("page") page: string | undefined,
+    @Query("page_size") pageSize: string | undefined,
+    @Req() request: ApiKeyRequest,
+  ) {
+    const scope = requireApiKeyScope(request);
+
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    return createSuccessEnvelope(
+      await this.batchImportService.getStatus(
+        knowledgeBaseId,
+        importJobId,
+        {
+          page: readPage(page),
+          pageSize: readPageSize(pageSize),
+        },
+        scope,
+      ),
+      createRequestId(),
+    );
+  }
+}
+
+function readPage(value: string | undefined): number {
+  const parsed = Number(value ?? "1");
+
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 1;
+}
+
+function readPageSize(value: string | undefined): number {
+  const parsed = Number(value ?? "50");
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 50;
+  }
+
+  return Math.min(200, Math.floor(parsed));
 }

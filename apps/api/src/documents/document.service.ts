@@ -260,7 +260,7 @@ export class DocumentService {
       });
     }
 
-    const uploadLease = this.uploadAdmissionService.acquireMultipartUpload();
+    const uploadLease = await this.uploadAdmissionService.acquireMultipartUpload();
     const abortController = new AbortController();
     const removeAbortWatcher = bindMultipartRequestAbort(request, abortController);
 
@@ -278,7 +278,7 @@ export class DocumentService {
       );
     } finally {
       removeAbortWatcher();
-      uploadLease.release();
+      await uploadLease.release();
     }
   }
 
@@ -2071,7 +2071,7 @@ export class DocumentService {
       ocr_policy: datasetConfiguration.values.ocr_policy,
     };
 
-    await this.sourceParseQueue.enqueueSourceParseJob(payload);
+    await this.enqueueSourceParseWithRetry(payload, job);
     await this.webhookService.emit({
       eventType: "document.ingest.started",
       knowledgeBaseId: job.knowledgeBaseId,
@@ -2084,6 +2084,65 @@ export class DocumentService {
         event_source: "document.enqueue_source_parse",
       },
       ...(scope === undefined ? {} : { scope }),
+    });
+  }
+
+  private async enqueueSourceParseWithRetry(
+    payload: SourceParseQueuePayload,
+    job: JobRecord,
+  ): Promise<void> {
+    const maxAttempts = 3;
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        await this.sourceParseQueue.enqueueSourceParseJob(payload);
+        return;
+      } catch (error) {
+        lastError = error;
+        if (attempt < maxAttempts) {
+          await delay(100 * attempt);
+        }
+      }
+    }
+
+    const failedAt = new Date().toISOString();
+    const failedJob: JobRecord = {
+      ...job,
+      error: {
+        code: "source_parse_enqueue_failed",
+        details: {
+          attempts: maxAttempts,
+          error: toSafeQueueError(lastError),
+        },
+      },
+      progressMessage: "Source parse job could not be queued.",
+      status: "failed",
+      updatedAt: failedAt,
+    };
+
+    await this.databaseMirror.updateJob(failedJob);
+    await this.databaseMirror.appendJobEvent({
+      createdAt: failedAt,
+      jobId: failedJob.id,
+      message: failedJob.progressMessage,
+      metadata: {
+        enqueue: {
+          attempts: maxAttempts,
+          error: toSafeQueueError(lastError),
+          status: "failed",
+        },
+      },
+      stage: failedJob.stage,
+      status: failedJob.status,
+      type: "job.failed",
+    });
+
+    throw new ApiError("durable_backend_unavailable", {
+      details: {
+        operation: "source_parse_enqueue",
+        retryable: true,
+      },
     });
   }
 
@@ -2191,7 +2250,7 @@ export class DocumentService {
   ): Promise<void> {
     const event = createQueuedJobEvent(
       job,
-      createUploadJobMetadata(document, this.uploadAdmissionService),
+      await createUploadJobMetadata(document, this.uploadAdmissionService),
     );
 
     await this.databaseMirror.saveSourceDocument(document);
@@ -2416,11 +2475,11 @@ function createQueuedJobEvent(record: JobRecord, metadata: Record<string, unknow
   };
 }
 
-function createUploadJobMetadata(
+async function createUploadJobMetadata(
   document: SourceDocumentRecord,
   uploadAdmissionService: UploadAdmissionService,
-): Record<string, unknown> {
-  const pressure = uploadAdmissionService.getSnapshot();
+): Promise<Record<string, unknown>> {
+  const pressure = await uploadAdmissionService.getSnapshot();
 
   return {
     source_document_id: document.id,
@@ -2430,6 +2489,7 @@ function createUploadJobMetadata(
     pressure: {
       active_multipart_uploads: pressure.activeMultipartUploads,
       admission_limit: pressure.multipartAdmissionLimit,
+      backend: pressure.backend,
       degraded_threshold: pressure.pressureDegradedThreshold,
       state: pressure.pressure,
     },
@@ -3920,6 +3980,25 @@ function createRetentionTimestamp(now: string, days: number | null): string | nu
 
 function toOperationalListError(error: unknown): ApiError {
   return error instanceof ApiError ? error : new ApiError("internal_error");
+}
+
+function toSafeQueueError(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    return {
+      message: error.message,
+      name: error.name,
+    };
+  }
+
+  return {
+    message: "Unknown queue error.",
+  };
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
 }
 
 function sanitizeObjectKeySegment(value: string): string {

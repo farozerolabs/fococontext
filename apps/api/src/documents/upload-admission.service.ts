@@ -3,34 +3,45 @@ import { ApiError } from "@fococontext/contracts";
 import type { RuntimeConfig } from "@fococontext/core";
 
 import { runtimeConfigToken } from "../runtime-config.provider.js";
+import {
+  uploadAdmissionStateStoreToken,
+  type UploadAdmissionStateStore,
+} from "./upload-admission-state.store.js";
 
 export interface UploadAdmissionSnapshot {
   activeMultipartUploads: number;
+  backend: "redis" | "local";
   multipartAdmissionLimit: number;
   pressureDegradedThreshold: number;
   pressure: "normal" | "degraded" | "limited";
 }
 
 export interface UploadAdmissionLease {
-  release(): void;
+  release(): Promise<void>;
 }
 
 @Injectable()
 export class UploadAdmissionService {
-  private activeMultipartUploads = 0;
+  constructor(
+    @Inject(runtimeConfigToken) private readonly runtimeConfig: RuntimeConfig,
+    @Inject(uploadAdmissionStateStoreToken)
+    private readonly stateStore: UploadAdmissionStateStore,
+  ) {}
 
-  constructor(@Inject(runtimeConfigToken) private readonly runtimeConfig: RuntimeConfig) {}
-
-  acquireMultipartUpload(): UploadAdmissionLease {
+  async acquireMultipartUpload(): Promise<UploadAdmissionLease> {
     const limit = this.runtimeConfig.limits.upload.admissionConcurrency;
+    const lease = await this.stateStore.acquireMultipartLease({
+      leaseTtlSeconds: this.runtimeConfig.limits.upload.multipartTimeoutSeconds + 300,
+      limit,
+    });
 
-    if (this.activeMultipartUploads >= limit) {
+    if (lease.active > limit) {
       const retryAfterMs = 1000;
 
       throw new ApiError("rate_limited", {
         messageKey: "api.validation.upload_admission_limit",
         details: {
-          active_uploads: this.activeMultipartUploads,
+          active_uploads: Math.max(0, lease.active - 1),
           limit,
           pressure: "limited",
           retry_after_ms: retryAfterMs,
@@ -41,33 +52,27 @@ export class UploadAdmissionService {
       });
     }
 
-    this.activeMultipartUploads += 1;
-    let released = false;
-
     return {
-      release: () => {
-        if (released) {
-          return;
-        }
-
-        released = true;
-        this.activeMultipartUploads = Math.max(0, this.activeMultipartUploads - 1);
-      },
+      release: () => lease.release(),
     };
   }
 
-  getSnapshot(): UploadAdmissionSnapshot {
+  async getSnapshot(): Promise<UploadAdmissionSnapshot> {
     const limit = this.runtimeConfig.limits.upload.admissionConcurrency;
     const pressureDegradedThreshold = this.runtimeConfig.limits.upload.pressureDegradedThreshold;
+    const snapshot = await this.stateStore.getMultipartSnapshot({
+      limit,
+    });
     const pressure =
-      this.activeMultipartUploads >= limit
+      snapshot.active >= limit
         ? "limited"
-        : this.activeMultipartUploads >= pressureDegradedThreshold
+        : snapshot.active >= pressureDegradedThreshold
           ? "degraded"
           : "normal";
 
     return {
-      activeMultipartUploads: this.activeMultipartUploads,
+      activeMultipartUploads: snapshot.active,
+      backend: snapshot.backend,
       multipartAdmissionLimit: limit,
       pressureDegradedThreshold,
       pressure,

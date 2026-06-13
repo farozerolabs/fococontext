@@ -1699,6 +1699,22 @@ export class FococontextClient {
     return this.postJson(`/knowledge-bases/${encodePath(knowledgeBaseId)}/imports`, input, options);
   }
 
+  getBatchImportStatus<TData = JsonObject>(
+    knowledgeBaseId: string,
+    importJobId: string,
+    input: ListOptions = {},
+    options: RequestOptions = {},
+  ): Promise<TData> {
+    return this.requestJson(
+      `/knowledge-bases/${encodePath(knowledgeBaseId)}/imports/${encodePath(importJobId)}`,
+      options,
+      {
+        method: "GET",
+        query: toPageQuery(input),
+      },
+    );
+  }
+
   retrieveKnowledgeContext<TData = RetrieveResponse>(
     knowledgeBaseId: string,
     input: RetrieveRequest,

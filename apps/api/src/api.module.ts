@@ -60,6 +60,11 @@ import {
 import { DocumentService } from "./documents/document.service.js";
 import { UploadAdmissionService } from "./documents/upload-admission.service.js";
 import {
+  createRedisUploadAdmissionStateStore,
+  uploadAdmissionStateStoreToken,
+  type UploadAdmissionStateStore,
+} from "./documents/upload-admission-state.store.js";
+import {
   JobController,
   KnowledgeBaseIngestProgressController,
   KnowledgeBaseJobController,
@@ -240,6 +245,7 @@ export interface ApiModuleOptions {
   runtimeCacheMetricsStore?: RuntimeCacheMetricsStore;
   runtimeApiMetricsStore?: RuntimeApiMetricsStore;
   runtimeQueuePressureRecorder?: RuntimeQueuePressureRecorder;
+  uploadAdmissionStateStore?: UploadAdmissionStateStore;
   retrievalQualityMetricsStore?: RetrievalQualityMetricsStore;
   securityAuditCounterStore?: SecurityAuditCounterStore;
   securityAuditStore?: SecurityAuditStore;
@@ -351,6 +357,11 @@ export class ApiModule implements NestModule {
           provide: runtimeQueuePressureRecorderToken,
           useValue:
             options.runtimeQueuePressureRecorder ?? createRedisRuntimeQueuePressureRecorder(config),
+        },
+        {
+          provide: uploadAdmissionStateStoreToken,
+          useValue:
+            options.uploadAdmissionStateStore ?? createRedisUploadAdmissionStateStore(config),
         },
         {
           provide: securityAuditStoreToken,

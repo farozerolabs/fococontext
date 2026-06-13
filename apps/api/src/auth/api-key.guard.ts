@@ -370,7 +370,7 @@ export function requiredApiKeyRoutePermission(
     return `cleanup:${access}`;
   }
   if (pathname.includes("/imports")) {
-    return "imports:write";
+    return `imports:${access}`;
   }
   if (pathname.includes("/knowledge-checks")) {
     return `knowledge_checks:${access}`;

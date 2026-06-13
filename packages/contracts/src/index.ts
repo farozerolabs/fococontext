@@ -5933,6 +5933,37 @@ const openApiPathDefinitions = {
       },
     },
   },
+  "/knowledge-bases/{knowledge_base_id}/imports/{import_job_id}": {
+    get: {
+      summary: "Get batch import status",
+      description:
+        "Returns durable batch import aggregate status and paginated item states for retry and progress polling.",
+      operationId: "getBatchImportStatus",
+      parameters: [
+        {
+          name: "knowledge_base_id",
+          in: "path",
+          required: true,
+          schema: {
+            $ref: "#/components/schemas/KnowledgeBaseId",
+          },
+        },
+        {
+          name: "import_job_id",
+          in: "path",
+          required: true,
+          schema: {
+            $ref: "#/components/schemas/JobId",
+          },
+        },
+        ...paginationParameters,
+      ],
+      responses: {
+        "200": standardJsonResponse,
+        ...standardErrorResponses,
+      },
+    },
+  },
   "/knowledge-bases/{knowledge_base_id}/jobs": {
     get: {
       summary: "List Knowledge Base jobs with compile stage events",
@@ -6725,7 +6756,7 @@ function classifyOpenApiOperation(
     return developerApiSecurity(`cleanup:${access}`, "cleanup", "source_scoped", access);
   }
   if (path.includes("/imports")) {
-    return developerApiSecurity("imports:write", "import", "source_scoped", "write");
+    return developerApiSecurity(`imports:${access}`, "import", "source_scoped", access);
   }
   if (path.includes("/knowledge-checks")) {
     return developerApiSecurity(

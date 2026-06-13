@@ -27,6 +27,7 @@ import type {
   DeletionCleanupStatus,
   DeletionCleanupTargetType,
 } from "../deletion-cleanup/deletion-cleanup.types.js";
+import type { BatchImportItemRecord, BatchImportRecord } from "../imports/batch-import.types.js";
 import type {
   ScheduledImportJobRecord,
   SourceWatchDiscoveredSource,
@@ -181,6 +182,12 @@ export interface PaginatedSourceWatchRuleReadResult {
 
 export interface PaginatedScheduledImportJobReadResult {
   items: ScheduledImportJobRecord[];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface PaginatedBatchImportItemReadResult {
+  items: BatchImportItemRecord[];
   total: number;
   hasMore: boolean;
 }
@@ -403,6 +410,11 @@ export interface OperationalReadStore {
     ruleId: string,
     input: Omit<PaginatedReadInput, "knowledgeBaseId">,
   ): Promise<PaginatedScheduledImportJobReadResult | null>;
+  getBatchImportById(batchId: string): Promise<BatchImportRecord | null>;
+  listBatchImportItems(
+    batchId: string,
+    input: Omit<PaginatedReadInput, "knowledgeBaseId">,
+  ): Promise<PaginatedBatchImportItemReadResult | null>;
   getScheduledImportJobById(jobId: string): Promise<ScheduledImportJobRecord | null>;
   listSourceWatchScanItems(
     input: SourceWatchScanItemReadInput,
@@ -554,6 +566,12 @@ export function createNoopOperationalReadStore(): OperationalReadStore {
       return new Map();
     },
     async listScheduledImportJobsByRuleId() {
+      return null;
+    },
+    async getBatchImportById() {
+      return null;
+    },
+    async listBatchImportItems() {
       return null;
     },
     async getScheduledImportJobById() {
@@ -2607,6 +2625,80 @@ class PostgresOperationalReadStore implements OperationalReadStore {
     };
   }
 
+  async getBatchImportById(batchId: string): Promise<BatchImportRecord | null> {
+    const result = await sql<BatchImportRow>`
+      select
+        id,
+        tenant_id,
+        project_id,
+        knowledge_base_id,
+        source_type,
+        status,
+        total_items,
+        accepted_items,
+        skipped_items,
+        validation_error_count,
+        completed_items,
+        failed_items,
+        enqueue_cursor,
+        retry_cursor,
+        metadata,
+        created_at,
+        updated_at
+      from upload_batches
+      where id = ${batchId}
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toBatchImportRecord(row);
+  }
+
+  async listBatchImportItems(
+    batchId: string,
+    input: Omit<PaginatedReadInput, "knowledgeBaseId">,
+  ): Promise<PaginatedBatchImportItemReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<BatchImportItemRow>`
+        select
+          id,
+          tenant_id,
+          project_id,
+          knowledge_base_id,
+          batch_id,
+          item_index,
+          source_type,
+          external_id,
+          idempotency_key,
+          status,
+          source_document_id,
+          ingest_job_id,
+          safe_error,
+          metadata,
+          created_at,
+          updated_at
+        from upload_batch_items
+        where batch_id = ${batchId}
+        order by item_index asc, id asc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from upload_batch_items
+        where batch_id = ${batchId}
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items: itemsResult.rows.map(toBatchImportItemRecord),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
   async getScheduledImportJobById(jobId: string): Promise<ScheduledImportJobRecord | null> {
     const result = await sql<ScheduledImportJobRow>`
       select
@@ -3578,6 +3670,45 @@ interface SourceWatchRuleRow {
   updated_at: unknown;
 }
 
+interface BatchImportRow {
+  id: string;
+  tenant_id: string;
+  project_id: string;
+  knowledge_base_id: string;
+  source_type: string;
+  status: string;
+  total_items: number;
+  accepted_items: number;
+  skipped_items: number;
+  validation_error_count: number;
+  completed_items: number;
+  failed_items: number;
+  enqueue_cursor: number;
+  retry_cursor: number;
+  metadata: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
+interface BatchImportItemRow {
+  id: string;
+  tenant_id: string;
+  project_id: string;
+  knowledge_base_id: string;
+  batch_id: string;
+  item_index: number;
+  source_type: string;
+  external_id: string | null;
+  idempotency_key: string | null;
+  status: string;
+  source_document_id: string | null;
+  ingest_job_id: string | null;
+  safe_error: unknown;
+  metadata: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
 interface ScheduledImportJobRow {
   id: string;
   source_watch_rule_id: string | null;
@@ -4125,6 +4256,49 @@ function toSourceWatchRuleRecord(row: SourceWatchRuleRow): SourceWatchRuleRecord
   };
 }
 
+function toBatchImportRecord(row: BatchImportRow): BatchImportRecord {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    projectId: row.project_id,
+    knowledgeBaseId: row.knowledge_base_id,
+    sourceType: readSourceType(row.source_type),
+    status: readBatchImportStatus(row.status),
+    totalItems: row.total_items,
+    acceptedItems: row.accepted_items,
+    skippedItems: row.skipped_items,
+    validationErrorCount: row.validation_error_count,
+    completedItems: row.completed_items,
+    failedItems: row.failed_items,
+    enqueueCursor: row.enqueue_cursor,
+    retryCursor: row.retry_cursor,
+    metadata: normalizeJsonObject(row.metadata),
+    createdAt: normalizeTimestamp(row.created_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toBatchImportItemRecord(row: BatchImportItemRow): BatchImportItemRecord {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    projectId: row.project_id,
+    knowledgeBaseId: row.knowledge_base_id,
+    batchId: row.batch_id,
+    itemIndex: row.item_index,
+    sourceType: readSourceType(row.source_type),
+    externalId: row.external_id,
+    idempotencyKey: row.idempotency_key,
+    status: readBatchImportItemStatus(row.status),
+    sourceDocumentId: row.source_document_id,
+    ingestJobId: row.ingest_job_id,
+    safeError: normalizeNullableJsonObject(row.safe_error),
+    metadata: normalizeJsonObject(row.metadata),
+    createdAt: normalizeTimestamp(row.created_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
 function toScheduledImportJobRecord(row: ScheduledImportJobRow): ScheduledImportJobRecord {
   const stagedItemCount = readCount(row.staged_item_count ?? undefined);
 
@@ -4626,6 +4800,34 @@ function readSourceType(value: unknown): SourceType {
   }
 
   return "file";
+}
+
+function readBatchImportStatus(value: unknown): BatchImportRecord["status"] {
+  if (
+    value === "queued" ||
+    value === "running" ||
+    value === "completed" ||
+    value === "failed" ||
+    value === "canceled"
+  ) {
+    return value;
+  }
+
+  return "failed";
+}
+
+function readBatchImportItemStatus(value: unknown): BatchImportItemRecord["status"] {
+  if (
+    value === "accepted" ||
+    value === "validation_failed" ||
+    value === "skipped" ||
+    value === "created" ||
+    value === "failed"
+  ) {
+    return value;
+  }
+
+  return "failed";
 }
 
 function readSourceDocumentStatus(value: unknown): SourceDocumentStatus {

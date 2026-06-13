@@ -28,6 +28,7 @@ import type {
   SourceDocumentRecord,
   UploadSessionRecord,
 } from "../documents/document.types.js";
+import type { BatchImportItemRecord, BatchImportRecord } from "../imports/batch-import.types.js";
 import type {
   KnowledgeCheckFinding,
   KnowledgeCheckRecord,
@@ -58,6 +59,10 @@ export interface ApiDatabaseMirror {
   ): Promise<void>;
   saveUploadSession(record: UploadSessionRecord): Promise<void>;
   updateUploadSession(record: UploadSessionRecord): Promise<void>;
+  saveBatchImport(record: BatchImportRecord): Promise<void>;
+  updateBatchImport(record: BatchImportRecord): Promise<void>;
+  saveBatchImportItems(records: readonly BatchImportItemRecord[]): Promise<void>;
+  updateBatchImportItem(record: BatchImportItemRecord): Promise<void>;
   saveDeletionCleanupOperation(record: DeletionCleanupOperationRecord): Promise<void>;
   updateDeletionCleanupOperation(record: DeletionCleanupOperationRecord): Promise<void>;
   saveDeletionCleanupItems(records: readonly DeletionCleanupItemRecord[]): Promise<void>;
@@ -734,6 +739,123 @@ class PostgresApiDatabaseMirror implements ApiDatabaseMirror {
 
   async updateUploadSession(record: UploadSessionRecord): Promise<void> {
     await this.saveUploadSession(record);
+  }
+
+  async saveBatchImport(record: BatchImportRecord): Promise<void> {
+    const scope = await requireKnowledgeBaseTenantProject(this.db, record.knowledgeBaseId);
+
+    await sql`
+      insert into upload_batches (
+        id,
+        tenant_id,
+        project_id,
+        knowledge_base_id,
+        source_type,
+        status,
+        total_items,
+        accepted_items,
+        skipped_items,
+        validation_error_count,
+        completed_items,
+        failed_items,
+        enqueue_cursor,
+        retry_cursor,
+        metadata,
+        created_at,
+        updated_at
+      )
+      values (
+        ${record.id},
+        ${scope.tenantId},
+        ${scope.projectId},
+        ${record.knowledgeBaseId},
+        ${record.sourceType},
+        ${record.status},
+        ${record.totalItems},
+        ${record.acceptedItems},
+        ${record.skippedItems},
+        ${record.validationErrorCount},
+        ${record.completedItems},
+        ${record.failedItems},
+        ${record.enqueueCursor},
+        ${record.retryCursor},
+        ${JSON.stringify(record.metadata)}::jsonb,
+        ${record.createdAt},
+        ${record.updatedAt}
+      )
+      on conflict (id) do update set
+        status = excluded.status,
+        total_items = excluded.total_items,
+        accepted_items = excluded.accepted_items,
+        skipped_items = excluded.skipped_items,
+        validation_error_count = excluded.validation_error_count,
+        completed_items = excluded.completed_items,
+        failed_items = excluded.failed_items,
+        enqueue_cursor = excluded.enqueue_cursor,
+        retry_cursor = excluded.retry_cursor,
+        metadata = excluded.metadata,
+        updated_at = excluded.updated_at
+    `.execute(this.db);
+  }
+
+  async updateBatchImport(record: BatchImportRecord): Promise<void> {
+    await this.saveBatchImport(record);
+  }
+
+  async saveBatchImportItems(records: readonly BatchImportItemRecord[]): Promise<void> {
+    for (const record of records) {
+      await this.updateBatchImportItem(record);
+    }
+  }
+
+  async updateBatchImportItem(record: BatchImportItemRecord): Promise<void> {
+    const scope = await requireKnowledgeBaseTenantProject(this.db, record.knowledgeBaseId);
+
+    await sql`
+      insert into upload_batch_items (
+        id,
+        tenant_id,
+        project_id,
+        knowledge_base_id,
+        batch_id,
+        item_index,
+        source_type,
+        external_id,
+        idempotency_key,
+        status,
+        source_document_id,
+        ingest_job_id,
+        safe_error,
+        metadata,
+        created_at,
+        updated_at
+      )
+      values (
+        ${record.id},
+        ${scope.tenantId},
+        ${scope.projectId},
+        ${record.knowledgeBaseId},
+        ${record.batchId},
+        ${record.itemIndex},
+        ${record.sourceType},
+        ${record.externalId},
+        ${record.idempotencyKey},
+        ${record.status},
+        ${record.sourceDocumentId},
+        ${record.ingestJobId},
+        ${record.safeError === null ? null : JSON.stringify(record.safeError)}::jsonb,
+        ${JSON.stringify(record.metadata)}::jsonb,
+        ${record.createdAt},
+        ${record.updatedAt}
+      )
+      on conflict (id) do update set
+        status = excluded.status,
+        source_document_id = excluded.source_document_id,
+        ingest_job_id = excluded.ingest_job_id,
+        safe_error = excluded.safe_error,
+        metadata = excluded.metadata,
+        updated_at = excluded.updated_at
+    `.execute(this.db);
   }
 
   async saveJob(record: JobRecord): Promise<void> {

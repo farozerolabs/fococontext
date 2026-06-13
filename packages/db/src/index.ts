@@ -28,6 +28,8 @@ export const expectedSchemaTables = [
   "knowledge_base_dataset_configuration_snapshots",
   "source_documents",
   "upload_sessions",
+  "upload_batches",
+  "upload_batch_items",
   "parsed_contents",
   "media_assets",
   "ocr_page_statuses",
