@@ -4,12 +4,15 @@ import {
   GetObjectCommand,
   HeadBucketCommand,
   HeadObjectCommand,
+  ListObjectVersionsCommand,
   ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
   type DeleteObjectsCommandOutput,
   type GetObjectCommandOutput,
   type HeadObjectCommandOutput,
+  type ListObjectVersionsCommandOutput,
+  type ListObjectsV2CommandOutput,
   type PutObjectCommandInput,
 } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
@@ -80,6 +83,29 @@ export interface DeleteObjectsInput {
   batchSize?: number;
 }
 
+export interface DeleteObjectVersionIdentifier {
+  key: string;
+  versionId?: string;
+}
+
+export interface DeleteObjectVersionsInput {
+  objects: DeleteObjectVersionIdentifier[];
+  batchSize?: number;
+}
+
+export interface ListObjectsByPrefixInput {
+  continuationToken?: string;
+  maxKeys?: number;
+  prefix: string;
+}
+
+export interface ListObjectVersionsByPrefixInput {
+  keyMarker?: string;
+  maxKeys?: number;
+  prefix: string;
+  versionIdMarker?: string;
+}
+
 export interface HeadObjectInput {
   key: string;
 }
@@ -128,6 +154,12 @@ export interface DeletedObjectItem {
   status: "deleted";
 }
 
+export interface DeletedObjectVersionItem {
+  key: string;
+  status: "deleted";
+  versionId?: string;
+}
+
 export interface DeleteObjectFailure {
   key: string;
   code?: string;
@@ -135,10 +167,57 @@ export interface DeleteObjectFailure {
   retryable: boolean;
 }
 
+export interface DeleteObjectVersionFailure {
+  key: string;
+  code?: string;
+  message: string;
+  retryable: boolean;
+  versionId?: string;
+}
+
 export interface DeleteObjectsResult {
   bucket: string;
   deleted: DeletedObjectItem[];
   failed: DeleteObjectFailure[];
+}
+
+export interface DeleteObjectVersionsResult {
+  bucket: string;
+  deleted: DeletedObjectVersionItem[];
+  failed: DeleteObjectVersionFailure[];
+}
+
+export interface ListedObjectItem {
+  etag?: string;
+  key: string;
+  lastModified?: Date;
+  size?: number;
+}
+
+export interface ListedObjectVersionItem {
+  etag?: string;
+  isDeleteMarker: boolean;
+  key: string;
+  lastModified?: Date;
+  size?: number;
+  versionId?: string;
+}
+
+export interface ListObjectsByPrefixResult {
+  bucket: string;
+  isTruncated: boolean;
+  nextContinuationToken?: string;
+  objects: ListedObjectItem[];
+  prefix: string;
+}
+
+export interface ListObjectVersionsByPrefixResult {
+  bucket: string;
+  isTruncated: boolean;
+  nextKeyMarker?: string;
+  nextVersionIdMarker?: string;
+  prefix: string;
+  versions: ListedObjectVersionItem[];
 }
 
 export interface ObjectStorageAdapter {
@@ -148,6 +227,11 @@ export interface ObjectStorageAdapter {
   headObject(input: HeadObjectInput): Promise<HeadObjectResult>;
   deleteObject(input: DeleteObjectInput): Promise<DeleteObjectResult>;
   deleteObjects(input: DeleteObjectsInput): Promise<DeleteObjectsResult>;
+  deleteObjectVersions?(input: DeleteObjectVersionsInput): Promise<DeleteObjectVersionsResult>;
+  listObjectsByPrefix(input: ListObjectsByPrefixInput): Promise<ListObjectsByPrefixResult>;
+  listObjectVersionsByPrefix?(
+    input: ListObjectVersionsByPrefixInput,
+  ): Promise<ListObjectVersionsByPrefixResult>;
   createPresignedGetUrl(input: PresignedObjectUrlInput): Promise<string>;
   createPresignedPutUrl(input: PresignedObjectUrlInput): Promise<string>;
   getDiagnostics(): Promise<ObjectStorageDiagnostics>;
@@ -208,6 +292,8 @@ type StorageCommand =
   | HeadObjectCommand
   | DeleteObjectCommand
   | DeleteObjectsCommand
+  | ListObjectsV2Command
+  | ListObjectVersionsCommand
   | HeadBucketCommand;
 
 type PresignableStorageCommand = PutObjectCommand | GetObjectCommand;
@@ -229,6 +315,7 @@ const classAOperations = new Set([
   "CreateBucket",
   "CreateMultipartUpload",
   "ListBucket",
+  "ListObjectVersions",
   "ListObjects",
   "ListObjectsV2",
   "PostObject",
@@ -240,7 +327,12 @@ const classAOperations = new Set([
 
 const classBOperations = new Set(["GetBucketLocation", "GetObject", "HeadBucket", "HeadObject"]);
 
-const freeOperations = new Set(["AbortMultipartUpload", "DeleteObject", "DeleteObjects"]);
+const freeOperations = new Set([
+  "AbortMultipartUpload",
+  "DeleteObject",
+  "DeleteObjectVersions",
+  "DeleteObjects",
+]);
 
 export interface S3CompatibleClient {
   send(command: StorageCommand, options?: { abortSignal?: AbortSignal }): Promise<unknown>;
@@ -447,6 +539,150 @@ export class S3ObjectStorageAdapter implements ObjectStorageAdapter {
     return result;
   }
 
+  async deleteObjectVersions(
+    input: DeleteObjectVersionsInput,
+  ): Promise<DeleteObjectVersionsResult> {
+    const result: DeleteObjectVersionsResult = {
+      bucket: this.config.bucket,
+      deleted: [],
+      failed: [],
+    };
+    const batchSize = normalizeDeleteBatchSize(input.batchSize);
+
+    for (const objects of chunkObjectVersions(input.objects, batchSize)) {
+      try {
+        const response = (await this.recordOperation("DeleteObjectVersions", () =>
+          this.client.send(
+            new DeleteObjectsCommand({
+              Bucket: this.config.bucket,
+              Delete: {
+                Objects: objects.map((object) => ({
+                  Key: object.key,
+                  ...(object.versionId === undefined ? {} : { VersionId: object.versionId }),
+                })),
+                Quiet: false,
+              },
+            }),
+          ),
+        )) as DeleteObjectsCommandOutput;
+
+        mergeDeleteObjectVersionsResponse(
+          result,
+          objects,
+          response,
+          this.getSecretRedactionValues(),
+        );
+      } catch (error) {
+        if (isBulkDeleteUnsupportedError(error)) {
+          await this.deleteObjectVersionsIndividually(objects, result);
+          continue;
+        }
+
+        for (const object of objects) {
+          result.failed.push(
+            createDeleteObjectVersionFailure(object, error, this.getSecretRedactionValues()),
+          );
+        }
+      }
+    }
+
+    return result;
+  }
+
+  async listObjectsByPrefix(input: ListObjectsByPrefixInput): Promise<ListObjectsByPrefixResult> {
+    const result = (await this.recordOperation("ListObjectsV2", () =>
+      this.client.send(
+        new ListObjectsV2Command({
+          Bucket: this.config.bucket,
+          ContinuationToken: input.continuationToken,
+          MaxKeys: normalizeListObjectsMaxKeys(input.maxKeys),
+          Prefix: input.prefix,
+        }),
+      ),
+    )) as ListObjectsV2CommandOutput;
+
+    return {
+      bucket: this.config.bucket,
+      isTruncated: result.IsTruncated === true,
+      ...(result.NextContinuationToken === undefined
+        ? {}
+        : { nextContinuationToken: result.NextContinuationToken }),
+      objects: (result.Contents ?? []).flatMap((item) => {
+        if (item.Key === undefined || item.Key.length === 0) {
+          return [];
+        }
+
+        return [
+          {
+            key: item.Key,
+            ...(item.ETag === undefined ? {} : { etag: item.ETag }),
+            ...(item.LastModified === undefined ? {} : { lastModified: item.LastModified }),
+            ...(item.Size === undefined ? {} : { size: item.Size }),
+          },
+        ];
+      }),
+      prefix: input.prefix,
+    };
+  }
+
+  async listObjectVersionsByPrefix(
+    input: ListObjectVersionsByPrefixInput,
+  ): Promise<ListObjectVersionsByPrefixResult> {
+    const result = (await this.recordOperation("ListObjectVersions", () =>
+      this.client.send(
+        new ListObjectVersionsCommand({
+          Bucket: this.config.bucket,
+          KeyMarker: input.keyMarker,
+          MaxKeys: normalizeListObjectsMaxKeys(input.maxKeys),
+          Prefix: input.prefix,
+          VersionIdMarker: input.versionIdMarker,
+        }),
+      ),
+    )) as ListObjectVersionsCommandOutput;
+
+    return {
+      bucket: this.config.bucket,
+      isTruncated: result.IsTruncated === true,
+      ...(result.NextKeyMarker === undefined ? {} : { nextKeyMarker: result.NextKeyMarker }),
+      ...(result.NextVersionIdMarker === undefined
+        ? {}
+        : { nextVersionIdMarker: result.NextVersionIdMarker }),
+      prefix: input.prefix,
+      versions: [
+        ...(result.Versions ?? []).flatMap((item) => {
+          if (item.Key === undefined || item.Key.length === 0) {
+            return [];
+          }
+
+          return [
+            {
+              etag: item.ETag,
+              isDeleteMarker: false,
+              key: item.Key,
+              ...(item.LastModified === undefined ? {} : { lastModified: item.LastModified }),
+              ...(item.Size === undefined ? {} : { size: item.Size }),
+              ...(item.VersionId === undefined ? {} : { versionId: item.VersionId }),
+            },
+          ];
+        }),
+        ...(result.DeleteMarkers ?? []).flatMap((item) => {
+          if (item.Key === undefined || item.Key.length === 0) {
+            return [];
+          }
+
+          return [
+            {
+              isDeleteMarker: true,
+              key: item.Key,
+              ...(item.LastModified === undefined ? {} : { lastModified: item.LastModified }),
+              ...(item.VersionId === undefined ? {} : { versionId: item.VersionId }),
+            },
+          ];
+        }),
+      ],
+    };
+  }
+
   async createPresignedGetUrl(input: PresignedObjectUrlInput): Promise<string> {
     return this.recordOperation("PresignGetObject", () =>
       this.presigner(
@@ -525,6 +761,47 @@ export class S3ObjectStorageAdapter implements ObjectStorageAdapter {
     }
   }
 
+  private async deleteObjectVersionsIndividually(
+    objects: DeleteObjectVersionIdentifier[],
+    result: DeleteObjectVersionsResult,
+  ): Promise<void> {
+    for (const object of objects) {
+      try {
+        await this.recordOperation(
+          "DeleteObject",
+          async () =>
+            this.client.send(
+              new DeleteObjectCommand({
+                Bucket: this.config.bucket,
+                Key: object.key,
+                ...(object.versionId === undefined ? {} : { VersionId: object.versionId }),
+              }),
+            ),
+          undefined,
+          isObjectMissingError,
+        );
+        result.deleted.push({
+          key: object.key,
+          status: "deleted",
+          ...(object.versionId === undefined ? {} : { versionId: object.versionId }),
+        });
+      } catch (error) {
+        if (isObjectMissingError(error)) {
+          result.deleted.push({
+            key: object.key,
+            status: "deleted",
+            ...(object.versionId === undefined ? {} : { versionId: object.versionId }),
+          });
+          continue;
+        }
+
+        result.failed.push(
+          createDeleteObjectVersionFailure(object, error, this.getSecretRedactionValues()),
+        );
+      }
+    }
+  }
+
   private getSecretRedactionValues(): string[] {
     return [this.config.accessKeyId, this.config.secretAccessKey].filter(
       (value) => value.length > 0,
@@ -591,6 +868,32 @@ export function createInstrumentedObjectStorageAdapter(
         operation: "DeleteObjects",
         run: () => adapter.deleteObjects(input),
       }),
+    ...(adapter.deleteObjectVersions === undefined
+      ? {}
+      : {
+          deleteObjectVersions: (input: DeleteObjectVersionsInput) =>
+            recordObjectStorageOperation({
+              ...options,
+              operation: "DeleteObjectVersions",
+              run: () => adapter.deleteObjectVersions!(input),
+            }),
+        }),
+    listObjectsByPrefix: (input) =>
+      recordObjectStorageOperation({
+        ...options,
+        operation: "ListObjectsV2",
+        run: () => adapter.listObjectsByPrefix(input),
+      }),
+    ...(adapter.listObjectVersionsByPrefix === undefined
+      ? {}
+      : {
+          listObjectVersionsByPrefix: (input: ListObjectVersionsByPrefixInput) =>
+            recordObjectStorageOperation({
+              ...options,
+              operation: "ListObjectVersions",
+              run: () => adapter.listObjectVersionsByPrefix!(input),
+            }),
+        }),
     createPresignedGetUrl: (input) =>
       recordObjectStorageOperation({
         ...options,
@@ -861,12 +1164,87 @@ function mergeDeleteObjectsResponse(
   }
 }
 
+function mergeDeleteObjectVersionsResponse(
+  result: DeleteObjectVersionsResult,
+  objects: DeleteObjectVersionIdentifier[],
+  response: DeleteObjectsCommandOutput,
+  redactionValues: string[],
+): void {
+  const handledObjects = new Set<string>();
+
+  for (const deleted of response.Deleted ?? []) {
+    if (typeof deleted.Key !== "string") {
+      continue;
+    }
+    const deletedObject: DeleteObjectVersionIdentifier = {
+      key: deleted.Key,
+      ...(typeof deleted.VersionId === "string" ? { versionId: deleted.VersionId } : {}),
+    };
+    handledObjects.add(createObjectVersionIdentity(deletedObject));
+    result.deleted.push({
+      key: deletedObject.key,
+      status: "deleted",
+      ...(deletedObject.versionId === undefined ? {} : { versionId: deletedObject.versionId }),
+    });
+  }
+
+  for (const error of response.Errors ?? []) {
+    if (typeof error.Key !== "string") {
+      continue;
+    }
+    const failedObject: DeleteObjectVersionIdentifier = {
+      key: error.Key,
+      ...(typeof error.VersionId === "string" ? { versionId: error.VersionId } : {}),
+    };
+    handledObjects.add(createObjectVersionIdentity(failedObject));
+
+    if (isMissingObjectCode(error.Code)) {
+      result.deleted.push({
+        key: failedObject.key,
+        status: "deleted",
+        ...(failedObject.versionId === undefined ? {} : { versionId: failedObject.versionId }),
+      });
+      continue;
+    }
+
+    result.failed.push({
+      key: failedObject.key,
+      ...(typeof error.Code === "string" ? { code: error.Code } : {}),
+      message:
+        typeof error.Message === "string"
+          ? sanitizeErrorMessage(error.Message, redactionValues)
+          : "Object version deletion failed.",
+      retryable: true,
+      ...(failedObject.versionId === undefined ? {} : { versionId: failedObject.versionId }),
+    });
+  }
+
+  for (const object of objects) {
+    if (handledObjects.has(createObjectVersionIdentity(object))) {
+      continue;
+    }
+    result.deleted.push({
+      key: object.key,
+      status: "deleted",
+      ...(object.versionId === undefined ? {} : { versionId: object.versionId }),
+    });
+  }
+}
+
 function normalizeDeleteBatchSize(batchSize: number | undefined): number {
   if (batchSize === undefined || !Number.isFinite(batchSize)) {
     return s3DeleteObjectsMaxBatchSize;
   }
 
   return Math.max(1, Math.min(Math.trunc(batchSize), s3DeleteObjectsMaxBatchSize));
+}
+
+function normalizeListObjectsMaxKeys(maxKeys: number | undefined): number {
+  if (maxKeys === undefined || !Number.isFinite(maxKeys)) {
+    return s3DeleteObjectsMaxBatchSize;
+  }
+
+  return Math.max(1, Math.min(Math.trunc(maxKeys), s3DeleteObjectsMaxBatchSize));
 }
 
 function chunkKeys(keys: string[], batchSize: number): string[][] {
@@ -880,6 +1258,37 @@ function chunkKeys(keys: string[], batchSize: number): string[][] {
   return chunks;
 }
 
+function chunkObjectVersions(
+  objects: DeleteObjectVersionIdentifier[],
+  batchSize: number,
+): DeleteObjectVersionIdentifier[][] {
+  const chunks: DeleteObjectVersionIdentifier[][] = [];
+  const seen = new Set<string>();
+  const uniqueObjects = objects.filter((object) => {
+    if (object.key.length === 0) {
+      return false;
+    }
+    const identity = createObjectVersionIdentity(object);
+
+    if (seen.has(identity)) {
+      return false;
+    }
+    seen.add(identity);
+
+    return true;
+  });
+
+  for (let index = 0; index < uniqueObjects.length; index += batchSize) {
+    chunks.push(uniqueObjects.slice(index, index + batchSize));
+  }
+
+  return chunks;
+}
+
+function createObjectVersionIdentity(object: DeleteObjectVersionIdentifier): string {
+  return `${object.key}\u0000${object.versionId ?? ""}`;
+}
+
 function createDeleteObjectFailure(
   key: string,
   error: unknown,
@@ -890,6 +1299,20 @@ function createDeleteObjectFailure(
     ...readOptionalErrorCode(error),
     message: sanitizeErrorMessage(getErrorMessage(error), redactionValues),
     retryable: !isObjectMissingError(error),
+  };
+}
+
+function createDeleteObjectVersionFailure(
+  object: DeleteObjectVersionIdentifier,
+  error: unknown,
+  redactionValues: string[] = [],
+): DeleteObjectVersionFailure {
+  return {
+    key: object.key,
+    ...readOptionalErrorCode(error),
+    message: sanitizeErrorMessage(getErrorMessage(error), redactionValues),
+    retryable: !isObjectMissingError(error),
+    ...(object.versionId === undefined ? {} : { versionId: object.versionId }),
   };
 }
 

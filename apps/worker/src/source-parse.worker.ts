@@ -1,6 +1,6 @@
 import { Worker } from "bullmq";
 import { createResourceId } from "@fococontext/contracts";
-import type { RuntimeConfig } from "@fococontext/core";
+import { createParsedContentObjectKey, type RuntimeConfig } from "@fococontext/core";
 import {
   createDefaultParserRegistry,
   createNoopParserCache,
@@ -31,6 +31,7 @@ import {
   createParserConfigHash,
   createParserProcessingUnits,
   createParserUnitDedupeKey,
+  remapParsedContentObjectKeys,
   type ParserMarkdownWindow,
 } from "./source-parse-processing-state.js";
 import type {
@@ -342,16 +343,17 @@ export class SourceParseProcessor {
       return this.createFailedResult(payload, postParseGuardError);
     }
 
+    const parsedContent = remapParsedContentObjectKeys(result.parsedContent, payload);
     const normalizedMarkdownObjectKey = createNormalizedMarkdownObjectKey(payload);
     const markdownWindows = createMarkdownWindows({
-      markdown: result.parsedContent.normalizedMarkdown,
+      markdown: parsedContent.normalizedMarkdown,
       maxChars: this.processingStateMarkdownWindowChars,
       payload,
     });
 
     await this.objectStorage.putObject({
       key: normalizedMarkdownObjectKey,
-      body: Buffer.from(result.parsedContent.normalizedMarkdown),
+      body: Buffer.from(parsedContent.normalizedMarkdown),
       contentType: "text/markdown",
       metadata: {
         documentId: payload.document_id,
@@ -363,30 +365,30 @@ export class SourceParseProcessor {
       id: parsedContentId,
       document_id: payload.document_id,
       ...createMarkdownPreview(
-        result.parsedContent.normalizedMarkdown,
+        parsedContent.normalizedMarkdown,
         normalizedMarkdownObjectKey,
         this.previewMaxChars,
       ),
-      parser_name: result.parsedContent.parserName,
-      parser_version: result.parsedContent.parserVersion,
-      normalized_markdown: result.parsedContent.normalizedMarkdown,
+      parser_name: parsedContent.parserName,
+      parser_version: parsedContent.parserVersion,
+      normalized_markdown: parsedContent.normalizedMarkdown,
       normalized_markdown_object_key: normalizedMarkdownObjectKey,
-      locators: result.parsedContent.locators.map(toJsonObject),
-      tables: result.parsedContent.tables.map(toJsonObject),
-      warnings: result.parsedContent.warnings.map(toJsonObject),
+      locators: parsedContent.locators.map(toJsonObject),
+      tables: parsedContent.tables.map(toJsonObject),
+      warnings: parsedContent.warnings.map(toJsonObject),
       error: null,
     });
-    const mediaAssets = result.parsedContent.mediaAssets.map((asset) =>
+    const mediaAssets = parsedContent.mediaAssets.map((asset) =>
       toMediaAssetWrite(payload.document_id, parsedContentId, asset),
     );
 
-    await this.writeMediaAssetObjects(result.parsedContent.mediaAssets, payload, parsedContentId);
+    await this.writeMediaAssetObjects(parsedContent.mediaAssets, payload, parsedContentId);
     await this.writer.saveMediaAssets(mediaAssets);
     await this.processingState?.upsertUnits(
       createParserProcessingUnits({
         configHash: parserConfigHash,
         markdownWindows,
-        parsedContent: result.parsedContent,
+        parsedContent,
         parsedContentId,
         payload,
       }),
@@ -395,23 +397,23 @@ export class SourceParseProcessor {
       configHash: parserConfigHash,
       contentHash: payload.content_hash,
       counters: {
-        locator_count: result.parsedContent.locators.length,
-        markdown_chars: result.parsedContent.normalizedMarkdown.length,
-        media_asset_count: result.parsedContent.mediaAssets.length,
-        table_count: result.parsedContent.tables.length,
-        warning_count: result.parsedContent.warnings.length,
+        locator_count: parsedContent.locators.length,
+        markdown_chars: parsedContent.normalizedMarkdown.length,
+        media_asset_count: parsedContent.mediaAssets.length,
+        table_count: parsedContent.tables.length,
+        warning_count: parsedContent.warnings.length,
       },
       jobId: payload.job_id,
       objectKey: normalizedMarkdownObjectKey,
       parsedContentId,
-      parserName: result.parsedContent.parserName,
-      parserVersion: result.parsedContent.parserVersion,
+      parserName: parsedContent.parserName,
+      parserVersion: parsedContent.parserVersion,
       sourceDocumentId: payload.document_id,
       stage: "parsed_artifact",
       status: "succeeded",
       unitKey: "normalized_markdown",
       unitType: "normalized_markdown",
-      warnings: result.parsedContent.warnings.map(toJsonObject),
+      warnings: parsedContent.warnings.map(toJsonObject),
     });
     await this.processingState?.upsertUnits(
       createMediaExtractionProcessingUnits({
@@ -432,8 +434,8 @@ export class SourceParseProcessor {
       jobId: payload.job_id,
       objectKey: payload.object_key,
       parsedContentId,
-      parserName: result.parsedContent.parserName,
-      parserVersion: result.parsedContent.parserVersion,
+      parserName: parsedContent.parserName,
+      parserVersion: parsedContent.parserVersion,
       sourceDocumentId: payload.document_id,
       stage: "parsing",
       status: "succeeded",
@@ -443,7 +445,7 @@ export class SourceParseProcessor {
 
     const ocrDecision = evaluateSourceOcrDecision({
       payload,
-      normalizedMarkdown: result.parsedContent.normalizedMarkdown,
+      normalizedMarkdown: parsedContent.normalizedMarkdown,
       ocrQueue: this.ocrQueue,
     });
 
@@ -1038,17 +1040,15 @@ function toJsonObject(value: object): Record<string, unknown> {
 }
 
 function createNormalizedMarkdownObjectKey(payload: SourceParsePayload): string {
-  return `parsed/${payload.document_id}/${sanitizeObjectKeySegment(
-    payload.content_hash,
-  )}/normalized.md`;
+  return createParsedContentObjectKey({
+    knowledgeBaseId: payload.knowledge_base_id,
+    documentId: payload.document_id,
+    contentHash: payload.content_hash,
+  });
 }
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
-}
-
-function sanitizeObjectKeySegment(value: string): string {
-  return value.replace(/[^a-zA-Z0-9._-]+/g, "_");
 }
 
 function normalizePositiveInteger(value: number | undefined, fallback: number): number {

@@ -99,6 +99,11 @@ const promptPurposes = [
 export const deletionCleanupTargetTypes = [
   "knowledge_base",
   "source_document",
+  "wiki_page",
+  "wiki_page_version",
+  "wiki_edge",
+  "job",
+  "job_artifact",
   "source_watch_rule",
   "webhook",
   "import_preview",
@@ -118,6 +123,7 @@ export const deletionCleanupPhases = [
   "manifest",
   "fencing",
   "object_cleanup",
+  "redis_cleanup",
   "database_cleanup",
   "retention",
   "completed",
@@ -125,7 +131,13 @@ export const deletionCleanupPhases = [
   "canceled",
 ] as const;
 
-export const deletionCleanupItemTypes = ["object", "database_row", "reference", "audit"] as const;
+export const deletionCleanupItemTypes = [
+  "object",
+  "database_row",
+  "redis_key",
+  "reference",
+  "audit",
+] as const;
 
 export const deletionCleanupItemStatuses = [
   "pending",
@@ -419,6 +431,7 @@ export interface DeletionCleanupOperationCounts {
   failedItemCount: number;
   objectKeyCount: number;
   databaseRowCount: number;
+  redisKeyCount: number;
 }
 
 export interface DeletionCleanupOperationRecord extends DeletionCleanupOperationCounts {
@@ -1424,6 +1437,7 @@ export const openApiComponents = {
         "manifest",
         "fencing",
         "object_cleanup",
+        "redis_cleanup",
         "database_cleanup",
         "retention",
         "completed",
@@ -4773,6 +4787,7 @@ export const openApiComponents = {
         "failed",
         "object_keys",
         "database_rows",
+        "redis_keys",
       ],
       properties: {
         total: {
@@ -4800,6 +4815,10 @@ export const openApiComponents = {
           minimum: 0,
         },
         database_rows: {
+          type: "integer",
+          minimum: 0,
+        },
+        redis_keys: {
           type: "integer",
           minimum: 0,
         },
@@ -4850,7 +4869,16 @@ export const openApiComponents = {
     },
     CleanupSettledState: {
       type: "object",
-      required: ["is_settled", "phase", "object_storage", "database", "residual_artifacts"],
+      required: [
+        "is_settled",
+        "phase",
+        "object_storage",
+        "database",
+        "redis",
+        "legacy_layout",
+        "versioned_object_storage",
+        "residual_artifacts",
+      ],
       properties: {
         is_settled: {
           type: "boolean",
@@ -4862,6 +4890,15 @@ export const openApiComponents = {
           $ref: "#/components/schemas/CleanupPhaseArtifactState",
         },
         database: {
+          $ref: "#/components/schemas/CleanupPhaseArtifactState",
+        },
+        redis: {
+          $ref: "#/components/schemas/CleanupPhaseArtifactState",
+        },
+        legacy_layout: {
+          $ref: "#/components/schemas/CleanupPhaseArtifactState",
+        },
+        versioned_object_storage: {
           $ref: "#/components/schemas/CleanupPhaseArtifactState",
         },
         residual_artifacts: {
@@ -4894,6 +4931,11 @@ export const openApiComponents = {
           enum: [
             "knowledge_base",
             "source_document",
+            "wiki_page",
+            "wiki_page_version",
+            "wiki_edge",
+            "job",
+            "job_artifact",
             "source_watch_rule",
             "webhook",
             "import_preview",
@@ -4980,7 +5022,7 @@ export const openApiComponents = {
         },
         item_type: {
           type: "string",
-          enum: ["object", "database_row", "reference", "audit"],
+          enum: ["object", "database_row", "redis_key", "reference", "audit"],
         },
         status: {
           type: "string",
@@ -5637,8 +5679,9 @@ const openApiPathDefinitions = {
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000",
               parser_name: "fococontext-ts-parser",
               parser_version: "0.1.0",
-              normalized_markdown_object_key: "parsed/doc_example/normalized.md",
-              source_object_key: "sources/doc_example/source.pdf",
+              normalized_markdown_object_key:
+                "kb/kb_example/parsed/doc_example/pc_example/normalized.md",
+              source_object_key: "kb/kb_example/sources/doc_example/source.pdf",
               warnings: [],
             },
             request_id: "req_example",
@@ -6115,7 +6158,7 @@ const openApiPathDefinitions = {
                       "sha256:0000000000000000000000000000000000000000000000000000000000000000",
                     parser_name: "fococontext-ts-parser",
                     parser_version: "0.1.0",
-                    source_object_key: "sources/doc_example/source.pdf",
+                    source_object_key: "kb/kb_example/sources/doc_example/source.pdf",
                     warnings: [],
                   },
                 },
@@ -6139,12 +6182,12 @@ const openApiPathDefinitions = {
                       "sha256:1111111111111111111111111111111111111111111111111111111111111111",
                     parser_name: "ts-pdf-parse",
                     parser_version: "0.1.0",
-                    source_object_key: "sources/doc_visual/source.pdf",
+                    source_object_key: "kb/kb_example/sources/doc_visual/source.pdf",
                     warnings: [],
                     media_evidence: {
                       media_asset_id: "med_visual",
                       mime_type: "image/png",
-                      object_key: "media/doc_visual/page-1.png",
+                      object_key: "kb/kb_example/media/doc_visual/page-1.png",
                       locator: {
                         source_format: "pdf",
                         asset_kind: "page_snapshot",

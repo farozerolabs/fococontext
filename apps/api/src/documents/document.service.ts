@@ -5,7 +5,7 @@ import type { Readable } from "node:stream";
 import { Transform } from "node:stream";
 import { Inject, Injectable } from "@nestjs/common";
 import { ApiError, createResourceId, resolveJobProgressState } from "@fococontext/contracts";
-import type { RuntimeConfig } from "@fococontext/core";
+import { createSourceObjectKey, type RuntimeConfig } from "@fococontext/core";
 import type { ObjectStorageAdapter } from "@fococontext/storage";
 
 import type {
@@ -115,6 +115,7 @@ const parsedContentMediaAssetPreviewLimit = 100;
 const documentDetailRelatedPageLimit = 100;
 const documentDetailPageVersionLimit = 200;
 const sourceDocumentDeletionMediaAssetLimit = 10_000;
+const sourceDocumentDeletionProcessingUnitLimit = 20_000;
 const expiredUploadSessionSweepLimit = 500;
 
 interface ParsedMarkdownPreviewOptions {
@@ -376,9 +377,11 @@ export class DocumentService {
       nowDate.getTime() + this.runtimeConfig.limits.upload.uploadSessionExpiresSeconds * 1000,
     ).toISOString();
     const documentId = createResourceId("sourceDocument");
-    const objectKey = `sources/${knowledgeBaseId}/${documentId}/${sanitizeObjectKeySegment(
+    const objectKey = createSourceObjectKey({
+      knowledgeBaseId,
+      documentId,
       fileName,
-    )}`;
+    });
     const session: UploadSessionRecord = {
       id: createResourceId("uploadSession"),
       ...createUploadSessionActorScope(scope),
@@ -926,21 +929,37 @@ export class DocumentService {
       },
       updatedAt: now,
     };
-    const [parsedContent, mediaAssetsResult, jobs] = await Promise.all([
+    const [parsedContent, mediaAssetsResult, processingUnitsResult, jobs] = await Promise.all([
       this.operationalReadStore.getParsedContentByDocumentId(updated.id),
       this.operationalReadStore.listMediaAssetsByDocumentId(updated.id, {
         page: 1,
         pageSize: sourceDocumentDeletionMediaAssetLimit,
       }),
+      this.operationalReadStore.listDocumentProcessingUnitsByDocumentId(updated.id, {
+        page: 1,
+        pageSize: sourceDocumentDeletionProcessingUnitLimit,
+      }),
       this.operationalReadStore.listJobsByDocumentId(updated.id),
     ]);
     const mediaAssets = mediaAssetsResult?.items ?? [];
+    const processingUnits = processingUnitsResult?.items ?? [];
 
     if (mediaAssetsResult?.hasMore === true) {
       throw new ApiError("invalid_request", {
         message: "Source document cleanup planning exceeded the synchronous media asset limit.",
         details: {
           limit: sourceDocumentDeletionMediaAssetLimit,
+          target_type: "source_document",
+          target_id: updated.id,
+        },
+      });
+    }
+
+    if (processingUnitsResult?.hasMore === true) {
+      throw new ApiError("invalid_request", {
+        message: "Source document cleanup planning exceeded the synchronous processing unit limit.",
+        details: {
+          limit: sourceDocumentDeletionProcessingUnitLimit,
           target_type: "source_document",
           target_id: updated.id,
         },
@@ -957,6 +976,7 @@ export class DocumentService {
         document: updated,
         parsedContent,
         mediaAssets,
+        processingUnits,
       }),
     });
     const manifest = collectSourceDocumentManifestFromRecords({
@@ -968,6 +988,7 @@ export class DocumentService {
       document: updated,
       parsedContent,
       mediaAssets,
+      processingUnits,
       jobs,
       jobEventsByJobId,
       activeObjectKeys,
@@ -1392,9 +1413,11 @@ export class DocumentService {
     signal: AbortSignal | undefined,
   ): Promise<UploadedFile> {
     const documentId = createResourceId("sourceDocument");
-    const objectKey = `sources/${knowledgeBaseId}/${documentId}/${sanitizeObjectKeySegment(
-      part.filename,
-    )}`;
+    const objectKey = createSourceObjectKey({
+      knowledgeBaseId,
+      documentId,
+      fileName: part.filename,
+    });
     const hash = createHash("sha256");
     let size = 0;
     const hashStream = new Transform({
@@ -1459,7 +1482,11 @@ export class DocumentService {
     },
   ): Promise<UploadedFile> {
     const documentId = createResourceId("sourceDocument");
-    const objectKey = `sources/${knowledgeBaseId}/${documentId}/${input.objectKeyName}`;
+    const objectKey = createSourceObjectKey({
+      knowledgeBaseId,
+      documentId,
+      fileName: input.objectKeyName,
+    });
 
     try {
       await this.objectStorage.putObject({

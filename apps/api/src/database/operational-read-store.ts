@@ -2976,6 +2976,7 @@ class PostgresOperationalReadStore implements OperationalReadStore {
           failed_item_count,
           object_key_count,
           database_row_count,
+          redis_key_count,
           attempt_count,
           max_attempts,
           retry_after,
@@ -3042,6 +3043,7 @@ class PostgresOperationalReadStore implements OperationalReadStore {
         failed_item_count,
         object_key_count,
         database_row_count,
+        redis_key_count,
         attempt_count,
         max_attempts,
         retry_after,
@@ -3793,6 +3795,7 @@ interface DeletionCleanupOperationRow {
   failed_item_count: number;
   object_key_count: number;
   database_row_count: number;
+  redis_key_count: number;
   attempt_count: number;
   max_attempts: number;
   retry_after: unknown;
@@ -4396,6 +4399,7 @@ function toDeletionCleanupOperationRecord(
     failedItemCount: row.failed_item_count,
     objectKeyCount: row.object_key_count,
     databaseRowCount: row.database_row_count,
+    redisKeyCount: row.redis_key_count,
     attemptCount: row.attempt_count,
     maxAttempts: row.max_attempts,
     retryAfter: normalizeNullableTimestamp(row.retry_after),

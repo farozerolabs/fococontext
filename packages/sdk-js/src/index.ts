@@ -123,6 +123,7 @@ export type CleanupPhase =
   | "manifest"
   | "fencing"
   | "object_cleanup"
+  | "redis_cleanup"
   | "database_cleanup"
   | "retention"
   | "completed"
@@ -135,6 +136,7 @@ export interface CleanupItemCounts {
   failed: number;
   object_keys: number;
   pending: number;
+  redis_keys: number;
   skipped: number;
   total: number;
 }
@@ -149,18 +151,21 @@ export interface CleanupPhaseArtifactState extends JsonObject {
 export interface CleanupSettledState extends JsonObject {
   database: CleanupPhaseArtifactState;
   is_settled: boolean;
+  legacy_layout: CleanupPhaseArtifactState;
   object_storage: CleanupPhaseArtifactState;
   phase: CleanupPhase;
+  redis: CleanupPhaseArtifactState;
   residual_artifacts: {
     failed: number;
     pending: number;
     total: number;
   };
+  versioned_object_storage: CleanupPhaseArtifactState;
 }
 
 export interface CleanupItemSummary extends JsonObject {
   id: string;
-  item_type: "object" | "database_row" | "reference" | "audit";
+  item_type: "object" | "database_row" | "redis_key" | "reference" | "audit";
   operation_id: string;
   phase: CleanupPhase;
   status: "pending" | "running" | "deleted" | "skipped" | "failed";
@@ -186,6 +191,11 @@ export interface CleanupOperation {
   target_type:
     | "knowledge_base"
     | "source_document"
+    | "wiki_page"
+    | "wiki_page_version"
+    | "wiki_edge"
+    | "job"
+    | "job_artifact"
     | "source_watch_rule"
     | "webhook"
     | "import_preview"

@@ -22,6 +22,7 @@ export interface DeletionCleanupOperationSummaryResponse {
     failed: number;
     object_keys: number;
     database_rows: number;
+    redis_keys: number;
   };
   settled_state: DeletionCleanupSettledStateResponse;
   created_at: string;
@@ -33,6 +34,9 @@ export interface DeletionCleanupSettledStateResponse {
   phase: DeletionCleanupOperationRecord["phase"];
   object_storage: DeletionCleanupPhaseArtifactStateResponse;
   database: DeletionCleanupPhaseArtifactStateResponse;
+  redis: DeletionCleanupPhaseArtifactStateResponse;
+  legacy_layout: DeletionCleanupPhaseArtifactStateResponse;
+  versioned_object_storage: DeletionCleanupPhaseArtifactStateResponse;
   residual_artifacts: {
     total: number;
     pending: number;
@@ -118,6 +122,7 @@ export function createQueuedDeletionCleanupOperation(input: {
     failedItemCount: 0,
     objectKeyCount: 0,
     databaseRowCount: 0,
+    redisKeyCount: 0,
     attemptCount: 0,
     maxAttempts: input.maxAttempts ?? 3,
     retryAfter: null,
@@ -153,6 +158,7 @@ export function toDeletionCleanupOperationSummaryResponse(
       failed: record.failedItemCount,
       object_keys: record.objectKeyCount,
       database_rows: record.databaseRowCount,
+      redis_keys: record.redisKeyCount,
     },
     settled_state: createDeletionCleanupSettledState(record),
     created_at: record.createdAt,
@@ -235,27 +241,67 @@ function createDeletionCleanupSettledState(
   const objectStorage = createPhaseArtifactState({
     failed: itemCounts?.objectFailed ?? inferFailedCount(record.objectKeyCount, record),
     operation: record,
-    residual: itemCounts?.objectResidual ?? inferResidualCount(record.objectKeyCount, record),
+    residual:
+      readOptionalNumberManifestValue(record.manifest, "object_storage_residual_count") ??
+      itemCounts?.objectResidual ??
+      inferResidualCount(record.objectKeyCount, record),
     total: itemCounts?.objectTotal ?? record.objectKeyCount,
   });
   const database = createPhaseArtifactState({
     failed: itemCounts?.databaseFailed ?? inferFailedCount(record.databaseRowCount, record),
     operation: record,
-    residual: itemCounts?.databaseResidual ?? inferResidualCount(record.databaseRowCount, record),
+    residual:
+      readOptionalNumberManifestValue(record.manifest, "database_residual_count") ??
+      itemCounts?.databaseResidual ??
+      inferResidualCount(record.databaseRowCount, record),
     total: itemCounts?.databaseTotal ?? record.databaseRowCount,
   });
-  const residualTotal = Math.max(objectStorage.residual + database.residual, pending + failed);
+  const redis = createPhaseArtifactState({
+    failed: itemCounts?.redisFailed ?? inferFailedCount(record.redisKeyCount, record),
+    operation: record,
+    residual:
+      readOptionalNumberManifestValue(record.manifest, "redis_residual_count") ??
+      itemCounts?.redisResidual ??
+      inferResidualCount(record.redisKeyCount, record),
+    total: itemCounts?.redisTotal ?? record.redisKeyCount,
+  });
+  const legacyLayout = createPhaseArtifactState({
+    failed: readNumberManifestValue(record.manifest, "legacy_layout_failed_count"),
+    operation: record,
+    residual: readNumberManifestValue(record.manifest, "legacy_layout_residual_count"),
+    total: readNumberManifestValue(record.manifest, "legacy_layout_object_count"),
+  });
+  const versionedObjectStorage = createPhaseArtifactState({
+    failed: readNumberManifestValue(record.manifest, "versioned_object_failed_count"),
+    operation: record,
+    residual: readNumberManifestValue(record.manifest, "versioned_object_residual_count"),
+    total: readNumberManifestValue(record.manifest, "versioned_object_count"),
+  });
+  const residualTotal = Math.max(
+    objectStorage.residual +
+      database.residual +
+      redis.residual +
+      legacyLayout.residual +
+      versionedObjectStorage.residual,
+    pending + failed,
+  );
 
   return {
     is_settled:
       record.status === "completed" &&
       objectStorage.residual === 0 &&
       database.residual === 0 &&
+      redis.residual === 0 &&
+      legacyLayout.residual === 0 &&
+      versionedObjectStorage.residual === 0 &&
       pending === 0 &&
       failed === 0,
     phase: record.phase,
     object_storage: objectStorage,
     database,
+    redis,
+    legacy_layout: legacyLayout,
+    versioned_object_storage: versionedObjectStorage,
     residual_artifacts: {
       total: residualTotal,
       pending,
@@ -267,6 +313,7 @@ function createDeletionCleanupSettledState(
 function createDeletionCleanupSettledItemCounts(items: readonly DeletionCleanupItemRecord[]) {
   const objectItems = items.filter((item) => item.itemType === "object");
   const databaseItems = items.filter((item) => item.itemType === "database_row");
+  const redisItems = items.filter((item) => item.itemType === "redis_key");
 
   return {
     pending: items.filter((item) => item.status === "pending" || item.status === "running").length,
@@ -281,6 +328,11 @@ function createDeletionCleanupSettledItemCounts(items: readonly DeletionCleanupI
       (item) => item.status === "pending" || item.status === "running" || item.status === "failed",
     ).length,
     databaseFailed: databaseItems.filter((item) => item.status === "failed").length,
+    redisTotal: redisItems.length,
+    redisResidual: redisItems.filter(
+      (item) => item.status === "pending" || item.status === "running" || item.status === "failed",
+    ).length,
+    redisFailed: redisItems.filter((item) => item.status === "failed").length,
   };
 }
 
@@ -341,4 +393,24 @@ function inferFailedCount(total: number, record: DeletionCleanupOperationRecord)
   }
 
   return Math.min(total, record.failedItemCount);
+}
+
+function readNumberManifestValue(
+  manifest: DeletionCleanupOperationRecord["manifest"],
+  key: string,
+): number {
+  const value = manifest[key];
+
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+}
+
+function readOptionalNumberManifestValue(
+  manifest: DeletionCleanupOperationRecord["manifest"],
+  key: string,
+): number | undefined {
+  const value = manifest[key];
+
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.floor(value))
+    : undefined;
 }

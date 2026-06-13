@@ -1,5 +1,6 @@
 import { randomUUID, createHash } from "node:crypto";
 import { sql, type Kysely } from "kysely";
+import { createProcessingArtifactObjectKey } from "@fococontext/core";
 import type { DatabaseSchema } from "@fococontext/db";
 
 export type DocumentProcessingStage =
@@ -180,14 +181,14 @@ export function createDocumentProcessingArtifactKey(input: {
   documentId: string;
   extension: string;
   jobId: string;
+  knowledgeBaseId: string;
   stage: DocumentProcessingStage;
   unitKey: string;
 }): string {
-  const extension = sanitizePathSegment(input.extension.replace(/^\./, "") || "bin");
-  const artifactSegment = sanitizePathSegment(input.artifactKind);
   const keyDigest = createHash("sha256")
     .update(
       [
+        input.knowledgeBaseId,
         input.documentId,
         input.jobId,
         input.stage,
@@ -199,14 +200,16 @@ export function createDocumentProcessingArtifactKey(input: {
     .digest("hex")
     .slice(0, 24);
 
-  return [
-    "processing",
-    sanitizePathSegment(input.documentId),
-    sanitizePathSegment(input.jobId),
-    sanitizePathSegment(input.stage),
-    keyDigest,
-    `${artifactSegment}.${extension}`,
-  ].join("/");
+  return createProcessingArtifactObjectKey({
+    artifactKind: input.artifactKind,
+    contentHash: keyDigest,
+    documentId: input.documentId,
+    extension: input.extension.replace(/^\./, "") || "bin",
+    jobId: input.jobId,
+    knowledgeBaseId: input.knowledgeBaseId,
+    stage: input.stage,
+    unitKey: input.unitKey,
+  });
 }
 
 export function createDocumentProcessingDedupeKey(input: {

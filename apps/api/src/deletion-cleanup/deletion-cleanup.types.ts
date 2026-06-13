@@ -1,6 +1,11 @@
 export const deletionCleanupTargetTypes = [
   "knowledge_base",
   "source_document",
+  "wiki_page",
+  "wiki_page_version",
+  "wiki_edge",
+  "job",
+  "job_artifact",
   "source_watch_rule",
   "webhook",
   "import_preview",
@@ -20,6 +25,7 @@ export const deletionCleanupPhases = [
   "manifest",
   "fencing",
   "object_cleanup",
+  "redis_cleanup",
   "database_cleanup",
   "retention",
   "completed",
@@ -27,7 +33,13 @@ export const deletionCleanupPhases = [
   "canceled",
 ] as const;
 
-export const deletionCleanupItemTypes = ["object", "database_row", "reference", "audit"] as const;
+export const deletionCleanupItemTypes = [
+  "object",
+  "database_row",
+  "redis_key",
+  "reference",
+  "audit",
+] as const;
 
 export const deletionCleanupItemStatuses = [
   "pending",
@@ -51,6 +63,7 @@ export interface DeletionCleanupOperationCounts {
   failedItemCount: number;
   objectKeyCount: number;
   databaseRowCount: number;
+  redisKeyCount: number;
 }
 
 export interface DeletionCleanupOperationRecord extends DeletionCleanupOperationCounts {

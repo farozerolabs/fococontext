@@ -1,5 +1,5 @@
 import { Queue, Worker } from "bullmq";
-import type { RuntimeConfig } from "@fococontext/core";
+import { createOcrPageImageObjectKey, type RuntimeConfig } from "@fococontext/core";
 import {
   applyPdfOcrResults,
   isRetryableOcrProviderError,
@@ -750,7 +750,12 @@ export class SourceOcrProcessor {
     const artifacts: SourceOcrArtifactWrite[] = [];
 
     for (const page of pages) {
-      const objectKey = `ocr/${payload.document_id}/${payload.parsed_content_id}/page-${page.pageNumber}.png`;
+      const objectKey = createOcrPageImageObjectKey({
+        knowledgeBaseId: payload.knowledge_base_id,
+        documentId: payload.document_id,
+        parsedContentId: payload.parsed_content_id,
+        pageNumber: page.pageNumber,
+      });
       const sha256 = await sha256Hex(page.image);
       const artifact: SourceOcrArtifactWrite = {
         id: `ocrart_${payload.document_id}_${page.pageNumber}`,

@@ -21,10 +21,12 @@ import { PostgresWorkerJobProgressWriter } from "./job-progress.postgres-writer.
 import {
   BullMqDeletionCleanupWorker,
   PostgresDeletionCleanupDatabaseCleaner,
+  RedisDeletionCleanupCleaner,
   DeletionCleanupProcessor,
   deletionCleanupQueueName,
   PostgresDeletionCleanupManifestPlanner,
   PostgresDeletionCleanupRepository,
+  PostgresDeletionCleanupResidualVerifier,
   PostgresDeletionCleanupTargetGuard,
 } from "./deletion-cleanup.worker.js";
 import { DocumentProcessingIntermediateCleaner } from "./document-processing-cleanup.js";
@@ -150,17 +152,25 @@ async function main(): Promise<void> {
   const wikiAnalyzeQueue = new BullMqWikiAnalyzeQueue(config);
   const wikiGenerateQueue = new BullMqWikiGenerateQueue(config);
   const wikiMergeQueue = new BullMqWikiMergeQueue(config);
+  const deletionCleanupRedis = new RedisDeletionCleanupCleaner(config);
   const deletionCleanupWorker = new BullMqDeletionCleanupWorker(
     config,
     new DeletionCleanupProcessor({
       repository: new PostgresDeletionCleanupRepository(db),
       databaseCleanup: new PostgresDeletionCleanupDatabaseCleaner(db),
+      redisCleanup: deletionCleanupRedis,
       checkpointRepository: backgroundOperationCheckpoints,
-      manifestPlanner: new PostgresDeletionCleanupManifestPlanner(db),
+      manifestPlanner: new PostgresDeletionCleanupManifestPlanner(db, objectStorage),
+      residualVerifier: new PostgresDeletionCleanupResidualVerifier(
+        db,
+        objectStorage,
+        deletionCleanupRedis,
+      ),
       targetGuard: new PostgresDeletionCleanupTargetGuard(db),
       ...(webhookEventEmitter === undefined ? {} : { webhookEvents: webhookEventEmitter }),
       objectStorage,
       objectBatchSize: config.limits.backgroundJobs.cleanup.batchSize,
+      versionedObjectCleanupEnabled: config.limits.deletionCleanup.versionedObjectCleanupEnabled,
     }),
   );
   const knowledgeCheckWorker = new BullMqKnowledgeCheckWorker(
@@ -358,6 +368,7 @@ async function main(): Promise<void> {
     ...(webhookRetryQueue === undefined ? [] : [webhookRetryQueue]),
     queuePressureRecorder,
     objectStorageOperationRecorder,
+    deletionCleanupRedis,
   ];
 
   const shutdown = async (signal: NodeJS.Signals): Promise<void> => {

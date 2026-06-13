@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Inject, Injectable } from "@nestjs/common";
 import { ApiError, createResourceId } from "@fococontext/contracts";
+import { createWikiDraftObjectKey } from "@fococontext/core";
 import type { ObjectStorageAdapter } from "@fococontext/storage";
 
 import { apiDatabaseMirrorToken, type ApiDatabaseMirror } from "../database/api-database-mirror.js";
@@ -200,7 +201,10 @@ function createWikiDraftDocumentRecord(input: {
     mimeType: "text/markdown",
     size: Buffer.byteLength(input.markdown),
     contentHash: createContentHash(input.markdown),
-    objectKey: `wiki-drafts/${input.knowledgeBaseId}/${input.draftId}.md`,
+    objectKey: createWikiDraftObjectKey({
+      knowledgeBaseId: input.knowledgeBaseId,
+      draftId: input.draftId,
+    }),
     status: "uploaded",
     metadata,
     createdAt: input.now,

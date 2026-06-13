@@ -402,6 +402,7 @@ export interface WebhookDeliveryLimits {
 export interface DeletionCleanupLimits {
   concurrency: number;
   objectBatchSize: number;
+  versionedObjectCleanupEnabled: boolean;
   maxRetries: number;
   retryBaseDelayMs: number;
   retryBackoff: DeletionCleanupRetryBackoff;
@@ -1562,6 +1563,12 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
           100,
           1,
           1000,
+          invalid,
+        ),
+        versionedObjectCleanupEnabled: parseOptionalBoolean(
+          env,
+          "DELETION_CLEANUP_VERSIONED_OBJECTS_ENABLED",
+          false,
           invalid,
         ),
         maxRetries: parseOptionalNonNegativeInteger(

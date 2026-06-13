@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import type {
   DocumentParser,
+  ParserMediaAsset,
   ParsedContent,
   ParserLocator,
   ParserTable,
 } from "@fococontext/parsers";
+import { createMediaAssetObjectKey } from "@fococontext/core";
 
 import {
   createDocumentProcessingArtifactKey,
@@ -22,6 +24,22 @@ export interface ParserMarkdownWindow {
   sha256: string;
   unitIndex: number;
   unitKey: string;
+}
+
+export function remapParsedContentObjectKeys<
+  TParsedContent extends { mediaAssets: ParserMediaAsset[] },
+>(parsedContent: TParsedContent, payload: SourceParsePayload): TParsedContent {
+  return {
+    ...parsedContent,
+    mediaAssets: parsedContent.mediaAssets.map((asset) => ({
+      ...asset,
+      objectKey: createMediaAssetObjectKey({
+        knowledgeBaseId: payload.knowledge_base_id,
+        documentId: payload.document_id,
+        parserObjectKey: asset.objectKey,
+      }),
+    })),
+  };
 }
 
 export function createParserConfigHash(
@@ -71,6 +89,7 @@ export function createMarkdownWindows(input: {
         documentId: input.payload.document_id,
         extension: ".md",
         jobId: input.payload.job_id,
+        knowledgeBaseId: input.payload.knowledge_base_id,
         stage: "parsed_artifact",
         unitKey,
       }),

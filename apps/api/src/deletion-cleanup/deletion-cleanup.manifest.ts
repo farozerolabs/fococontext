@@ -6,6 +6,7 @@ import type {
   DeletionCleanupOperationRecord,
 } from "./deletion-cleanup.types.js";
 import type {
+  DocumentProcessingUnitRecord,
   JobEventRecord,
   JobRecord,
   MediaAssetRecord,
@@ -31,6 +32,7 @@ export interface CollectSourceDocumentManifestRecordsInput extends CollectManife
   document: SourceDocumentRecord;
   parsedContent: ParsedContentRecord | null;
   mediaAssets: readonly MediaAssetRecord[];
+  processingUnits: readonly DocumentProcessingUnitRecord[];
   jobs: readonly JobRecord[];
   jobEventsByJobId: ReadonlyMap<string, readonly JobEventRecord[]>;
   activeObjectKeys: ReadonlySet<string>;
@@ -44,6 +46,7 @@ export function collectSourceDocumentObjectKeysFromRecords(input: {
   document: SourceDocumentRecord;
   parsedContent: ParsedContentRecord | null;
   mediaAssets: readonly MediaAssetRecord[];
+  processingUnits?: readonly DocumentProcessingUnitRecord[];
 }): string[] {
   return uniqueObjectEntries(collectDocumentEntriesFromRecords(input)).map(
     (entry) => entry.objectKey,
@@ -96,6 +99,7 @@ export function collectSourceDocumentManifestFromRecords(
       document: input.document,
       parsedContent: input.parsedContent,
       mediaAssets: input.mediaAssets,
+      processingUnits: input.processingUnits,
       jobs: input.jobs,
       jobEventsByJobId: input.jobEventsByJobId,
     }),
@@ -167,6 +171,7 @@ interface DatabaseRowRef {
 function collectParsedContentObjectEntries(record: ParsedContentRecord): ObjectEntry[] {
   return [
     createObjectEntry(record.captionedMarkdownObjectKey, "parsed_contents", record.id),
+    createObjectEntry(record.markdownPreviewObjectKey, "parsed_contents", record.id),
     createObjectEntry(record.normalizedMarkdownObjectKey, "parsed_contents", record.id),
     createObjectEntry(record.plainTextObjectKey, "parsed_contents", record.id),
     ...extractKnownObjectKeys(record.ocrSummary).map((objectKey) =>
@@ -182,6 +187,7 @@ function collectDocumentEntriesFromRecords(input: {
   document: SourceDocumentRecord;
   parsedContent: ParsedContentRecord | null;
   mediaAssets: readonly MediaAssetRecord[];
+  processingUnits?: readonly DocumentProcessingUnitRecord[];
 }): ObjectEntry[] {
   return [
     createObjectEntry(input.document.objectKey, "source_documents", input.document.id),
@@ -192,6 +198,21 @@ function collectDocumentEntriesFromRecords(input: {
     ...input.mediaAssets.map((asset) =>
       createObjectEntry(asset.objectKey, "media_assets", asset.id),
     ),
+    ...(input.processingUnits ?? []).flatMap(collectDocumentProcessingUnitObjectEntries),
+  ].filter(isObjectEntry);
+}
+
+function collectDocumentProcessingUnitObjectEntries(
+  unit: DocumentProcessingUnitRecord,
+): ObjectEntry[] {
+  return [
+    createObjectEntry(unit.objectKey ?? undefined, "document_processing_units", unit.id),
+    ...extractKnownObjectKeys(unit.objectRefs).map((objectKey) =>
+      createObjectEntry(objectKey, "document_processing_units.object_refs", unit.id),
+    ),
+    ...extractKnownObjectKeys(unit.metadata).map((objectKey) =>
+      createObjectEntry(objectKey, "document_processing_units.metadata", unit.id),
+    ),
   ].filter(isObjectEntry);
 }
 
@@ -199,6 +220,7 @@ function collectDocumentRowRefsFromRecords(input: {
   document: SourceDocumentRecord;
   parsedContent: ParsedContentRecord | null;
   mediaAssets: readonly MediaAssetRecord[];
+  processingUnits: readonly DocumentProcessingUnitRecord[];
   jobs: readonly JobRecord[];
   jobEventsByJobId: ReadonlyMap<string, readonly JobEventRecord[]>;
 }): DatabaseRowRef[] {
@@ -212,6 +234,10 @@ function collectDocumentRowRefsFromRecords(input: {
       ? []
       : [{ tableName: "parsed_contents", resourceId: input.parsedContent.id }]),
     ...input.mediaAssets.map((asset) => ({ tableName: "media_assets", resourceId: asset.id })),
+    ...input.processingUnits.map((unit) => ({
+      tableName: "document_processing_units",
+      resourceId: unit.id,
+    })),
     ...input.jobs.map((job) => ({ tableName: "jobs", resourceId: job.id })),
     ...jobEvents.map(({ job, event }) => ({
       tableName: "job_events",
@@ -280,10 +306,14 @@ function createManifestResult(input: {
       knowledge_base_id: input.knowledgeBaseId,
       object_key_count: objectItemCount,
       database_row_count: databaseItems.length,
+      redis_key_count: 0,
       skipped_reference_count: skippedReferenceCount,
       total_item_count: items.length,
       item_page_size: items.length,
       item_page_count: items.length === 0 ? 0 : 1,
+      ...(input.targetType === "source_document"
+        ? { worker_prefix_scan_required: true, prefix_scan_status: "pending" }
+        : {}),
     },
     items,
   };
@@ -373,6 +403,7 @@ function countCleanupItems(items: readonly DeletionCleanupItemRecord[]) {
     objectKeyCount: items.filter((item) => item.itemType === "object" && item.objectKey !== null)
       .length,
     databaseRowCount: items.filter((item) => item.itemType === "database_row").length,
+    redisKeyCount: items.filter((item) => item.itemType === "redis_key").length,
   };
 }
 

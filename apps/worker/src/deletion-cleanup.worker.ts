@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import { Queue, Worker } from "bullmq";
+import { Queue, RedisConnection, Worker } from "bullmq";
 import { sql, type Kysely } from "kysely";
 import type {
   DeletionCleanupItemRecord,
@@ -11,7 +11,22 @@ import type {
   DeletionCleanupStatus,
   DeletionCleanupTargetType,
 } from "@fococontext/contracts";
-import { createBackgroundOperationDedupeKey, type RuntimeConfig } from "@fococontext/core";
+import {
+  createBackgroundOperationDedupeKey,
+  createKnowledgeBaseObjectPrefix,
+  createMediaAssetObjectPrefix,
+  createOcrObjectPrefix,
+  createParsedContentObjectPrefix,
+  createProcessingObjectPrefix,
+  createRuntimeQueuePressureKey,
+  createSourceObjectPrefix,
+  createWikiEdgeObjectPrefix,
+  createWikiPageObjectPrefix,
+  createWikiPageVersionObjectPrefix,
+  runtimeQueueWorkKinds,
+  sanitizeObjectKeySegment,
+  type RuntimeConfig,
+} from "@fococontext/core";
 import {
   backgroundOperationIdPrefix,
   type BackgroundOperationCheckpointRecord,
@@ -22,7 +37,7 @@ import {
   requireCleanupOperationTenantProject,
   type DatabaseSchema,
 } from "@fococontext/db";
-import type { ObjectStorageAdapter } from "@fococontext/storage";
+import type { DeleteObjectVersionIdentifier, ObjectStorageAdapter } from "@fococontext/storage";
 import {
   getDatabaseCleanupPriority,
   getScopedCleanupColumn,
@@ -35,6 +50,9 @@ import type { WorkerWebhookEventEmitter } from "./webhook-dispatch.worker.js";
 
 export const deletionCleanupQueueName = "deletion.cleanup";
 export const deletionCleanupJobName = "deletion.cleanup.operation";
+
+const cleanupManifestPlanningPageSize = 1000;
+const knowledgeBaseLegacySourceDocumentPageSize = 500;
 
 export interface DeletionCleanupPayload {
   operation_id: string;
@@ -88,7 +106,7 @@ export interface DeletionCleanupStore {
 }
 
 export interface ListRetryableDeletionCleanupItemsInput {
-  itemType: "object" | "database_row";
+  itemType: "object" | "database_row" | "redis_key";
   limit: number;
   retryFailedBefore: string;
 }
@@ -101,12 +119,40 @@ export interface DeletionCleanupOperationItemCounts {
   failedItemCount: number;
   objectKeyCount: number;
   databaseRowCount: number;
+  redisKeyCount: number;
 }
 
 export interface DeletionCleanupDatabaseCleaner {
   cleanupDatabaseItem(
     item: DeletionCleanupItemRecord,
   ): Promise<DeletionCleanupDatabaseCleanupResult>;
+}
+
+export interface DeletionCleanupRedisCleaner {
+  cleanupRedisItem(item: DeletionCleanupItemRecord): Promise<DeletionCleanupRedisCleanupResult>;
+}
+
+export interface DeletionCleanupResidualVerifier {
+  verifyResiduals(
+    operation: DeletionCleanupOperationRecord,
+  ): Promise<DeletionCleanupResidualVerificationResult>;
+}
+
+export interface DeletionCleanupResidualVerificationResult {
+  objectStorageResidualCount: number;
+  objectStorageResidualExamples: string[];
+  databaseResidualCount: number;
+  databaseResidualExamples: string[];
+  redisResidualCount: number;
+  redisResidualExamples: string[];
+  legacyLayoutResidualCount: number;
+  legacyLayoutResidualExamples: string[];
+  versionedObjectResidualCount: number;
+  versionedObjectResidualExamples: string[];
+}
+
+export interface DeletionCleanupRedisResidualChecker {
+  countResidualRedisKeys(keys: readonly string[]): Promise<{ count: number; examples: string[] }>;
 }
 
 export interface DeletionCleanupTargetGuard {
@@ -137,15 +183,31 @@ export type DeletionCleanupDatabaseCleanupResult =
       error: Record<string, unknown>;
     };
 
+export type DeletionCleanupRedisCleanupResult =
+  | {
+      status: "deleted";
+    }
+  | {
+      status: "skipped";
+      skipReason: string;
+    }
+  | {
+      status: "failed";
+      error: Record<string, unknown>;
+    };
+
 export interface DeletionCleanupProcessorOptions {
   repository: DeletionCleanupStore;
   objectStorage: ObjectStorageAdapter;
   databaseCleanup?: DeletionCleanupDatabaseCleaner;
+  redisCleanup?: DeletionCleanupRedisCleaner;
+  residualVerifier?: DeletionCleanupResidualVerifier;
   manifestPlanner?: DeletionCleanupManifestPlanner;
   targetGuard?: DeletionCleanupTargetGuard;
   webhookEvents?: WorkerWebhookEventEmitter;
   checkpointRepository?: BackgroundOperationCheckpointRepository;
   objectBatchSize?: number;
+  versionedObjectCleanupEnabled?: boolean;
   now?: () => string;
 }
 
@@ -310,14 +372,45 @@ export class DeletionCleanupProcessor {
       return this.finishOperation(started.id);
     }
 
+    const objectCleaned = await this.cleanupVersionedObjectStorage(started);
+    let redisItems = await this.listRetryableItems(
+      operationId,
+      "redis_key",
+      objectCleaned.updatedAt,
+    );
+
+    if (redisItems.length > 0) {
+      const redisPhase = await this.updateOperation(objectCleaned, {
+        status: "running",
+        phase: "redis_cleanup",
+        updatedAt: this.now(),
+      });
+      await this.saveCheckpointProgress(checkpoint, redisPhase);
+
+      while (redisItems.length > 0) {
+        await this.deleteRedisItems(redisItems);
+        await this.refreshCheckpointCounts(checkpoint, operationId, "redis_cleanup");
+        if (await this.hasFailedItems(operationId, "redis_key")) {
+          return this.finishOperation(redisPhase.id);
+        }
+        redisItems = await this.listRetryableItems(operationId, "redis_key", redisPhase.updatedAt);
+      }
+    }
+
+    const redisFailed = await this.hasFailedItems(operationId, "redis_key");
+
+    if (redisFailed) {
+      return this.finishOperation(objectCleaned.id);
+    }
+
     let databaseItems = await this.listRetryableItems(
       operationId,
       "database_row",
-      started.updatedAt,
+      objectCleaned.updatedAt,
     );
 
     if (databaseItems.length > 0) {
-      const databasePhase = await this.updateOperation(started, {
+      const databasePhase = await this.updateOperation(objectCleaned, {
         status: "running",
         phase: "database_cleanup",
         updatedAt: this.now(),
@@ -340,7 +433,7 @@ export class DeletionCleanupProcessor {
       return this.finishOperation(databasePhase.id);
     }
 
-    return this.finishOperation(started.id);
+    return this.finishOperation(objectCleaned.id);
   }
 
   private async createOrReuseCheckpoint(
@@ -505,6 +598,123 @@ export class DeletionCleanupProcessor {
     }
   }
 
+  private async cleanupVersionedObjectStorage(
+    operation: DeletionCleanupOperationRecord,
+  ): Promise<DeletionCleanupOperationRecord> {
+    if (this.options.versionedObjectCleanupEnabled !== true) {
+      return operation;
+    }
+    if (
+      this.options.objectStorage.listObjectVersionsByPrefix === undefined ||
+      this.options.objectStorage.deleteObjectVersions === undefined
+    ) {
+      return this.updateOperation(operation, {
+        manifest: {
+          ...operation.manifest,
+          versioned_object_status: "unsupported",
+          versioned_object_count: 0,
+          versioned_object_failed_count: 0,
+          versioned_object_residual_count: 0,
+          versioned_object_residual_examples: [],
+        },
+        updatedAt: this.now(),
+      });
+    }
+    const prefixes = createVersionedObjectCleanupPrefixes(operation);
+
+    if (prefixes.length === 0) {
+      return this.updateOperation(operation, {
+        manifest: {
+          ...operation.manifest,
+          versioned_object_status: "not_applicable",
+          versioned_object_count: 0,
+          versioned_object_failed_count: 0,
+          versioned_object_residual_count: 0,
+          versioned_object_residual_examples: [],
+        },
+        updatedAt: this.now(),
+      });
+    }
+
+    let versionCount = 0;
+    let failedCount = 0;
+    const residualExamples: string[] = [];
+
+    try {
+      for (const prefix of prefixes) {
+        let keyMarker: string | undefined;
+        let versionIdMarker: string | undefined;
+
+        do {
+          const page = await this.options.objectStorage.listObjectVersionsByPrefix({
+            prefix,
+            ...(this.options.objectBatchSize === undefined
+              ? {}
+              : { maxKeys: this.options.objectBatchSize }),
+            ...(keyMarker === undefined ? {} : { keyMarker }),
+            ...(versionIdMarker === undefined ? {} : { versionIdMarker }),
+          });
+          const versions = page.versions.map(
+            (version): DeleteObjectVersionIdentifier => ({
+              key: version.key,
+              ...(version.versionId === undefined ? {} : { versionId: version.versionId }),
+            }),
+          );
+          versionCount += versions.length;
+
+          if (versions.length > 0) {
+            const result = await this.options.objectStorage.deleteObjectVersions({
+              objects: versions,
+              ...(this.options.objectBatchSize === undefined
+                ? {}
+                : { batchSize: this.options.objectBatchSize }),
+            });
+            failedCount += result.failed.length;
+            for (const failure of result.failed) {
+              if (residualExamples.length >= 5) {
+                break;
+              }
+              residualExamples.push(createObjectVersionExample(failure));
+            }
+          }
+          keyMarker = page.nextKeyMarker;
+          versionIdMarker = page.nextVersionIdMarker;
+        } while (keyMarker !== undefined || versionIdMarker !== undefined);
+      }
+    } catch (error) {
+      if (isVersionedCleanupUnsupportedError(error)) {
+        return this.updateOperation(operation, {
+          manifest: {
+            ...operation.manifest,
+            versioned_object_status: "unsupported",
+            versioned_object_count: versionCount,
+            versioned_object_failed_count: 0,
+            versioned_object_residual_count: 0,
+            versioned_object_residual_examples: [],
+          },
+          updatedAt: this.now(),
+        });
+      }
+
+      failedCount += 1;
+      residualExamples.push(
+        error instanceof Error ? error.message : "Object version cleanup failed.",
+      );
+    }
+
+    return this.updateOperation(operation, {
+      manifest: {
+        ...operation.manifest,
+        versioned_object_status: failedCount > 0 ? "failed" : "completed",
+        versioned_object_count: versionCount,
+        versioned_object_failed_count: failedCount,
+        versioned_object_residual_count: failedCount,
+        versioned_object_residual_examples: residualExamples.slice(0, 5),
+      },
+      updatedAt: this.now(),
+    });
+  }
+
   private async deleteDatabaseItems(items: DeletionCleanupItemRecord[]): Promise<void> {
     const now = this.now();
 
@@ -564,6 +774,65 @@ export class DeletionCleanupProcessor {
     }
   }
 
+  private async deleteRedisItems(items: DeletionCleanupItemRecord[]): Promise<void> {
+    const now = this.now();
+
+    for (const item of items) {
+      if (this.options.redisCleanup === undefined) {
+        await this.options.repository.upsertItem({
+          ...item,
+          status: "failed",
+          phase: "redis_cleanup",
+          attemptCount: item.attemptCount + 1,
+          lastError: {
+            message: "Redis cleanup is not configured.",
+          },
+          updatedAt: now,
+        });
+        continue;
+      }
+
+      const result = await this.cleanupRedisItem(item);
+
+      if (result.status === "deleted") {
+        await this.options.repository.upsertItem({
+          ...item,
+          status: "deleted",
+          phase: "redis_cleanup",
+          attemptCount: item.attemptCount + 1,
+          lastError: null,
+          skipReason: null,
+          updatedAt: now,
+          completedAt: now,
+        });
+        continue;
+      }
+
+      if (result.status === "skipped") {
+        await this.options.repository.upsertItem({
+          ...item,
+          status: "skipped",
+          phase: "redis_cleanup",
+          attemptCount: item.attemptCount + 1,
+          lastError: null,
+          skipReason: result.skipReason,
+          updatedAt: now,
+          completedAt: now,
+        });
+        continue;
+      }
+
+      await this.options.repository.upsertItem({
+        ...item,
+        status: "failed",
+        phase: "redis_cleanup",
+        attemptCount: item.attemptCount + 1,
+        lastError: result.error,
+        updatedAt: now,
+      });
+    }
+  }
+
   private async cleanupDatabaseItem(
     item: DeletionCleanupItemRecord,
   ): Promise<DeletionCleanupDatabaseCleanupResult> {
@@ -574,6 +843,21 @@ export class DeletionCleanupProcessor {
         status: "failed",
         error: {
           message: error instanceof Error ? error.message : "Database cleanup failed.",
+        },
+      };
+    }
+  }
+
+  private async cleanupRedisItem(
+    item: DeletionCleanupItemRecord,
+  ): Promise<DeletionCleanupRedisCleanupResult> {
+    try {
+      return await this.options.redisCleanup!.cleanupRedisItem(item);
+    } catch (error) {
+      return {
+        status: "failed",
+        error: {
+          message: error instanceof Error ? error.message : "Redis cleanup failed.",
         },
       };
     }
@@ -609,19 +893,53 @@ export class DeletionCleanupProcessor {
     const now = this.now();
     const hasIncomplete = counts.failedItemCount > 0 || counts.pendingItemCount > 0;
     const retryable = await this.hasRetryableItems(operationId);
+    const residuals =
+      !hasIncomplete && this.options.residualVerifier !== undefined
+        ? await this.options.residualVerifier.verifyResiduals(operation)
+        : createEmptyResidualVerificationResult();
+    const residualManifest = createResidualVerificationManifestPatch(
+      residuals,
+      operation.manifest,
+      {
+        defaultVersionedStatus:
+          this.options.versionedObjectCleanupEnabled === true ? "unsupported" : "disabled",
+      },
+    );
+    const versionedObjectResidualCount = readNonNegativeManifestInteger(
+      residualManifest,
+      "versioned_object_residual_count",
+    );
+    const residualCount =
+      countNonVersionedResidualVerificationResult(residuals) + versionedObjectResidualCount;
+    const hasResiduals = residualCount > 0;
 
     const updated = await this.updateOperation(operation, {
       ...counts,
-      status: hasIncomplete ? "failed" : "completed",
-      phase: hasIncomplete ? operation.phase : "completed",
-      retryable,
+      manifest: {
+        ...operation.manifest,
+        ...residualManifest,
+      },
+      status: hasIncomplete || hasResiduals ? "failed" : "completed",
+      phase: hasIncomplete ? operation.phase : hasResiduals ? "failed" : "completed",
+      retryable: hasResiduals ? true : retryable,
       lastError: hasIncomplete
         ? {
             message: "Cleanup failed or still has pending items.",
           }
-        : null,
-      failedAt: hasIncomplete ? now : operation.failedAt,
-      completedAt: hasIncomplete ? operation.completedAt : now,
+        : hasResiduals
+          ? {
+              message: "Cleanup residual check failed.",
+              residual_counts: {
+                database: residuals.databaseResidualCount,
+                legacy_layout: residuals.legacyLayoutResidualCount,
+                object_storage: residuals.objectStorageResidualCount,
+                redis: residuals.redisResidualCount,
+                versioned_object_storage: versionedObjectResidualCount,
+              },
+            }
+          : null,
+      failedAt: hasIncomplete || hasResiduals ? now : operation.failedAt,
+      completedAt: hasIncomplete || hasResiduals ? operation.completedAt : now,
       updatedAt: now,
     });
 
@@ -720,7 +1038,7 @@ export class DeletionCleanupProcessor {
 
   private async listRetryableItems(
     operationId: string,
-    itemType: "object" | "database_row",
+    itemType: "object" | "database_row" | "redis_key",
     retryFailedBefore: string,
   ): Promise<DeletionCleanupItemRecord[]> {
     const limit = this.getItemPageLimit();
@@ -735,11 +1053,16 @@ export class DeletionCleanupProcessor {
     }
 
     const items = await this.options.repository.listItemsByOperationId(operationId);
-    const retryableItems = items.filter((item) =>
-      itemType === "object"
-        ? isRetryableObjectItem(item, retryFailedBefore)
-        : isRetryableDatabaseItem(item, retryFailedBefore),
-    );
+    const retryableItems = items.filter((item) => {
+      if (itemType === "object") {
+        return isRetryableObjectItem(item, retryFailedBefore);
+      }
+      if (itemType === "redis_key") {
+        return isRetryableRedisItem(item, retryFailedBefore);
+      }
+
+      return isRetryableDatabaseItem(item, retryFailedBefore);
+    });
     const sortedItems =
       itemType === "database_row"
         ? retryableItems.sort(compareDatabaseCleanupItems)
@@ -817,6 +1140,7 @@ export class PostgresDeletionCleanupRepository implements DeletionCleanupStore {
         failed_item_count,
         object_key_count,
         database_row_count,
+        redis_key_count,
         attempt_count,
         max_attempts,
         retry_after,
@@ -870,6 +1194,7 @@ export class PostgresDeletionCleanupRepository implements DeletionCleanupStore {
         failed_item_count,
         object_key_count,
         database_row_count,
+        redis_key_count,
         attempt_count,
         max_attempts,
         retry_after,
@@ -904,6 +1229,7 @@ export class PostgresDeletionCleanupRepository implements DeletionCleanupStore {
         ${record.failedItemCount},
         ${record.objectKeyCount},
         ${record.databaseRowCount},
+        ${record.redisKeyCount},
         ${record.attemptCount},
         ${record.maxAttempts},
         ${record.retryAfter},
@@ -932,6 +1258,7 @@ export class PostgresDeletionCleanupRepository implements DeletionCleanupStore {
         failed_item_count = excluded.failed_item_count,
         object_key_count = excluded.object_key_count,
         database_row_count = excluded.database_row_count,
+        redis_key_count = excluded.redis_key_count,
         attempt_count = excluded.attempt_count,
         max_attempts = excluded.max_attempts,
         retry_after = excluded.retry_after,
@@ -1023,6 +1350,45 @@ export class PostgresDeletionCleanupRepository implements DeletionCleanupStore {
       return result.rows.map(toItemRecord);
     }
 
+    if (input.itemType === "redis_key") {
+      const result = await sql<DeletionCleanupItemRow>`
+        select
+          id,
+          operation_id,
+          item_type,
+          resource_type,
+          resource_id,
+          object_key,
+          table_name,
+          knowledge_base_id,
+          source_document_id,
+          status,
+          phase,
+          attempt_count,
+          max_attempts,
+          last_error,
+          skip_reason,
+          retry_after,
+          retained_until,
+          created_at,
+          updated_at,
+          completed_at
+        from deletion_cleanup_items
+        where operation_id = ${operationId}
+          and item_type = 'redis_key'
+          and resource_id is not null
+          and attempt_count < max_attempts
+          and (
+            status = 'pending'
+            or (status = 'failed' and updated_at <= ${input.retryFailedBefore})
+          )
+        order by resource_id asc, id asc
+        limit ${input.limit}
+      `.execute(this.db);
+
+      return result.rows.map(toItemRecord);
+    }
+
     const result = await sql<DeletionCleanupItemRow>`
       select
         id,
@@ -1071,7 +1437,8 @@ export class PostgresDeletionCleanupRepository implements DeletionCleanupStore {
         count(*) filter (where status = 'skipped')::text as skipped_item_count,
         count(*) filter (where status = 'failed')::text as failed_item_count,
         count(*) filter (where object_key is not null)::text as object_key_count,
-        count(*) filter (where table_name is not null)::text as database_row_count
+        count(*) filter (where table_name is not null)::text as database_row_count,
+        count(*) filter (where item_type = 'redis_key')::text as redis_key_count
       from deletion_cleanup_items
       where operation_id = ${operationId}
     `.execute(this.db);
@@ -1209,17 +1576,84 @@ export class PostgresDeletionCleanupRepository implements DeletionCleanupStore {
 }
 
 export class PostgresDeletionCleanupManifestPlanner implements DeletionCleanupManifestPlanner {
-  constructor(private readonly db: Kysely<DatabaseSchema>) {}
+  constructor(
+    private readonly db: Kysely<DatabaseSchema>,
+    private readonly objectStorage?: ObjectStorageAdapter,
+  ) {}
 
   async planOperation(
     input: DeletionCleanupManifestPlanInput,
   ): Promise<DeletionCleanupOperationRecord> {
+    if (input.operation.targetType === "source_document") {
+      await this.insertSourceDocumentDatabaseItems(input.operation, input.now());
+      await this.insertSourceDocumentRedisItems(input.operation, input.now());
+      await this.insertSourceDocumentPersistedObjectItems(input.operation, input.now());
+      await this.insertSourceDocumentPrefixObjectItems(input.operation, input.now());
+      const counts = await readOperationItemCounts(input.repository, input.operation.id);
+      const legacyLayoutObjectCount = await this.countLegacyLayoutObjectItems(input.operation.id);
+      const now = input.now();
+
+      return input.repository.updateOperation({
+        ...input.operation,
+        ...counts,
+        status: "running",
+        phase: "manifest",
+        manifest: {
+          ...input.operation.manifest,
+          object_key_count: counts.objectKeyCount,
+          database_row_count: counts.databaseRowCount,
+          redis_key_count: counts.redisKeyCount,
+          total_item_count: counts.totalItemCount,
+          prefix_scan_status: "completed",
+          planning_status: "completed",
+          planning_mode: "worker_source_document_prefix_scan",
+          legacy_layout_object_count: legacyLayoutObjectCount,
+        },
+        retryable: true,
+        lastError: null,
+        updatedAt: now,
+      });
+    }
+
+    if (isChildResourceCleanupTarget(input.operation.targetType)) {
+      await this.insertChildResourceDatabaseItems(input.operation, input.now());
+      await this.insertChildResourcePrefixObjectItems(input.operation, input.now());
+      const counts = await readOperationItemCounts(input.repository, input.operation.id);
+      const now = input.now();
+
+      return input.repository.updateOperation({
+        ...input.operation,
+        ...counts,
+        status: "running",
+        phase: "manifest",
+        manifest: {
+          ...input.operation.manifest,
+          target_type: input.operation.targetType,
+          target_id: input.operation.targetId,
+          knowledge_base_id: input.operation.knowledgeBaseId,
+          object_key_count: counts.objectKeyCount,
+          database_row_count: counts.databaseRowCount,
+          redis_key_count: counts.redisKeyCount,
+          total_item_count: counts.totalItemCount,
+          prefix_scan_status: "completed",
+          planning_status: "completed",
+          planning_mode: "worker_child_resource_prefix_scan",
+        },
+        retryable: true,
+        lastError: null,
+        updatedAt: now,
+      });
+    }
+
     if (input.operation.targetType !== "knowledge_base") {
       return input.operation;
     }
 
     await this.insertKnowledgeBaseManifestItems(input.operation, input.now());
+    await this.insertKnowledgeBasePrefixObjectItems(input.operation, input.now());
+    await this.insertKnowledgeBaseRedisItems(input.operation, input.now());
     const counts = await readOperationItemCounts(input.repository, input.operation.id);
+    const legacyLayoutObjectCount = await this.countLegacyLayoutObjectItems(input.operation.id);
     const now = input.now();
 
     return input.repository.updateOperation({
@@ -1234,12 +1668,17 @@ export class PostgresDeletionCleanupManifestPlanner implements DeletionCleanupMa
         knowledge_base_id: input.operation.knowledgeBaseId,
         object_key_count: counts.objectKeyCount,
         database_row_count: counts.databaseRowCount,
+        redis_key_count: counts.redisKeyCount,
         skipped_reference_count: 0,
         total_item_count: counts.totalItemCount,
-        item_page_size: counts.totalItemCount,
-        item_page_count: counts.totalItemCount === 0 ? 0 : 1,
+        item_page_size: cleanupManifestPlanningPageSize,
+        item_page_count:
+          counts.totalItemCount === 0
+            ? 0
+            : Math.ceil(counts.totalItemCount / cleanupManifestPlanningPageSize),
         planning_status: "completed",
         planning_mode: "worker_bounded_db",
+        legacy_layout_object_count: legacyLayoutObjectCount,
       },
       retryable: true,
       lastError: null,
@@ -1309,6 +1748,15 @@ export class PostgresDeletionCleanupManifestPlanner implements DeletionCleanupMa
           where parsed_contents.captioned_markdown_object_key is not null
           union all
           select
+            'parsed_contents'::text as resource_type,
+            parsed_contents.id as resource_id,
+            parsed_contents.markdown_preview_object_key as object_key
+          from parsed_contents
+          inner join source_documents on source_documents.id = parsed_contents.source_document_id
+          inner join target_kb on target_kb.id = source_documents.knowledge_base_id
+          where parsed_contents.markdown_preview_object_key is not null
+          union all
+          select
             'media_assets'::text as resource_type,
             media_assets.id as resource_id,
             media_assets.object_key as object_key
@@ -1316,6 +1764,32 @@ export class PostgresDeletionCleanupManifestPlanner implements DeletionCleanupMa
           inner join source_documents on source_documents.id = media_assets.source_document_id
           inner join target_kb on target_kb.id = source_documents.knowledge_base_id
           where media_assets.object_key is not null
+          union all
+          select
+            'ocr_artifacts'::text as resource_type,
+            ocr_artifacts.id as resource_id,
+            ocr_artifacts.object_key as object_key
+          from ocr_artifacts
+          inner join source_documents on source_documents.id = ocr_artifacts.source_document_id
+          inner join target_kb on target_kb.id = source_documents.knowledge_base_id
+          where ocr_artifacts.object_key is not null
+          union all
+          select
+            'document_processing_units'::text as resource_type,
+            document_processing_units.id as resource_id,
+            document_processing_units.object_key as object_key
+          from document_processing_units
+          inner join target_kb on target_kb.id = document_processing_units.knowledge_base_id
+          where document_processing_units.object_key is not null
+          union all
+          select
+            'document_processing_units.object_refs'::text as resource_type,
+            document_processing_units.id as resource_id,
+            object_ref.value ->> 'object_key' as object_key
+          from document_processing_units
+          inner join target_kb on target_kb.id = document_processing_units.knowledge_base_id
+          cross join lateral jsonb_array_elements(document_processing_units.object_refs) as object_ref(value)
+          where object_ref.value ->> 'object_key' is not null
         ) raw_object_rows
         order by object_key, resource_type, resource_id
       ),
@@ -1359,6 +1833,44 @@ export class PostgresDeletionCleanupManifestPlanner implements DeletionCleanupMa
           inner join target_kb on target_kb.id = source_documents.knowledge_base_id
           union all
           select
+            'ocr_artifacts'::text as resource_type,
+            ocr_artifacts.id as resource_id,
+            'ocr_artifacts'::text as table_name
+          from ocr_artifacts
+          inner join source_documents on source_documents.id = ocr_artifacts.source_document_id
+          inner join target_kb on target_kb.id = source_documents.knowledge_base_id
+          union all
+          select
+            'ocr_page_statuses'::text as resource_type,
+            ocr_page_statuses.id as resource_id,
+            'ocr_page_statuses'::text as table_name
+          from ocr_page_statuses
+          inner join source_documents on source_documents.id = ocr_page_statuses.source_document_id
+          inner join target_kb on target_kb.id = source_documents.knowledge_base_id
+          union all
+          select
+            'ocr_blocks'::text as resource_type,
+            ocr_blocks.id as resource_id,
+            'ocr_blocks'::text as table_name
+          from ocr_blocks
+          inner join source_documents on source_documents.id = ocr_blocks.source_document_id
+          inner join target_kb on target_kb.id = source_documents.knowledge_base_id
+          union all
+          select
+            'document_processing_units'::text as resource_type,
+            document_processing_units.id as resource_id,
+            'document_processing_units'::text as table_name
+          from document_processing_units
+          inner join target_kb on target_kb.id = document_processing_units.knowledge_base_id
+          union all
+          select
+            'document_processing_checkpoints'::text as resource_type,
+            document_processing_checkpoints.id as resource_id,
+            'document_processing_checkpoints'::text as table_name
+          from document_processing_checkpoints
+          inner join target_kb on target_kb.id = document_processing_checkpoints.knowledge_base_id
+          union all
+          select
             'jobs'::text as resource_type,
             jobs.id as resource_id,
             'jobs'::text as table_name
@@ -1372,6 +1884,170 @@ export class PostgresDeletionCleanupManifestPlanner implements DeletionCleanupMa
           from job_events
           inner join jobs on jobs.id = job_events.job_id
           inner join target_kb on target_kb.id = jobs.knowledge_base_id
+          union all
+          select
+            'webhook_deliveries'::text as resource_type,
+            webhook_deliveries.id as resource_id,
+            'webhook_deliveries'::text as table_name
+          from webhook_deliveries
+          inner join target_kb on target_kb.id = webhook_deliveries.knowledge_base_id
+          union all
+          select
+            'scheduled_import_jobs'::text as resource_type,
+            scheduled_import_jobs.id as resource_id,
+            'scheduled_import_jobs'::text as table_name
+          from scheduled_import_jobs
+          inner join target_kb on target_kb.id = scheduled_import_jobs.knowledge_base_id
+          union all
+          select
+            'import_previews'::text as resource_type,
+            import_previews.id as resource_id,
+            'import_previews'::text as table_name
+          from import_previews
+          inner join target_kb on target_kb.id = import_previews.knowledge_base_id
+          union all
+          select
+            'page_embeddings'::text as resource_type,
+            page_embeddings.id as resource_id,
+            'page_embeddings'::text as table_name
+          from page_embeddings
+          inner join target_kb on target_kb.id = page_embeddings.knowledge_base_id
+          union all
+          select
+            'retrieval_traces'::text as resource_type,
+            retrieval_traces.id as resource_id,
+            'retrieval_traces'::text as table_name
+          from retrieval_traces
+          inner join target_kb on target_kb.id = retrieval_traces.knowledge_base_id
+          union all
+          select
+            'wiki_edge_sources'::text as resource_type,
+            wiki_edge_sources.id as resource_id,
+            'wiki_edge_sources'::text as table_name
+          from wiki_edge_sources
+          inner join wiki_edges on wiki_edges.id = wiki_edge_sources.edge_id
+          inner join target_kb on target_kb.id = wiki_edges.knowledge_base_id
+          union all
+          select
+            'wiki_edges'::text as resource_type,
+            wiki_edges.id as resource_id,
+            'wiki_edges'::text as table_name
+          from wiki_edges
+          inner join target_kb on target_kb.id = wiki_edges.knowledge_base_id
+          union all
+          select
+            'duplicate_decisions'::text as resource_type,
+            duplicate_decisions.id as resource_id,
+            'duplicate_decisions'::text as table_name
+          from duplicate_decisions
+          inner join target_kb on target_kb.id = duplicate_decisions.knowledge_base_id
+          union all
+          select
+            'knowledge_checks'::text as resource_type,
+            knowledge_checks.id as resource_id,
+            'knowledge_checks'::text as table_name
+          from knowledge_checks
+          inner join target_kb on target_kb.id = knowledge_checks.knowledge_base_id
+          union all
+          select
+            'page_merge_records'::text as resource_type,
+            page_merge_records.id as resource_id,
+            'page_merge_records'::text as table_name
+          from page_merge_records
+          inner join target_kb on target_kb.id = page_merge_records.knowledge_base_id
+          union all
+          select
+            'rollback_records'::text as resource_type,
+            rollback_records.id as resource_id,
+            'rollback_records'::text as table_name
+          from rollback_records
+          inner join target_kb on target_kb.id = rollback_records.knowledge_base_id
+          union all
+          select
+            'change_set_items'::text as resource_type,
+            change_set_items.id as resource_id,
+            'change_set_items'::text as table_name
+          from change_set_items
+          inner join change_sets on change_sets.id = change_set_items.change_set_id
+          inner join target_kb on target_kb.id = change_sets.knowledge_base_id
+          union all
+          select
+            'change_sets'::text as resource_type,
+            change_sets.id as resource_id,
+            'change_sets'::text as table_name
+          from change_sets
+          inner join target_kb on target_kb.id = change_sets.knowledge_base_id
+          union all
+          select
+            'wiki_draft_candidates'::text as resource_type,
+            wiki_draft_candidates.id as resource_id,
+            'wiki_draft_candidates'::text as table_name
+          from wiki_draft_candidates
+          inner join target_kb on target_kb.id = wiki_draft_candidates.knowledge_base_id
+          union all
+          select
+            'wiki_analysis_results'::text as resource_type,
+            wiki_analysis_results.id as resource_id,
+            'wiki_analysis_results'::text as table_name
+          from wiki_analysis_results
+          inner join target_kb on target_kb.id = wiki_analysis_results.knowledge_base_id
+          union all
+          select
+            'model_calls'::text as resource_type,
+            model_calls.id as resource_id,
+            'model_calls'::text as table_name
+          from model_calls
+          inner join target_kb on target_kb.id = model_calls.knowledge_base_id
+          union all
+          select
+            'compile_stage_executions'::text as resource_type,
+            compile_stage_executions.id as resource_id,
+            'compile_stage_executions'::text as table_name
+          from compile_stage_executions
+          inner join target_kb on target_kb.id = compile_stage_executions.knowledge_base_id
+          union all
+          select
+            'source_watch_rules'::text as resource_type,
+            source_watch_rules.id as resource_id,
+            'source_watch_rules'::text as table_name
+          from source_watch_rules
+          inner join target_kb on target_kb.id = source_watch_rules.knowledge_base_id
+          union all
+          select
+            'webhooks'::text as resource_type,
+            webhooks.id as resource_id,
+            'webhooks'::text as table_name
+          from webhooks
+          inner join target_kb on target_kb.id = webhooks.knowledge_base_id
+          union all
+          select
+            'knowledge_versions'::text as resource_type,
+            knowledge_versions.id as resource_id,
+            'knowledge_versions'::text as table_name
+          from knowledge_versions
+          inner join target_kb on target_kb.id = knowledge_versions.knowledge_base_id
+          union all
+          select
+            'system_pages'::text as resource_type,
+            system_pages.id as resource_id,
+            'system_pages'::text as table_name
+          from system_pages
+          inner join target_kb on target_kb.id = system_pages.knowledge_base_id
+          union all
+          select
+            'wiki_page_versions'::text as resource_type,
+            wiki_page_versions.id as resource_id,
+            'wiki_page_versions'::text as table_name
+          from wiki_page_versions
+          inner join wiki_pages on wiki_pages.id = wiki_page_versions.page_id
+          inner join target_kb on target_kb.id = wiki_pages.knowledge_base_id
+          union all
+          select
+            'wiki_pages'::text as resource_type,
+            wiki_pages.id as resource_id,
+            'wiki_pages'::text as table_name
+          from wiki_pages
+          inner join target_kb on target_kb.id = wiki_pages.knowledge_base_id
           union all
           ${forkScopedRowsSql}
         ) raw_database_rows
@@ -1442,6 +2118,1028 @@ export class PostgresDeletionCleanupManifestPlanner implements DeletionCleanupMa
       on conflict (id) do nothing
     `.execute(this.db);
   }
+
+  private async insertKnowledgeBasePrefixObjectItems(
+    operation: DeletionCleanupOperationRecord,
+    now: string,
+  ): Promise<void> {
+    if (this.objectStorage === undefined || operation.knowledgeBaseId === null) {
+      return;
+    }
+
+    const scope = await requirePersistedCleanupOperationTenantProject(this.db, operation.id);
+    const prefix = createKnowledgeBaseObjectPrefix({
+      knowledgeBaseId: operation.knowledgeBaseId,
+    });
+    await this.insertListedObjectPrefixItems({
+      now,
+      operation,
+      prefixes: [prefix],
+      resourceType: "object_storage_prefix",
+      scope,
+      sourceDocumentId: null,
+    });
+
+    await this.insertKnowledgeBaseLegacyPrefixObjectItems(operation, now, scope);
+  }
+
+  private async insertPrefixObjectRows(input: {
+    keys: readonly string[];
+    now: string;
+    operation: DeletionCleanupOperationRecord;
+    resourceType: string;
+    scope: { tenantId: string; projectId: string };
+    sourceDocumentId: string | null;
+  }): Promise<void> {
+    const rows = input.keys
+      .filter((key) => key.length > 0)
+      .map((key) => ({
+        id: createCleanupManifestItemId(input.operation.id, "object", key),
+        object_key: key,
+      }));
+
+    if (rows.length === 0) {
+      return;
+    }
+
+    await sql`
+      with input_rows as (
+        select *
+        from jsonb_to_recordset(${JSON.stringify(rows)}::jsonb) as row(id text, object_key text)
+      )
+      insert into deletion_cleanup_items (
+        id,
+        tenant_id,
+        project_id,
+        operation_id,
+        item_type,
+        resource_type,
+        resource_id,
+        object_key,
+        table_name,
+        knowledge_base_id,
+        source_document_id,
+        status,
+        phase,
+        attempt_count,
+        max_attempts,
+        last_error,
+        skip_reason,
+        retry_after,
+        retained_until,
+        created_at,
+        updated_at,
+        completed_at
+      )
+      select
+        input_rows.id,
+        ${input.scope.tenantId},
+        ${input.scope.projectId},
+        ${input.operation.id},
+        'object',
+        ${input.resourceType},
+        input_rows.object_key,
+        input_rows.object_key,
+        null,
+        ${input.operation.knowledgeBaseId},
+        ${input.sourceDocumentId},
+        'pending',
+        'queued',
+        0,
+        ${input.operation.maxAttempts},
+        null,
+        null,
+        null,
+        ${input.operation.itemRetentionExpiresAt},
+        ${input.now},
+        ${input.now},
+        null
+      from input_rows
+      where not exists (
+        select 1
+        from deletion_cleanup_items existing
+        where existing.operation_id = ${input.operation.id}
+          and existing.object_key = input_rows.object_key
+      )
+      on conflict (id) do nothing
+    `.execute(this.db);
+  }
+
+  private async insertSourceDocumentDatabaseItems(
+    operation: DeletionCleanupOperationRecord,
+    now: string,
+  ): Promise<void> {
+    if (operation.knowledgeBaseId === null) {
+      return;
+    }
+
+    const scope = await requirePersistedCleanupOperationTenantProject(this.db, operation.id);
+
+    await sql`
+      with target_source as (
+        select id, knowledge_base_id
+        from source_documents
+        where id = ${operation.targetId}
+          and knowledge_base_id = ${operation.knowledgeBaseId}
+          and tenant_id = ${scope.tenantId}
+          and project_id = ${scope.projectId}
+        limit 1
+      ),
+      database_rows as (
+        select distinct on (table_name, resource_type, resource_id)
+          'database_row'::text as item_type,
+          resource_type,
+          resource_id,
+          null::text as object_key,
+          table_name,
+          1000 + ${databaseCleanupPriorityOrderSql()} as sort_group,
+          resource_id as sort_key
+        from (
+          select
+            'source_documents'::text as resource_type,
+            target_source.id as resource_id,
+            'source_documents'::text as table_name
+          from target_source
+          union all
+          select
+            'parsed_contents'::text as resource_type,
+            parsed_contents.id as resource_id,
+            'parsed_contents'::text as table_name
+          from parsed_contents
+          inner join target_source on target_source.id = parsed_contents.source_document_id
+          union all
+          select
+            'media_assets'::text as resource_type,
+            media_assets.id as resource_id,
+            'media_assets'::text as table_name
+          from media_assets
+          inner join target_source on target_source.id = media_assets.source_document_id
+          union all
+          select
+            'ocr_artifacts'::text as resource_type,
+            ocr_artifacts.id as resource_id,
+            'ocr_artifacts'::text as table_name
+          from ocr_artifacts
+          inner join target_source on target_source.id = ocr_artifacts.source_document_id
+          union all
+          select
+            'ocr_page_statuses'::text as resource_type,
+            ocr_page_statuses.id as resource_id,
+            'ocr_page_statuses'::text as table_name
+          from ocr_page_statuses
+          inner join target_source on target_source.id = ocr_page_statuses.source_document_id
+          union all
+          select
+            'ocr_blocks'::text as resource_type,
+            ocr_blocks.id as resource_id,
+            'ocr_blocks'::text as table_name
+          from ocr_blocks
+          inner join target_source on target_source.id = ocr_blocks.source_document_id
+          union all
+          select
+            'document_processing_units'::text as resource_type,
+            document_processing_units.id as resource_id,
+            'document_processing_units'::text as table_name
+          from document_processing_units
+          inner join target_source on target_source.id = document_processing_units.source_document_id
+          union all
+          select
+            'document_processing_checkpoints'::text as resource_type,
+            document_processing_checkpoints.id as resource_id,
+            'document_processing_checkpoints'::text as table_name
+          from document_processing_checkpoints
+          inner join target_source on target_source.id = document_processing_checkpoints.source_document_id
+          union all
+          select
+            'jobs'::text as resource_type,
+            jobs.id as resource_id,
+            'jobs'::text as table_name
+          from jobs
+          inner join target_source on target_source.id = jobs.source_document_id
+          union all
+          select
+            'job_events'::text as resource_type,
+            jobs.id || ':' || job_events.created_at::text || ':' || job_events.event_type as resource_id,
+            'job_events'::text as table_name
+          from job_events
+          inner join jobs on jobs.id = job_events.job_id
+          inner join target_source on target_source.id = jobs.source_document_id
+          union all
+          select
+            'wiki_analysis_results'::text as resource_type,
+            wiki_analysis_results.id as resource_id,
+            'wiki_analysis_results'::text as table_name
+          from wiki_analysis_results
+          inner join target_source on target_source.id = wiki_analysis_results.source_document_id
+          union all
+          select
+            'model_calls'::text as resource_type,
+            model_calls.id as resource_id,
+            'model_calls'::text as table_name
+          from model_calls
+          inner join target_source on target_source.id = model_calls.source_document_id
+          union all
+          select
+            'compile_stage_executions'::text as resource_type,
+            compile_stage_executions.id as resource_id,
+            'compile_stage_executions'::text as table_name
+          from compile_stage_executions
+          inner join target_source on target_source.id = compile_stage_executions.source_document_id
+          union all
+          select
+            'delete_impact_previews'::text as resource_type,
+            delete_impact_previews.id as resource_id,
+            'delete_impact_previews'::text as table_name
+          from delete_impact_previews
+          inner join target_source on target_source.id = delete_impact_previews.source_document_id
+        ) raw_database_rows
+        order by table_name, resource_type, resource_id
+      ),
+      numbered_items as (
+        select
+          row_number() over (order by sort_group asc, sort_key asc, resource_type asc, resource_id asc) as item_index,
+          item_type,
+          resource_type,
+          resource_id,
+          object_key,
+          table_name
+        from database_rows
+      )
+      insert into deletion_cleanup_items (
+        id,
+        tenant_id,
+        project_id,
+        operation_id,
+        item_type,
+        resource_type,
+        resource_id,
+        object_key,
+        table_name,
+        knowledge_base_id,
+        source_document_id,
+        status,
+        phase,
+        attempt_count,
+        max_attempts,
+        last_error,
+        skip_reason,
+        retry_after,
+        retained_until,
+        created_at,
+        updated_at,
+        completed_at
+      )
+      select
+        ${operation.id} || '_source_database_' || md5(table_name || ':' || resource_id),
+        ${scope.tenantId},
+        ${scope.projectId},
+        ${operation.id},
+        item_type,
+        resource_type,
+        resource_id,
+        object_key,
+        table_name,
+        ${operation.knowledgeBaseId},
+        ${operation.targetId},
+        'pending',
+        'queued',
+        0,
+        ${operation.maxAttempts},
+        null,
+        null,
+        null,
+        ${operation.itemRetentionExpiresAt},
+        ${now},
+        ${now},
+        null
+      from numbered_items
+      where not exists (
+        select 1
+        from deletion_cleanup_items existing
+        where existing.operation_id = ${operation.id}
+          and existing.item_type = 'database_row'
+          and existing.table_name = numbered_items.table_name
+          and existing.resource_id = numbered_items.resource_id
+      )
+      on conflict (id) do nothing
+    `.execute(this.db);
+  }
+
+  private async insertSourceDocumentRedisItems(
+    operation: DeletionCleanupOperationRecord,
+    now: string,
+  ): Promise<void> {
+    if (operation.knowledgeBaseId === null) {
+      return;
+    }
+
+    const scope = await requirePersistedCleanupOperationTenantProject(this.db, operation.id);
+
+    await sql`
+      with target_source as (
+        select id, knowledge_base_id
+        from source_documents
+        where id = ${operation.targetId}
+          and knowledge_base_id = ${operation.knowledgeBaseId}
+          and tenant_id = ${scope.tenantId}
+          and project_id = ${scope.projectId}
+        limit 1
+      ),
+      source_jobs as (
+        select jobs.id
+        from jobs
+        inner join target_source on target_source.id = jobs.source_document_id
+        where jobs.tenant_id = ${scope.tenantId}
+          and jobs.project_id = ${scope.projectId}
+      ),
+      redis_rows as (
+        select distinct on (redis_key)
+          resource_type,
+          redis_key
+        from (
+          select
+            'bullmq_source_parse_job'::text as resource_type,
+            'bull:source.parse:' || source_jobs.id as redis_key
+          from source_jobs
+          union all
+          select
+            'bullmq_wiki_analyze_job'::text as resource_type,
+            'bull:wiki.analyze:' || source_jobs.id || '-analyze' as redis_key
+          from source_jobs
+          union all
+          select
+            'bullmq_wiki_generate_job'::text as resource_type,
+            'bull:wiki.generate:'
+              || source_jobs.id
+              || '-generate-analysis_'
+              || regexp_replace(wiki_analysis_results.id, '^analysis_', '') as redis_key
+          from wiki_analysis_results
+          inner join source_jobs on source_jobs.id = wiki_analysis_results.job_id
+          union all
+          select
+            'bullmq_wiki_merge_job'::text as resource_type,
+            'bull:wiki.merge:'
+              || source_jobs.id
+              || '-merge-draft_'
+              || regexp_replace(wiki_draft_candidates.id, '^draft_', '') as redis_key
+          from wiki_draft_candidates
+          inner join source_jobs on source_jobs.id = wiki_draft_candidates.job_id
+        ) raw_redis_rows
+        order by redis_key, resource_type
+      )
+      insert into deletion_cleanup_items (
+        id,
+        tenant_id,
+        project_id,
+        operation_id,
+        item_type,
+        resource_type,
+        resource_id,
+        object_key,
+        table_name,
+        knowledge_base_id,
+        source_document_id,
+        status,
+        phase,
+        attempt_count,
+        max_attempts,
+        last_error,
+        skip_reason,
+        retry_after,
+        retained_until,
+        created_at,
+        updated_at,
+        completed_at
+      )
+      select
+        ${operation.id} || '_source_redis_' || md5(redis_key),
+        ${scope.tenantId},
+        ${scope.projectId},
+        ${operation.id},
+        'redis_key',
+        resource_type,
+        redis_key,
+        null,
+        null,
+        ${operation.knowledgeBaseId},
+        ${operation.targetId},
+        'pending',
+        'queued',
+        0,
+        ${operation.maxAttempts},
+        null,
+        null,
+        null,
+        ${operation.itemRetentionExpiresAt},
+        ${now},
+        ${now},
+        null
+      from redis_rows
+      where not exists (
+        select 1
+        from deletion_cleanup_items existing
+        where existing.operation_id = ${operation.id}
+          and existing.item_type = 'redis_key'
+          and existing.resource_id = redis_rows.redis_key
+      )
+      on conflict (id) do nothing
+    `.execute(this.db);
+  }
+
+  private async insertSourceDocumentPersistedObjectItems(
+    operation: DeletionCleanupOperationRecord,
+    now: string,
+  ): Promise<void> {
+    if (operation.knowledgeBaseId === null) {
+      return;
+    }
+
+    const scope = await requirePersistedCleanupOperationTenantProject(this.db, operation.id);
+
+    await sql`
+      with target_source as (
+        select id, knowledge_base_id
+        from source_documents
+        where id = ${operation.targetId}
+          and knowledge_base_id = ${operation.knowledgeBaseId}
+          and tenant_id = ${scope.tenantId}
+          and project_id = ${scope.projectId}
+        limit 1
+      ),
+      object_rows as (
+        select distinct on (object_key)
+          resource_type,
+          resource_id,
+          object_key
+        from (
+          select
+            'source_documents.object_key'::text as resource_type,
+            target_source.id as resource_id,
+            source_documents.object_key as object_key
+          from source_documents
+          inner join target_source on target_source.id = source_documents.id
+          where source_documents.object_key is not null
+          union all
+          select
+            'parsed_contents.normalized_markdown_object_key'::text as resource_type,
+            parsed_contents.id as resource_id,
+            parsed_contents.normalized_markdown_object_key as object_key
+          from parsed_contents
+          inner join target_source on target_source.id = parsed_contents.source_document_id
+          where parsed_contents.normalized_markdown_object_key is not null
+          union all
+          select
+            'parsed_contents.plain_text_object_key'::text as resource_type,
+            parsed_contents.id as resource_id,
+            parsed_contents.plain_text_object_key as object_key
+          from parsed_contents
+          inner join target_source on target_source.id = parsed_contents.source_document_id
+          where parsed_contents.plain_text_object_key is not null
+          union all
+          select
+            'parsed_contents.captioned_markdown_object_key'::text as resource_type,
+            parsed_contents.id as resource_id,
+            parsed_contents.captioned_markdown_object_key as object_key
+          from parsed_contents
+          inner join target_source on target_source.id = parsed_contents.source_document_id
+          where parsed_contents.captioned_markdown_object_key is not null
+          union all
+          select
+            'parsed_contents.markdown_preview_object_key'::text as resource_type,
+            parsed_contents.id as resource_id,
+            parsed_contents.markdown_preview_object_key as object_key
+          from parsed_contents
+          inner join target_source on target_source.id = parsed_contents.source_document_id
+          where parsed_contents.markdown_preview_object_key is not null
+          union all
+          select
+            'media_assets.object_key'::text as resource_type,
+            media_assets.id as resource_id,
+            media_assets.object_key as object_key
+          from media_assets
+          inner join target_source on target_source.id = media_assets.source_document_id
+          where media_assets.object_key is not null
+          union all
+          select
+            'ocr_artifacts.object_key'::text as resource_type,
+            ocr_artifacts.id as resource_id,
+            ocr_artifacts.object_key as object_key
+          from ocr_artifacts
+          inner join target_source on target_source.id = ocr_artifacts.source_document_id
+          where ocr_artifacts.object_key is not null
+          union all
+          select
+            'document_processing_units.object_key'::text as resource_type,
+            document_processing_units.id as resource_id,
+            document_processing_units.object_key as object_key
+          from document_processing_units
+          inner join target_source on target_source.id = document_processing_units.source_document_id
+          where document_processing_units.object_key is not null
+          union all
+          select
+            'document_processing_units.object_refs'::text as resource_type,
+            document_processing_units.id as resource_id,
+            object_ref.value ->> 'object_key' as object_key
+          from document_processing_units
+          inner join target_source on target_source.id = document_processing_units.source_document_id
+          cross join lateral jsonb_array_elements(document_processing_units.object_refs) as object_ref(value)
+          where object_ref.value ->> 'object_key' is not null
+        ) raw_object_rows
+        order by object_key, resource_type, resource_id
+      )
+      insert into deletion_cleanup_items (
+        id,
+        tenant_id,
+        project_id,
+        operation_id,
+        item_type,
+        resource_type,
+        resource_id,
+        object_key,
+        table_name,
+        knowledge_base_id,
+        source_document_id,
+        status,
+        phase,
+        attempt_count,
+        max_attempts,
+        last_error,
+        skip_reason,
+        retry_after,
+        retained_until,
+        created_at,
+        updated_at,
+        completed_at
+      )
+      select
+        ${operation.id} || '_source_object_' || md5(object_key),
+        ${scope.tenantId},
+        ${scope.projectId},
+        ${operation.id},
+        'object',
+        resource_type,
+        resource_id,
+        object_key,
+        null,
+        ${operation.knowledgeBaseId},
+        ${operation.targetId},
+        'pending',
+        'queued',
+        0,
+        ${operation.maxAttempts},
+        null,
+        null,
+        null,
+        ${operation.itemRetentionExpiresAt},
+        ${now},
+        ${now},
+        null
+      from object_rows
+      where not exists (
+        select 1
+        from deletion_cleanup_items existing
+        where existing.operation_id = ${operation.id}
+          and existing.object_key = object_rows.object_key
+      )
+      on conflict (id) do nothing
+    `.execute(this.db);
+  }
+
+  private async insertSourceDocumentPrefixObjectItems(
+    operation: DeletionCleanupOperationRecord,
+    now: string,
+  ): Promise<void> {
+    if (this.objectStorage === undefined || operation.knowledgeBaseId === null) {
+      return;
+    }
+
+    const scope = await requirePersistedCleanupOperationTenantProject(this.db, operation.id);
+
+    await this.insertListedObjectPrefixItems({
+      now,
+      operation,
+      prefixes: createSourceDocumentObjectPrefixes(operation),
+      resourceType: "source_document_prefix",
+      scope,
+      sourceDocumentId: operation.targetId,
+    });
+    await this.insertListedObjectPrefixItems({
+      now,
+      operation,
+      prefixes: createLegacySourceDocumentObjectPrefixes({
+        documentId: operation.targetId,
+        knowledgeBaseId: operation.knowledgeBaseId,
+      }),
+      resourceType: "legacy_source_document_prefix",
+      scope,
+      sourceDocumentId: operation.targetId,
+    });
+  }
+
+  private async insertListedObjectPrefixItems(input: {
+    now: string;
+    operation: DeletionCleanupOperationRecord;
+    prefixes: readonly string[];
+    resourceType: string;
+    scope: { tenantId: string; projectId: string };
+    sourceDocumentId: string | null;
+  }): Promise<void> {
+    if (this.objectStorage === undefined) {
+      return;
+    }
+
+    for (const prefix of input.prefixes) {
+      let continuationToken: string | undefined;
+
+      do {
+        const page = await this.objectStorage.listObjectsByPrefix({
+          maxKeys: 1000,
+          prefix,
+          ...(continuationToken === undefined ? {} : { continuationToken }),
+        });
+        await this.insertPrefixObjectRows({
+          keys: page.objects.map((object) => object.key),
+          now: input.now,
+          operation: input.operation,
+          resourceType: input.resourceType,
+          scope: input.scope,
+          sourceDocumentId: input.sourceDocumentId,
+        });
+        continuationToken = page.nextContinuationToken;
+      } while (continuationToken !== undefined);
+    }
+  }
+
+  private async insertKnowledgeBaseLegacyPrefixObjectItems(
+    operation: DeletionCleanupOperationRecord,
+    now: string,
+    scope: { tenantId: string; projectId: string },
+  ): Promise<void> {
+    if (operation.knowledgeBaseId === null) {
+      return;
+    }
+
+    const sourceDocumentPageSize = knowledgeBaseLegacySourceDocumentPageSize;
+    let afterId: string | null = null;
+
+    while (true) {
+      const result = await sql<{ id: string }>`
+        select id
+        from source_documents
+        where knowledge_base_id = ${operation.knowledgeBaseId}
+          and tenant_id = ${scope.tenantId}
+          and project_id = ${scope.projectId}
+          and (${afterId}::text is null or id > ${afterId})
+        order by id asc
+        limit ${sourceDocumentPageSize}
+      `.execute(this.db);
+
+      if (result.rows.length === 0) {
+        return;
+      }
+
+      for (const row of result.rows) {
+        await this.insertListedObjectPrefixItems({
+          now,
+          operation,
+          prefixes: createLegacySourceDocumentObjectPrefixes({
+            documentId: row.id,
+            knowledgeBaseId: operation.knowledgeBaseId,
+          }),
+          resourceType: "legacy_source_document_prefix",
+          scope,
+          sourceDocumentId: row.id,
+        });
+      }
+
+      afterId = result.rows[result.rows.length - 1]?.id ?? afterId;
+      if (result.rows.length < sourceDocumentPageSize) {
+        return;
+      }
+    }
+  }
+
+  private async countLegacyLayoutObjectItems(operationId: string): Promise<number> {
+    const result = await sql<{ count: string }>`
+      select count(*)::text as count
+      from deletion_cleanup_items
+      where operation_id = ${operationId}
+        and item_type = 'object'
+        and object_key is not null
+        and (
+          resource_type like 'legacy_%'
+          or object_key ~ '^(sources|parsed|media|ocr|processing)/'
+        )
+    `.execute(this.db);
+
+    return Number(result.rows[0]?.count ?? 0);
+  }
+
+  private async insertChildResourceDatabaseItems(
+    operation: DeletionCleanupOperationRecord,
+    now: string,
+  ): Promise<void> {
+    if (operation.knowledgeBaseId === null) {
+      return;
+    }
+
+    const scope = await requirePersistedCleanupOperationTenantProject(this.db, operation.id);
+
+    await sql`
+      with target_page as (
+        select id, knowledge_base_id
+        from wiki_pages
+        where ${operation.targetType === "wiki_page" ? sql`id = ${operation.targetId}` : sql`false`}
+          and knowledge_base_id = ${operation.knowledgeBaseId}
+        limit 1
+      ),
+      target_page_version as (
+        select wiki_page_versions.id, wiki_page_versions.page_id, wiki_pages.knowledge_base_id
+        from wiki_page_versions
+        inner join wiki_pages on wiki_pages.id = wiki_page_versions.page_id
+        where ${operation.targetType === "wiki_page_version" ? sql`wiki_page_versions.id = ${operation.targetId}` : sql`false`}
+          and wiki_pages.knowledge_base_id = ${operation.knowledgeBaseId}
+        limit 1
+      ),
+      target_edge as (
+        select id, knowledge_base_id
+        from wiki_edges
+        where ${operation.targetType === "wiki_edge" ? sql`id = ${operation.targetId}` : sql`false`}
+          and knowledge_base_id = ${operation.knowledgeBaseId}
+        limit 1
+      ),
+      database_rows as (
+        select distinct on (table_name, resource_type, resource_id)
+          'database_row'::text as item_type,
+          resource_type,
+          resource_id,
+          null::text as object_key,
+          table_name,
+          1000 + ${databaseCleanupPriorityOrderSql()} as sort_group,
+          resource_id as sort_key
+        from (
+          select
+            'page_embeddings'::text as resource_type,
+            page_embeddings.id as resource_id,
+            'page_embeddings'::text as table_name
+          from page_embeddings
+          inner join target_page on target_page.id = page_embeddings.page_id
+          union all
+          select
+            'page_embeddings'::text as resource_type,
+            page_embeddings.id as resource_id,
+            'page_embeddings'::text as table_name
+          from page_embeddings
+          inner join wiki_page_versions on wiki_page_versions.id = page_embeddings.page_version_id
+          inner join target_page on target_page.id = wiki_page_versions.page_id
+          union all
+          select
+            'page_embeddings'::text as resource_type,
+            page_embeddings.id as resource_id,
+            'page_embeddings'::text as table_name
+          from page_embeddings
+          inner join target_page_version on target_page_version.id = page_embeddings.page_version_id
+          union all
+          select
+            'page_embeddings'::text as resource_type,
+            page_embeddings.id as resource_id,
+            'page_embeddings'::text as table_name
+          from page_embeddings
+          inner join target_edge on page_embeddings.object_type = 'wiki_edge'
+            and page_embeddings.object_id = target_edge.id
+          union all
+          select
+            'wiki_edge_sources'::text as resource_type,
+            wiki_edge_sources.id as resource_id,
+            'wiki_edge_sources'::text as table_name
+          from wiki_edge_sources
+          inner join wiki_edges on wiki_edges.id = wiki_edge_sources.edge_id
+          inner join target_page on target_page.id = wiki_edges.from_page_id
+            or target_page.id = wiki_edges.to_page_id
+          union all
+          select
+            'wiki_edge_sources'::text as resource_type,
+            wiki_edge_sources.id as resource_id,
+            'wiki_edge_sources'::text as table_name
+          from wiki_edge_sources
+          inner join target_page_version on target_page_version.id = wiki_edge_sources.page_version_id
+          union all
+          select
+            'wiki_edge_sources'::text as resource_type,
+            wiki_edge_sources.id as resource_id,
+            'wiki_edge_sources'::text as table_name
+          from wiki_edge_sources
+          inner join target_edge on target_edge.id = wiki_edge_sources.edge_id
+          union all
+          select
+            'wiki_edges'::text as resource_type,
+            wiki_edges.id as resource_id,
+            'wiki_edges'::text as table_name
+          from wiki_edges
+          inner join target_page on target_page.id = wiki_edges.from_page_id
+            or target_page.id = wiki_edges.to_page_id
+          union all
+          select
+            'wiki_edges'::text as resource_type,
+            target_edge.id as resource_id,
+            'wiki_edges'::text as table_name
+          from target_edge
+          union all
+          select
+            'wiki_page_versions'::text as resource_type,
+            wiki_page_versions.id as resource_id,
+            'wiki_page_versions'::text as table_name
+          from wiki_page_versions
+          inner join target_page on target_page.id = wiki_page_versions.page_id
+          union all
+          select
+            'wiki_page_versions'::text as resource_type,
+            target_page_version.id as resource_id,
+            'wiki_page_versions'::text as table_name
+          from target_page_version
+          union all
+          select
+            'wiki_pages'::text as resource_type,
+            target_page.id as resource_id,
+            'wiki_pages'::text as table_name
+          from target_page
+        ) raw_database_rows
+        order by table_name, resource_type, resource_id
+      ),
+      numbered_items as (
+        select
+          row_number() over (order by sort_group asc, sort_key asc, resource_type asc, resource_id asc) as item_index,
+          item_type,
+          resource_type,
+          resource_id,
+          object_key,
+          table_name
+        from database_rows
+      )
+      insert into deletion_cleanup_items (
+        id,
+        tenant_id,
+        project_id,
+        operation_id,
+        item_type,
+        resource_type,
+        resource_id,
+        object_key,
+        table_name,
+        knowledge_base_id,
+        source_document_id,
+        status,
+        phase,
+        attempt_count,
+        max_attempts,
+        last_error,
+        skip_reason,
+        retry_after,
+        retained_until,
+        created_at,
+        updated_at,
+        completed_at
+      )
+      select
+        ${operation.id} || '_child_database_' || md5(table_name || ':' || resource_id),
+        ${scope.tenantId},
+        ${scope.projectId},
+        ${operation.id},
+        item_type,
+        resource_type,
+        resource_id,
+        object_key,
+        table_name,
+        ${operation.knowledgeBaseId},
+        null,
+        'pending',
+        'queued',
+        0,
+        ${operation.maxAttempts},
+        null,
+        null,
+        null,
+        ${operation.itemRetentionExpiresAt},
+        ${now},
+        ${now},
+        null
+      from numbered_items
+      where not exists (
+        select 1
+        from deletion_cleanup_items existing
+        where existing.operation_id = ${operation.id}
+          and existing.item_type = 'database_row'
+          and existing.table_name = numbered_items.table_name
+          and existing.resource_id = numbered_items.resource_id
+      )
+      on conflict (id) do nothing
+    `.execute(this.db);
+  }
+
+  private async insertChildResourcePrefixObjectItems(
+    operation: DeletionCleanupOperationRecord,
+    now: string,
+  ): Promise<void> {
+    if (this.objectStorage === undefined || operation.knowledgeBaseId === null) {
+      return;
+    }
+
+    const scope = await requirePersistedCleanupOperationTenantProject(this.db, operation.id);
+
+    for (const prefix of createChildResourceObjectPrefixes(operation)) {
+      let continuationToken: string | undefined;
+
+      do {
+        const page = await this.objectStorage.listObjectsByPrefix({
+          maxKeys: 1000,
+          prefix,
+          ...(continuationToken === undefined ? {} : { continuationToken }),
+        });
+        await this.insertPrefixObjectRows({
+          keys: page.objects.map((object) => object.key),
+          now,
+          operation,
+          resourceType: `${operation.targetType}_prefix`,
+          scope,
+          sourceDocumentId: null,
+        });
+        continuationToken = page.nextContinuationToken;
+      } while (continuationToken !== undefined);
+    }
+  }
+
+  private async insertKnowledgeBaseRedisItems(
+    operation: DeletionCleanupOperationRecord,
+    now: string,
+  ): Promise<void> {
+    if (operation.knowledgeBaseId === null) {
+      return;
+    }
+
+    const scope = await requirePersistedCleanupOperationTenantProject(this.db, operation.id);
+    const rows = createKnowledgeBaseRedisCleanupRows(operation.knowledgeBaseId).map((row) => ({
+      id: createCleanupManifestItemId(operation.id, "redis", row.key),
+      redis_key: row.key,
+      resource_type: row.resourceType,
+    }));
+
+    await sql`
+      with input_rows as (
+        select *
+        from jsonb_to_recordset(${JSON.stringify(rows)}::jsonb)
+          as row(id text, redis_key text, resource_type text)
+      )
+      insert into deletion_cleanup_items (
+        id,
+        tenant_id,
+        project_id,
+        operation_id,
+        item_type,
+        resource_type,
+        resource_id,
+        object_key,
+        table_name,
+        knowledge_base_id,
+        source_document_id,
+        status,
+        phase,
+        attempt_count,
+        max_attempts,
+        last_error,
+        skip_reason,
+        retry_after,
+        retained_until,
+        created_at,
+        updated_at,
+        completed_at
+      )
+      select
+        input_rows.id,
+        ${scope.tenantId},
+        ${scope.projectId},
+        ${operation.id},
+        'redis_key',
+        input_rows.resource_type,
+        input_rows.redis_key,
+        null,
+        null,
+        ${operation.knowledgeBaseId},
+        null,
+        'pending',
+        'queued',
+        0,
+        ${operation.maxAttempts},
+        null,
+        null,
+        null,
+        ${operation.itemRetentionExpiresAt},
+        ${now},
+        ${now},
+        null
+      from input_rows
+      on conflict (id) do nothing
+    `.execute(this.db);
+  }
 }
 
 export class PostgresDeletionCleanupDatabaseCleaner implements DeletionCleanupDatabaseCleaner {
@@ -1500,9 +3198,26 @@ export class PostgresDeletionCleanupDatabaseCleaner implements DeletionCleanupDa
     }
 
     if (item.tableName === "source_documents") {
+      const operationTargetType = await this.readOperationTargetType(item.operationId);
+
+      if (operationTargetType !== "knowledge_base") {
+        return {
+          status: "skipped",
+          skipReason: "source_document_tombstone_preserved",
+        };
+      }
+
+      const itemScope = await requirePersistedCleanupItemTenantProject(this.db, item.id);
+
+      await sql`
+        delete from source_documents
+        where id = ${item.resourceId}
+          and tenant_id = ${itemScope.tenantId}
+          and project_id = ${itemScope.projectId}
+      `.execute(this.db);
+
       return {
-        status: "skipped",
-        skipReason: "source_document_tombstone_preserved",
+        status: "deleted",
       };
     }
 
@@ -1543,6 +3258,367 @@ export class PostgresDeletionCleanupDatabaseCleaner implements DeletionCleanupDa
     return {
       status: "deleted",
     };
+  }
+
+  private async readOperationTargetType(operationId: string): Promise<string | null> {
+    const result = await sql<{ target_type: string }>`
+      select target_type
+      from deletion_cleanup_operations
+      where id = ${operationId}
+      limit 1
+    `.execute(this.db);
+
+    return result.rows[0]?.target_type ?? null;
+  }
+}
+
+export class RedisDeletionCleanupCleaner implements DeletionCleanupRedisCleaner {
+  private readonly connection: RedisConnection;
+
+  constructor(config: RuntimeConfig) {
+    this.connection = new RedisConnection({
+      url: config.redis.url,
+    });
+  }
+
+  async cleanupRedisItem(
+    item: DeletionCleanupItemRecord,
+  ): Promise<DeletionCleanupRedisCleanupResult> {
+    if (item.resourceId === null || item.resourceId.length === 0) {
+      return {
+        status: "skipped",
+        skipReason: "redis_key_reference_incomplete",
+      };
+    }
+
+    const client = await this.connection.client;
+
+    if (item.resourceType === "runtime_cache_index") {
+      const indexedKeys = readRedisStringArray(
+        await client.runCommand("smembers", [item.resourceId]),
+      );
+
+      if (indexedKeys.length > 0) {
+        await client.runCommand("del", indexedKeys);
+      }
+    }
+
+    await client.runCommand("del", [item.resourceId]);
+
+    return {
+      status: "deleted",
+    };
+  }
+
+  async countResidualRedisKeys(
+    keys: readonly string[],
+  ): Promise<{ count: number; examples: string[] }> {
+    const uniqueKeys = [...new Set(keys.filter((key) => key.length > 0))];
+
+    if (uniqueKeys.length === 0) {
+      return {
+        count: 0,
+        examples: [],
+      };
+    }
+
+    const client = await this.connection.client;
+    const examples: string[] = [];
+    let count = 0;
+
+    for (const key of uniqueKeys) {
+      const exists = Number(await client.runCommand("exists", [key]));
+
+      if (exists > 0) {
+        count += 1;
+        if (examples.length < 5) {
+          examples.push(key);
+        }
+      }
+    }
+
+    return {
+      count,
+      examples,
+    };
+  }
+
+  async close(): Promise<void> {
+    await this.connection.close();
+  }
+}
+
+export class PostgresDeletionCleanupResidualVerifier implements DeletionCleanupResidualVerifier {
+  constructor(
+    private readonly db: Kysely<DatabaseSchema>,
+    private readonly objectStorage?: ObjectStorageAdapter,
+    private readonly redisResidualChecker?: DeletionCleanupRedisResidualChecker,
+  ) {}
+
+  async verifyResiduals(
+    operation: DeletionCleanupOperationRecord,
+  ): Promise<DeletionCleanupResidualVerificationResult> {
+    if (operation.targetType === "knowledge_base" && operation.knowledgeBaseId !== null) {
+      const [objectStorage, legacyLayout, database, redis] = await Promise.all([
+        this.countObjectStorageResiduals([
+          createKnowledgeBaseObjectPrefix({
+            knowledgeBaseId: operation.knowledgeBaseId,
+          }),
+        ]),
+        this.countLegacyLayoutResiduals(operation),
+        this.countKnowledgeBaseDatabaseResiduals(operation),
+        this.countRedisResiduals(createKnowledgeBaseRedisCleanupRows(operation.knowledgeBaseId)),
+      ]);
+
+      return createResidualVerificationResult({
+        databaseResidualCount: database.count,
+        databaseResidualExamples: database.examples,
+        legacyLayoutResidualCount: legacyLayout.count,
+        legacyLayoutResidualExamples: legacyLayout.examples,
+        objectStorageResidualCount: objectStorage.count,
+        objectStorageResidualExamples: objectStorage.examples,
+        redisResidualCount: redis.count,
+        redisResidualExamples: redis.examples,
+      });
+    }
+
+    if (operation.targetType === "source_document" && operation.knowledgeBaseId !== null) {
+      const [objectStorage, legacyLayout, database, redisRows] = await Promise.all([
+        this.countObjectStorageResiduals(createSourceDocumentObjectPrefixes(operation)),
+        this.countLegacyLayoutResiduals(operation),
+        this.countSourceDocumentDatabaseResiduals(operation),
+        this.listOperationRedisCleanupRows(operation.id),
+      ]);
+      const redis = await this.countRedisResiduals(redisRows);
+
+      return createResidualVerificationResult({
+        databaseResidualCount: database.count,
+        databaseResidualExamples: database.examples,
+        legacyLayoutResidualCount: legacyLayout.count,
+        legacyLayoutResidualExamples: legacyLayout.examples,
+        objectStorageResidualCount: objectStorage.count,
+        objectStorageResidualExamples: objectStorage.examples,
+        redisResidualCount: redis.count,
+        redisResidualExamples: redis.examples,
+      });
+    }
+
+    if (isChildResourceCleanupTarget(operation.targetType) && operation.knowledgeBaseId !== null) {
+      const [objectStorage, database] = await Promise.all([
+        this.countObjectStorageResiduals(createChildResourceObjectPrefixes(operation)),
+        this.countChildResourceDatabaseResiduals(operation),
+      ]);
+
+      return createResidualVerificationResult({
+        databaseResidualCount: database.count,
+        databaseResidualExamples: database.examples,
+        objectStorageResidualCount: objectStorage.count,
+        objectStorageResidualExamples: objectStorage.examples,
+      });
+    }
+
+    return createEmptyResidualVerificationResult();
+  }
+
+  private async countObjectStorageResiduals(
+    prefixes: readonly string[],
+  ): Promise<{ count: number; examples: string[] }> {
+    if (this.objectStorage === undefined) {
+      return {
+        count: 0,
+        examples: [],
+      };
+    }
+
+    const examples: string[] = [];
+    let count = 0;
+
+    for (const prefix of prefixes) {
+      let continuationToken: string | undefined;
+
+      do {
+        const page = await this.objectStorage.listObjectsByPrefix({
+          maxKeys: 1000,
+          prefix,
+          ...(continuationToken === undefined ? {} : { continuationToken }),
+        });
+        count += page.objects.length;
+        for (const object of page.objects) {
+          if (examples.length >= 5) {
+            break;
+          }
+          examples.push(object.key);
+        }
+        continuationToken = page.nextContinuationToken;
+      } while (continuationToken !== undefined);
+    }
+
+    return {
+      count,
+      examples,
+    };
+  }
+
+  private async countLegacyLayoutResiduals(
+    operation: DeletionCleanupOperationRecord,
+  ): Promise<{ count: number; examples: string[] }> {
+    if (this.objectStorage === undefined) {
+      return {
+        count: 0,
+        examples: [],
+      };
+    }
+
+    const result = await sql<{ object_key: string }>`
+      select object_key
+      from deletion_cleanup_items
+      where operation_id = ${operation.id}
+        and item_type = 'object'
+        and object_key is not null
+        and (
+          resource_type like 'legacy_%'
+          or object_key ~ '^(sources|parsed|media|ocr|processing)/'
+        )
+      order by object_key asc
+    `.execute(this.db);
+    const examples: string[] = [];
+    let count = 0;
+
+    for (const row of result.rows) {
+      const head = await this.objectStorage.headObject({ key: row.object_key });
+
+      if (!head.exists) {
+        continue;
+      }
+
+      count += 1;
+      if (examples.length < 5) {
+        examples.push(row.object_key);
+      }
+    }
+
+    return {
+      count,
+      examples,
+    };
+  }
+
+  private async countKnowledgeBaseDatabaseResiduals(
+    operation: DeletionCleanupOperationRecord,
+  ): Promise<{ count: number; examples: string[] }> {
+    const scope = await requirePersistedCleanupOperationTenantProject(this.db, operation.id);
+    const countResult = await sql<{ count: string }>`
+      select coalesce(sum(residual_count), 0)::text as count
+      from (${knowledgeBaseResidualRowsSql({
+        knowledgeBaseId: operation.targetId,
+        projectId: scope.projectId,
+        tenantId: scope.tenantId,
+      })}) residuals
+    `.execute(this.db);
+    const examplesResult = await sql<{ table_name: string }>`
+      select table_name
+      from (${knowledgeBaseResidualRowsSql({
+        knowledgeBaseId: operation.targetId,
+        projectId: scope.projectId,
+        tenantId: scope.tenantId,
+      })}) residuals
+      where residual_count > 0
+      order by table_name asc
+      limit 5
+    `.execute(this.db);
+
+    return {
+      count: Number(countResult.rows[0]?.count ?? 0),
+      examples: examplesResult.rows.map((row) => row.table_name),
+    };
+  }
+
+  private async countSourceDocumentDatabaseResiduals(
+    operation: DeletionCleanupOperationRecord,
+  ): Promise<{ count: number; examples: string[] }> {
+    const scope = await requirePersistedCleanupOperationTenantProject(this.db, operation.id);
+    const countResult = await sql<{ count: string }>`
+      select coalesce(sum(residual_count), 0)::text as count
+      from (${sourceDocumentResidualRowsSql({
+        projectId: scope.projectId,
+        sourceDocumentId: operation.targetId,
+        tenantId: scope.tenantId,
+      })}) residuals
+    `.execute(this.db);
+    const examplesResult = await sql<{ table_name: string }>`
+      select table_name
+      from (${sourceDocumentResidualRowsSql({
+        projectId: scope.projectId,
+        sourceDocumentId: operation.targetId,
+        tenantId: scope.tenantId,
+      })}) residuals
+      where residual_count > 0
+      order by table_name asc
+      limit 5
+    `.execute(this.db);
+
+    return {
+      count: Number(countResult.rows[0]?.count ?? 0),
+      examples: examplesResult.rows.map((row) => row.table_name),
+    };
+  }
+
+  private async countChildResourceDatabaseResiduals(
+    operation: DeletionCleanupOperationRecord,
+  ): Promise<{ count: number; examples: string[] }> {
+    const countResult = await sql<{ count: string }>`
+      select coalesce(sum(residual_count), 0)::text as count
+      from (${childResourceResidualRowsSql({
+        targetId: operation.targetId,
+        targetType: operation.targetType,
+      })}) residuals
+    `.execute(this.db);
+    const examplesResult = await sql<{ table_name: string }>`
+      select table_name
+      from (${childResourceResidualRowsSql({
+        targetId: operation.targetId,
+        targetType: operation.targetType,
+      })}) residuals
+      where residual_count > 0
+      order by table_name asc
+      limit 5
+    `.execute(this.db);
+
+    return {
+      count: Number(countResult.rows[0]?.count ?? 0),
+      examples: examplesResult.rows.map((row) => row.table_name),
+    };
+  }
+
+  private async countRedisResiduals(
+    rows: readonly { key: string; resourceType: string }[],
+  ): Promise<{ count: number; examples: string[] }> {
+    if (this.redisResidualChecker === undefined) {
+      return {
+        count: 0,
+        examples: [],
+      };
+    }
+
+    return this.redisResidualChecker.countResidualRedisKeys(rows.map((row) => row.key));
+  }
+
+  private async listOperationRedisCleanupRows(
+    operationId: string,
+  ): Promise<Array<{ key: string; resourceType: string }>> {
+    const result = await sql<{ key: string; resource_type: string }>`
+      select resource_id as key, coalesce(resource_type, 'redis_key') as resource_type
+      from deletion_cleanup_items
+      where operation_id = ${operationId}
+        and item_type = 'redis_key'
+        and resource_id is not null
+      order by resource_id asc
+    `.execute(this.db);
+
+    return result.rows.map((row) => ({
+      key: row.key,
+      resourceType: row.resource_type,
+    }));
   }
 }
 
@@ -1627,9 +3703,106 @@ export class PostgresDeletionCleanupTargetGuard implements DeletionCleanupTarget
       };
     }
 
+    if (operation.targetType === "wiki_page") {
+      const result = await sql<{ deleted_at: Date | string | null }>`
+        select wiki_pages.deleted_at
+        from wiki_pages
+        inner join knowledge_bases on knowledge_bases.id = wiki_pages.knowledge_base_id
+        where wiki_pages.id = ${operation.targetId}
+          and wiki_pages.knowledge_base_id = ${operation.knowledgeBaseId}
+          and knowledge_bases.tenant_id = ${scope.tenantId}
+          and knowledge_bases.project_id = ${scope.projectId}
+        limit 1
+      `.execute(this.db);
+      const row = result.rows[0];
+
+      if (row === undefined) {
+        if (await this.targetExistsInAnyScope(operation)) {
+          return {
+            allowed: false,
+            reason: "cleanup_target_scope_mismatch",
+          };
+        }
+
+        return {
+          allowed: true,
+        };
+      }
+
+      if (row.deleted_at !== null) {
+        return {
+          allowed: true,
+        };
+      }
+
+      return {
+        allowed: false,
+        reason: "wiki_page_is_active",
+      };
+    }
+
+    if (operation.targetType === "wiki_page_version" || operation.targetType === "wiki_edge") {
+      if (await this.targetExistsInScope(operation, scope)) {
+        return {
+          allowed: true,
+        };
+      }
+
+      if (await this.targetExistsInAnyScope(operation)) {
+        return {
+          allowed: false,
+          reason: "cleanup_target_scope_mismatch",
+        };
+      }
+
+      return {
+        allowed: true,
+      };
+    }
+
     return {
       allowed: true,
     };
+  }
+
+  private async targetExistsInScope(
+    operation: DeletionCleanupOperationRecord,
+    scope: { tenantId: string; projectId: string },
+  ): Promise<boolean> {
+    if (operation.targetType === "wiki_page_version") {
+      const result = await sql<{ exists: boolean }>`
+        select exists (
+          select 1
+          from wiki_page_versions
+          inner join wiki_pages on wiki_pages.id = wiki_page_versions.page_id
+          inner join knowledge_bases on knowledge_bases.id = wiki_pages.knowledge_base_id
+          where wiki_page_versions.id = ${operation.targetId}
+            and wiki_pages.knowledge_base_id = ${operation.knowledgeBaseId}
+            and knowledge_bases.tenant_id = ${scope.tenantId}
+            and knowledge_bases.project_id = ${scope.projectId}
+        ) as exists
+      `.execute(this.db);
+
+      return result.rows[0]?.exists ?? false;
+    }
+
+    if (operation.targetType === "wiki_edge") {
+      const result = await sql<{ exists: boolean }>`
+        select exists (
+          select 1
+          from wiki_edges
+          inner join knowledge_bases on knowledge_bases.id = wiki_edges.knowledge_base_id
+          where wiki_edges.id = ${operation.targetId}
+            and wiki_edges.knowledge_base_id = ${operation.knowledgeBaseId}
+            and knowledge_bases.tenant_id = ${scope.tenantId}
+            and knowledge_bases.project_id = ${scope.projectId}
+        ) as exists
+      `.execute(this.db);
+
+      return result.rows[0]?.exists ?? false;
+    }
+
+    return false;
   }
 
   private async targetExistsInAnyScope(
@@ -1659,13 +3832,58 @@ export class PostgresDeletionCleanupTargetGuard implements DeletionCleanupTarget
       return result.rows[0]?.exists ?? false;
     }
 
+    if (operation.targetType === "wiki_page") {
+      const result = await sql<{ exists: boolean }>`
+        select exists (
+          select 1
+          from wiki_pages
+          where id = ${operation.targetId}
+        ) as exists
+      `.execute(this.db);
+
+      return result.rows[0]?.exists ?? false;
+    }
+
+    if (operation.targetType === "wiki_page_version") {
+      const result = await sql<{ exists: boolean }>`
+        select exists (
+          select 1
+          from wiki_page_versions
+          where id = ${operation.targetId}
+        ) as exists
+      `.execute(this.db);
+
+      return result.rows[0]?.exists ?? false;
+    }
+
+    if (operation.targetType === "wiki_edge") {
+      const result = await sql<{ exists: boolean }>`
+        select exists (
+          select 1
+          from wiki_edges
+          where id = ${operation.targetId}
+        ) as exists
+      `.execute(this.db);
+
+      return result.rows[0]?.exists ?? false;
+    }
+
     return false;
   }
 }
 
 function shouldPlanManifest(operation: DeletionCleanupOperationRecord): boolean {
+  if (
+    operation.targetType === "source_document" &&
+    operation.manifest.worker_prefix_scan_required === true &&
+    operation.manifest.prefix_scan_status !== "completed"
+  ) {
+    return true;
+  }
+
   return (
-    operation.targetType === "knowledge_base" &&
+    (operation.targetType === "knowledge_base" ||
+      isChildResourceCleanupTarget(operation.targetType)) &&
     operation.totalItemCount === 0 &&
     operation.manifest.planning_status !== "completed"
   );
@@ -1675,6 +3893,562 @@ function createStableDeletionCleanupOperationId(operationId: string): string {
   const digest = createHash("sha256").update(operationId).digest("hex").slice(0, 32);
 
   return `${backgroundOperationIdPrefix}deletion_cleanup_${digest}`;
+}
+
+function createCleanupManifestItemId(operationId: string, itemKind: string, value: string): string {
+  const digest = createHash("sha256").update(`${itemKind}\0${value}`).digest("hex").slice(0, 32);
+
+  return `${operationId}_${itemKind}_${digest}`;
+}
+
+function createKnowledgeBaseRedisCleanupRows(
+  knowledgeBaseId: string,
+): Array<{ key: string; resourceType: string }> {
+  return [
+    {
+      key: `fococontext:runtime-cache-index:${encodeURIComponent(knowledgeBaseId)}`,
+      resourceType: "runtime_cache_index",
+    },
+    ...runtimeQueueWorkKinds.map((workKind) => ({
+      key: createRuntimeQueuePressureKey({
+        scopeId: knowledgeBaseId,
+        workKind,
+      }),
+      resourceType: "queue_pressure",
+    })),
+  ];
+}
+
+function createSourceDocumentObjectPrefixes(operation: DeletionCleanupOperationRecord): string[] {
+  if (operation.knowledgeBaseId === null) {
+    return [];
+  }
+
+  const input = {
+    documentId: operation.targetId,
+    knowledgeBaseId: operation.knowledgeBaseId,
+  };
+
+  return [
+    createSourceObjectPrefix(input),
+    createParsedContentObjectPrefix(input),
+    createMediaAssetObjectPrefix(input),
+    createOcrObjectPrefix(input),
+    createProcessingObjectPrefix(input),
+  ];
+}
+
+function createLegacySourceDocumentObjectPrefixes(input: {
+  documentId: string;
+  knowledgeBaseId: string;
+}): string[] {
+  const documentId = sanitizeObjectKeySegment(input.documentId);
+  const knowledgeBaseId = sanitizeObjectKeySegment(input.knowledgeBaseId);
+
+  return [
+    `sources/${knowledgeBaseId}/${documentId}/`,
+    `parsed/${knowledgeBaseId}/${documentId}/`,
+    `media/${knowledgeBaseId}/${documentId}/`,
+    `ocr/${knowledgeBaseId}/${documentId}/`,
+    `processing/${knowledgeBaseId}/${documentId}/`,
+    `sources/${documentId}/`,
+    `parsed/${documentId}/`,
+    `media/${documentId}/`,
+    `ocr/${documentId}/`,
+    `processing/${documentId}/`,
+  ];
+}
+
+function createChildResourceObjectPrefixes(operation: DeletionCleanupOperationRecord): string[] {
+  if (operation.knowledgeBaseId === null) {
+    return [];
+  }
+
+  const knowledgeBaseId = operation.knowledgeBaseId;
+
+  if (operation.targetType === "wiki_page") {
+    return [
+      createWikiPageObjectPrefix({
+        knowledgeBaseId,
+        pageId: operation.targetId,
+      }),
+    ];
+  }
+
+  if (operation.targetType === "wiki_page_version") {
+    return [
+      createWikiPageVersionObjectPrefix({
+        knowledgeBaseId,
+        pageVersionId: operation.targetId,
+      }),
+    ];
+  }
+
+  if (operation.targetType === "wiki_edge") {
+    return [
+      createWikiEdgeObjectPrefix({
+        edgeId: operation.targetId,
+        knowledgeBaseId,
+      }),
+    ];
+  }
+
+  return [];
+}
+
+function createVersionedObjectCleanupPrefixes(operation: DeletionCleanupOperationRecord): string[] {
+  if (operation.targetType === "knowledge_base" && operation.knowledgeBaseId !== null) {
+    return [
+      createKnowledgeBaseObjectPrefix({
+        knowledgeBaseId: operation.knowledgeBaseId,
+      }),
+    ];
+  }
+  if (operation.targetType === "source_document") {
+    return createSourceDocumentObjectPrefixes(operation);
+  }
+  if (isChildResourceCleanupTarget(operation.targetType)) {
+    return createChildResourceObjectPrefixes(operation);
+  }
+
+  return [];
+}
+
+function createObjectVersionExample(object: { key: string; versionId?: string }): string {
+  return object.versionId === undefined ? object.key : `${object.key}#${object.versionId}`;
+}
+
+function isVersionedCleanupUnsupportedError(error: unknown): boolean {
+  const code = readErrorCode(error);
+
+  return (
+    code === "NotImplemented" ||
+    code === "NotSupported" ||
+    code === "UnsupportedOperation" ||
+    code === "MethodNotAllowed"
+  );
+}
+
+function readErrorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) {
+    return undefined;
+  }
+  if ("Code" in error && typeof error.Code === "string") {
+    return error.Code;
+  }
+  if ("code" in error && typeof error.code === "string") {
+    return error.code;
+  }
+  if ("name" in error && typeof error.name === "string") {
+    return error.name;
+  }
+
+  return undefined;
+}
+
+function isChildResourceCleanupTarget(targetType: DeletionCleanupTargetType): boolean {
+  return (
+    targetType === "wiki_page" || targetType === "wiki_page_version" || targetType === "wiki_edge"
+  );
+}
+
+function createEmptyResidualVerificationResult(): DeletionCleanupResidualVerificationResult {
+  return createResidualVerificationResult({});
+}
+
+function createResidualVerificationResult(
+  input: Partial<DeletionCleanupResidualVerificationResult>,
+): DeletionCleanupResidualVerificationResult {
+  return {
+    databaseResidualCount: input.databaseResidualCount ?? 0,
+    databaseResidualExamples: input.databaseResidualExamples ?? [],
+    legacyLayoutResidualCount: input.legacyLayoutResidualCount ?? 0,
+    legacyLayoutResidualExamples: input.legacyLayoutResidualExamples ?? [],
+    objectStorageResidualCount: input.objectStorageResidualCount ?? 0,
+    objectStorageResidualExamples: input.objectStorageResidualExamples ?? [],
+    redisResidualCount: input.redisResidualCount ?? 0,
+    redisResidualExamples: input.redisResidualExamples ?? [],
+    versionedObjectResidualCount: input.versionedObjectResidualCount ?? 0,
+    versionedObjectResidualExamples: input.versionedObjectResidualExamples ?? [],
+  };
+}
+
+function countNonVersionedResidualVerificationResult(
+  result: DeletionCleanupResidualVerificationResult,
+): number {
+  return (
+    result.objectStorageResidualCount +
+    result.databaseResidualCount +
+    result.redisResidualCount +
+    result.legacyLayoutResidualCount
+  );
+}
+
+function createResidualVerificationManifestPatch(
+  result: DeletionCleanupResidualVerificationResult,
+  existingManifest: Record<string, unknown>,
+  options: { defaultVersionedStatus: string },
+): Record<string, unknown> {
+  const versionedObjectResidualCount = Math.max(
+    readNonNegativeManifestInteger(existingManifest, "versioned_object_residual_count"),
+    result.versionedObjectResidualCount,
+  );
+  const versionedObjectResidualExamples =
+    readStringArrayManifestValue(existingManifest, "versioned_object_residual_examples").length > 0
+      ? readStringArrayManifestValue(existingManifest, "versioned_object_residual_examples")
+      : result.versionedObjectResidualExamples;
+
+  return {
+    database_residual_count: result.databaseResidualCount,
+    database_residual_examples: result.databaseResidualExamples,
+    legacy_layout_residual_count: result.legacyLayoutResidualCount,
+    legacy_layout_residual_examples: result.legacyLayoutResidualExamples,
+    object_storage_residual_count: result.objectStorageResidualCount,
+    object_storage_residual_examples: result.objectStorageResidualExamples,
+    redis_residual_count: result.redisResidualCount,
+    redis_residual_examples: result.redisResidualExamples,
+    residual_check_status:
+      countNonVersionedResidualVerificationResult(result) + versionedObjectResidualCount === 0
+        ? "completed"
+        : "failed",
+    versioned_object_count: readNonNegativeManifestInteger(
+      existingManifest,
+      "versioned_object_count",
+    ),
+    versioned_object_failed_count: readNonNegativeManifestInteger(
+      existingManifest,
+      "versioned_object_failed_count",
+    ),
+    versioned_object_residual_count: versionedObjectResidualCount,
+    versioned_object_residual_examples: versionedObjectResidualExamples,
+    versioned_object_status:
+      readStringManifestValue(existingManifest, "versioned_object_status") ??
+      options.defaultVersionedStatus,
+  };
+}
+
+function readNonNegativeManifestInteger(manifest: Record<string, unknown>, key: string): number {
+  const value = manifest[key];
+
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
+}
+
+function readStringManifestValue(manifest: Record<string, unknown>, key: string): string | null {
+  const value = manifest[key];
+
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function readStringArrayManifestValue(manifest: Record<string, unknown>, key: string): string[] {
+  const value = manifest[key];
+
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+function knowledgeBaseResidualRowsSql(input: {
+  knowledgeBaseId: string;
+  projectId: string;
+  tenantId: string;
+}) {
+  return sql`
+    select 'change_set_items'::text as table_name, count(*)::bigint as residual_count
+    from change_set_items
+    inner join change_sets on change_sets.id = change_set_items.change_set_id
+    where change_sets.knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'change_sets'::text, count(*)::bigint
+    from change_sets
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'compile_stage_executions'::text, count(*)::bigint
+    from compile_stage_executions
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'delete_impact_previews'::text, count(*)::bigint
+    from delete_impact_previews
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'document_processing_checkpoints'::text, count(*)::bigint
+    from document_processing_checkpoints
+    where knowledge_base_id = ${input.knowledgeBaseId}
+      and tenant_id = ${input.tenantId}
+      and project_id = ${input.projectId}
+    union all
+    select 'document_processing_units'::text, count(*)::bigint
+    from document_processing_units
+    where knowledge_base_id = ${input.knowledgeBaseId}
+      and tenant_id = ${input.tenantId}
+      and project_id = ${input.projectId}
+    union all
+    select 'duplicate_decisions'::text, count(*)::bigint
+    from duplicate_decisions
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'import_previews'::text, count(*)::bigint
+    from import_previews
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'jobs'::text, count(*)::bigint
+    from jobs
+    where knowledge_base_id = ${input.knowledgeBaseId}
+      and tenant_id = ${input.tenantId}
+      and project_id = ${input.projectId}
+    union all
+    select 'knowledge_checks'::text, count(*)::bigint
+    from knowledge_checks
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'knowledge_versions'::text, count(*)::bigint
+    from knowledge_versions
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'media_assets'::text, count(*)::bigint
+    from media_assets
+    inner join source_documents on source_documents.id = media_assets.source_document_id
+    where source_documents.knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'model_calls'::text, count(*)::bigint
+    from model_calls
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'ocr_artifacts'::text, count(*)::bigint
+    from ocr_artifacts
+    inner join source_documents on source_documents.id = ocr_artifacts.source_document_id
+    where source_documents.knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'ocr_blocks'::text, count(*)::bigint
+    from ocr_blocks
+    inner join source_documents on source_documents.id = ocr_blocks.source_document_id
+    where source_documents.knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'ocr_page_statuses'::text, count(*)::bigint
+    from ocr_page_statuses
+    inner join source_documents on source_documents.id = ocr_page_statuses.source_document_id
+    where source_documents.knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'page_embeddings'::text, count(*)::bigint
+    from page_embeddings
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'page_merge_records'::text, count(*)::bigint
+    from page_merge_records
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'parsed_contents'::text, count(*)::bigint
+    from parsed_contents
+    inner join source_documents on source_documents.id = parsed_contents.source_document_id
+    where source_documents.knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'retrieval_traces'::text, count(*)::bigint
+    from retrieval_traces
+    where knowledge_base_id = ${input.knowledgeBaseId}
+      and tenant_id = ${input.tenantId}
+      and project_id = ${input.projectId}
+    union all
+    select 'rollback_records'::text, count(*)::bigint
+    from rollback_records
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'scheduled_import_jobs'::text, count(*)::bigint
+    from scheduled_import_jobs
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'source_documents'::text, count(*)::bigint
+    from source_documents
+    where knowledge_base_id = ${input.knowledgeBaseId}
+      and tenant_id = ${input.tenantId}
+      and project_id = ${input.projectId}
+    union all
+    select 'source_watch_rules'::text, count(*)::bigint
+    from source_watch_rules
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'system_pages'::text, count(*)::bigint
+    from system_pages
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'webhook_deliveries'::text, count(*)::bigint
+    from webhook_deliveries
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'webhooks'::text, count(*)::bigint
+    from webhooks
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'wiki_analysis_results'::text, count(*)::bigint
+    from wiki_analysis_results
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'wiki_draft_candidates'::text, count(*)::bigint
+    from wiki_draft_candidates
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'wiki_edge_sources'::text, count(*)::bigint
+    from wiki_edge_sources
+    inner join wiki_edges on wiki_edges.id = wiki_edge_sources.edge_id
+    where wiki_edges.knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'wiki_edges'::text, count(*)::bigint
+    from wiki_edges
+    where knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'wiki_page_versions'::text, count(*)::bigint
+    from wiki_page_versions
+    inner join wiki_pages on wiki_pages.id = wiki_page_versions.page_id
+    where wiki_pages.knowledge_base_id = ${input.knowledgeBaseId}
+    union all
+    select 'wiki_pages'::text, count(*)::bigint
+    from wiki_pages
+    where knowledge_base_id = ${input.knowledgeBaseId}
+  `;
+}
+
+function sourceDocumentResidualRowsSql(input: {
+  projectId: string;
+  sourceDocumentId: string;
+  tenantId: string;
+}) {
+  return sql`
+    select 'compile_stage_executions'::text as table_name, count(*)::bigint as residual_count
+    from compile_stage_executions
+    where source_document_id = ${input.sourceDocumentId}
+    union all
+    select 'delete_impact_previews'::text, count(*)::bigint
+    from delete_impact_previews
+    where source_document_id = ${input.sourceDocumentId}
+    union all
+    select 'document_processing_checkpoints'::text, count(*)::bigint
+    from document_processing_checkpoints
+    where source_document_id = ${input.sourceDocumentId}
+      and tenant_id = ${input.tenantId}
+      and project_id = ${input.projectId}
+    union all
+    select 'document_processing_units'::text, count(*)::bigint
+    from document_processing_units
+    where source_document_id = ${input.sourceDocumentId}
+      and tenant_id = ${input.tenantId}
+      and project_id = ${input.projectId}
+    union all
+    select 'jobs'::text, count(*)::bigint
+    from jobs
+    where source_document_id = ${input.sourceDocumentId}
+      and tenant_id = ${input.tenantId}
+      and project_id = ${input.projectId}
+    union all
+    select 'media_assets'::text, count(*)::bigint
+    from media_assets
+    where source_document_id = ${input.sourceDocumentId}
+    union all
+    select 'model_calls'::text, count(*)::bigint
+    from model_calls
+    where source_document_id = ${input.sourceDocumentId}
+    union all
+    select 'ocr_artifacts'::text, count(*)::bigint
+    from ocr_artifacts
+    where source_document_id = ${input.sourceDocumentId}
+    union all
+    select 'ocr_blocks'::text, count(*)::bigint
+    from ocr_blocks
+    where source_document_id = ${input.sourceDocumentId}
+    union all
+    select 'ocr_page_statuses'::text, count(*)::bigint
+    from ocr_page_statuses
+    where source_document_id = ${input.sourceDocumentId}
+    union all
+    select 'parsed_contents'::text, count(*)::bigint
+    from parsed_contents
+    where source_document_id = ${input.sourceDocumentId}
+    union all
+    select 'wiki_analysis_results'::text, count(*)::bigint
+    from wiki_analysis_results
+    where source_document_id = ${input.sourceDocumentId}
+  `;
+}
+
+function childResourceResidualRowsSql(input: {
+  targetId: string;
+  targetType: DeletionCleanupTargetType;
+}) {
+  if (input.targetType === "wiki_page") {
+    return sql`
+      select 'page_embeddings'::text as table_name, count(*)::bigint as residual_count
+      from page_embeddings
+      where page_id = ${input.targetId}
+         or page_version_id in (
+           select id
+           from wiki_page_versions
+           where page_id = ${input.targetId}
+         )
+      union all
+      select 'wiki_edge_sources'::text, count(*)::bigint
+      from wiki_edge_sources
+      where edge_id in (
+        select id
+        from wiki_edges
+        where from_page_id = ${input.targetId}
+           or to_page_id = ${input.targetId}
+      )
+      union all
+      select 'wiki_edges'::text, count(*)::bigint
+      from wiki_edges
+      where from_page_id = ${input.targetId}
+         or to_page_id = ${input.targetId}
+      union all
+      select 'wiki_page_versions'::text, count(*)::bigint
+      from wiki_page_versions
+      where page_id = ${input.targetId}
+      union all
+      select 'wiki_pages'::text, count(*)::bigint
+      from wiki_pages
+      where id = ${input.targetId}
+    `;
+  }
+
+  if (input.targetType === "wiki_page_version") {
+    return sql`
+      select 'page_embeddings'::text as table_name, count(*)::bigint as residual_count
+      from page_embeddings
+      where page_version_id = ${input.targetId}
+         or (object_type = 'wiki_page_version' and object_id = ${input.targetId})
+      union all
+      select 'wiki_edge_sources'::text, count(*)::bigint
+      from wiki_edge_sources
+      where page_version_id = ${input.targetId}
+      union all
+      select 'wiki_page_versions'::text, count(*)::bigint
+      from wiki_page_versions
+      where id = ${input.targetId}
+    `;
+  }
+
+  if (input.targetType === "wiki_edge") {
+    return sql`
+      select 'page_embeddings'::text as table_name, count(*)::bigint as residual_count
+      from page_embeddings
+      where object_type = 'wiki_edge'
+        and object_id = ${input.targetId}
+      union all
+      select 'wiki_edge_sources'::text, count(*)::bigint
+      from wiki_edge_sources
+      where edge_id = ${input.targetId}
+      union all
+      select 'wiki_edges'::text, count(*)::bigint
+      from wiki_edges
+      where id = ${input.targetId}
+    `;
+  }
+
+  return sql`
+    select 'unsupported_child_resource'::text as table_name, 0::bigint as residual_count
+  `;
+}
+
+function readRedisStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
 }
 
 async function readOperationItemCounts(
@@ -1717,6 +4491,19 @@ function isRetryableDatabaseItem(
   );
 }
 
+function isRetryableRedisItem(
+  item: DeletionCleanupItemRecord,
+  retryFailedBefore = "9999-12-31T23:59:59.999Z",
+): boolean {
+  return (
+    item.itemType === "redis_key" &&
+    item.resourceId !== null &&
+    (item.status === "pending" ||
+      (item.status === "failed" && item.updatedAt <= retryFailedBefore)) &&
+    item.attemptCount < item.maxAttempts
+  );
+}
+
 function compareDatabaseCleanupItems(
   left: DeletionCleanupItemRecord,
   right: DeletionCleanupItemRecord,
@@ -1741,6 +4528,7 @@ function countItems(items: readonly DeletionCleanupItemRecord[]) {
     failedItemCount: items.filter((item) => item.status === "failed").length,
     objectKeyCount: items.filter((item) => item.objectKey !== null).length,
     databaseRowCount: items.filter((item) => item.tableName !== null).length,
+    redisKeyCount: items.filter((item) => item.itemType === "redis_key").length,
   };
 }
 
@@ -1762,6 +4550,7 @@ interface DeletionCleanupOperationRow {
   failed_item_count: number;
   object_key_count: number;
   database_row_count: number;
+  redis_key_count: number;
   attempt_count: number;
   max_attempts: number;
   retry_after: Date | string | null;
@@ -1808,6 +4597,7 @@ interface DeletionCleanupItemCountRow {
   failed_item_count: string;
   object_key_count: string;
   database_row_count: string;
+  redis_key_count: string;
 }
 
 function toOperationRecord(row: DeletionCleanupOperationRow): DeletionCleanupOperationRecord {
@@ -1829,6 +4619,7 @@ function toOperationRecord(row: DeletionCleanupOperationRow): DeletionCleanupOpe
     failedItemCount: row.failed_item_count,
     objectKeyCount: row.object_key_count,
     databaseRowCount: row.database_row_count,
+    redisKeyCount: row.redis_key_count,
     attemptCount: row.attempt_count,
     maxAttempts: row.max_attempts,
     retryAfter: normalizeNullableTimestamp(row.retry_after),
@@ -1881,6 +4672,7 @@ function toItemCounts(
     failedItemCount: Number(row?.failed_item_count ?? 0),
     objectKeyCount: Number(row?.object_key_count ?? 0),
     databaseRowCount: Number(row?.database_row_count ?? 0),
+    redisKeyCount: Number(row?.redis_key_count ?? 0),
   };
 }
 

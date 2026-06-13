@@ -503,6 +503,7 @@ export interface CleanupOperation {
     failed: number
     object_keys: number
     pending: number
+    redis_keys: number
     skipped: number
     total: number
   }
@@ -521,6 +522,7 @@ export interface CleanupOperation {
     | "manifest"
     | "fencing"
     | "object_cleanup"
+    | "redis_cleanup"
     | "database_cleanup"
     | "retention"
     | "completed"
@@ -536,6 +538,11 @@ export interface CleanupOperation {
   target_type:
     | "knowledge_base"
     | "source_document"
+    | "wiki_page"
+    | "wiki_page_version"
+    | "wiki_edge"
+    | "job"
+    | "job_artifact"
     | "source_watch_rule"
     | "webhook"
     | "import_preview"
@@ -546,13 +553,16 @@ export interface CleanupOperation {
 export interface CleanupSettledState {
   database: CleanupPhaseArtifactState
   is_settled: boolean
+  legacy_layout: CleanupPhaseArtifactState
   object_storage: CleanupPhaseArtifactState
   phase: CleanupOperation["phase"]
+  redis: CleanupPhaseArtifactState
   residual_artifacts: {
     failed: number
     pending: number
     total: number
   }
+  versioned_object_storage: CleanupPhaseArtifactState
 }
 
 export interface CleanupPhaseArtifactState {
@@ -572,7 +582,7 @@ export interface CleanupOperationItem {
   attempt_count: number
   completed_at: string | null
   id: string
-  item_type: "object" | "database_row" | "reference" | "audit"
+  item_type: "object" | "database_row" | "redis_key" | "reference" | "audit"
   last_error: Record<string, unknown> | null
   max_attempts: number
   object_key: string | null

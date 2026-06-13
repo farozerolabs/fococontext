@@ -51,6 +51,21 @@ type SystemSettingsSection =
   | "storageIndexes"
   | "webhook"
 
+type CleanupArtifactKey =
+  | "object_storage"
+  | "database"
+  | "redis"
+  | "legacy_layout"
+  | "versioned_object_storage"
+
+const cleanupArtifactKeys: CleanupArtifactKey[] = [
+  "object_storage",
+  "database",
+  "redis",
+  "legacy_layout",
+  "versioned_object_storage",
+]
+
 export function SystemSettingsPage() {
   const { t } = useTranslation()
   const apiClient = useApiClient()
@@ -298,12 +313,7 @@ function SystemSettingsSectionPanel({
 
   if (section === "operations") {
     const cleanupQueue = readRecord(settings.dependencies, "cleanupQueue")
-    const operations = cleanupOperations.filter(
-      (operation) =>
-        operation.status === "failed" ||
-        operation.status === "queued" ||
-        operation.status === "running"
-    )
+    const operations = cleanupOperations
 
     return (
       <div className="flex flex-col gap-4">
@@ -332,6 +342,7 @@ function SystemSettingsSectionPanel({
                 <TableHead>{t("source.column.status")}</TableHead>
                 <TableHead>{t("cleanup.phase")}</TableHead>
                 <TableHead>{t("cleanup.items")}</TableHead>
+                <TableHead>{t("cleanup.settlement")}</TableHead>
                 <TableHead>{t("cleanup.updated")}</TableHead>
                 <TableHead className="text-right">
                   {t("job.column.actions")}
@@ -366,6 +377,16 @@ function SystemSettingsSectionPanel({
                     {operation.item_counts.deleted +
                       operation.item_counts.skipped}
                     /{operation.item_counts.total}
+                    <div className="text-xs text-muted-foreground">
+                      {t("cleanup.itemBreakdown", {
+                        database: operation.item_counts.database_rows,
+                        object: operation.item_counts.object_keys,
+                        redis: operation.item_counts.redis_keys,
+                      })}
+                    </div>
+                  </TableCell>
+                  <TableCell className="min-w-72 whitespace-normal">
+                    <CleanupSettlementSummary operation={operation} t={t} />
                   </TableCell>
                   <TableCell>{operation.updated_at}</TableCell>
                   <TableCell className="text-right">
@@ -847,6 +868,76 @@ function buildConcurrencyRows(
     scopeLabel: t(`systemSettings.concurrency.scopeValue.${row.scope}`),
     value: readNestedPrimitive(effectiveConcurrency, row.path),
   }))
+}
+
+function CleanupSettlementSummary({
+  operation,
+  t,
+}: {
+  operation: CleanupOperation
+  t: TFunction
+}) {
+  const residual = operation.settled_state.residual_artifacts
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge variant={getCleanupSettlementVariant(operation)}>
+          {getCleanupSettlementLabel(operation, t)}
+        </Badge>
+        <span className="text-xs text-muted-foreground">
+          {t("cleanup.residualSummary", {
+            failed: residual.failed,
+            pending: residual.pending,
+            total: residual.total,
+          })}
+        </span>
+      </div>
+      <div className="flex flex-wrap gap-1">
+        {cleanupArtifactKeys.map((key) => (
+          <span
+            className="rounded-md border px-2 py-1 text-xs text-muted-foreground"
+            key={key}
+          >
+            <span className="font-medium text-foreground">
+              {t(`cleanup.artifact.${key}`)}
+            </span>{" "}
+            {formatStatus(t, operation.settled_state[key].status)} ·{" "}
+            {operation.settled_state[key].residual}/
+            {operation.settled_state[key].total}
+          </span>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function getCleanupSettlementLabel(operation: CleanupOperation, t: TFunction) {
+  if (operation.settled_state.is_settled) {
+    return t("cleanup.settlementValue.settled")
+  }
+
+  if (operation.status === "failed" && operation.retryable) {
+    return t("cleanup.settlementValue.retryableFailure")
+  }
+
+  if (operation.settled_state.residual_artifacts.total > 0) {
+    return t("cleanup.settlementValue.residual")
+  }
+
+  return t("cleanup.settlementValue.pending")
+}
+
+function getCleanupSettlementVariant(operation: CleanupOperation) {
+  if (operation.status === "failed") {
+    return "destructive"
+  }
+
+  if (operation.settled_state.is_settled) {
+    return "secondary"
+  }
+
+  return "outline"
 }
 
 function getRuntimePressureWarnings(
