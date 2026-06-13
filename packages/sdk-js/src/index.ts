@@ -11,9 +11,20 @@ export interface RequestOptions {
 }
 
 export interface ListOptions extends RequestOptions {
+  cursor?: string;
+  limit?: number;
   page?: number;
   pageSize?: number;
   [key: string]: string | number | boolean | undefined | HeadersInit;
+}
+
+export interface CleanupOperationItemListOptions extends RequestOptions {
+  itemsPage?: number;
+  itemsPageSize?: number;
+}
+
+export interface SourceWatchScanItemListOptions extends ListOptions {
+  item_kind?: SourceWatchScanItemKind;
 }
 
 export interface UploadSourceDocumentInput extends RequestOptions {
@@ -57,6 +68,7 @@ export const apiErrorCodes = [
   "parser_timeout",
   "password_protected_pdf",
   "parser_output_empty",
+  "parser_limit_exceeded",
   "invalid_request",
   "invalid_locator",
   "unsupported_evidence_kind",
@@ -66,6 +78,10 @@ export const apiErrorCodes = [
   "ingest_failed",
   "change_set_conflict",
   "retrieve_index_not_ready",
+  "durable_backend_unavailable",
+  "bounded_retrieval_unavailable",
+  "graph_index_unavailable",
+  "redis_metrics_degraded",
   "fork_target_invalid",
   "fork_submission_requires_fork",
   "document_delete_preview_required",
@@ -76,6 +92,10 @@ export const apiErrorCodes = [
   "resource_conflict",
   "ingest_lock_conflict",
   "rate_limited",
+  "admission_limited",
+  "request_size_limit_exceeded",
+  "retrieve_limit_exceeded",
+  "export_limit_exceeded",
   "internal_error",
 ] as const;
 
@@ -138,10 +158,25 @@ export interface CleanupSettledState extends JsonObject {
   };
 }
 
+export interface CleanupItemSummary extends JsonObject {
+  id: string;
+  item_type: "object" | "database_row" | "reference" | "audit";
+  operation_id: string;
+  phase: CleanupPhase;
+  status: "pending" | "running" | "deleted" | "skipped" | "failed";
+}
+
 export interface CleanupOperation {
   created_at: string;
   id: string;
   item_counts: CleanupItemCounts;
+  items?: CleanupItemSummary[];
+  items_pagination?: {
+    has_more: boolean;
+    page: number;
+    page_size: number;
+    total: number;
+  };
   knowledge_base_id: string | null;
   phase: CleanupPhase;
   retryable: boolean;
@@ -170,6 +205,38 @@ export interface CleanupRetryResponse {
   cleanup_operation: CleanupOperation;
 }
 
+export interface ChangeSet extends JsonObject {
+  applied_at: string | null;
+  base_version_id: string | null;
+  created_at: string;
+  description: string | null;
+  diff: JsonObject;
+  discarded_at: string | null;
+  id: string;
+  items: JsonObject[];
+  knowledge_base_id: string;
+  metadata: JsonObject;
+  status: string;
+  target_version_id: string | null;
+  title: string;
+  trigger_type: string;
+}
+
+export interface ChangeSetSummary extends JsonObject {
+  applied_at: string | null;
+  base_version_id: string | null;
+  created_at: string;
+  description: string | null;
+  discarded_at: string | null;
+  id: string;
+  knowledge_base_id: string;
+  metadata: JsonObject;
+  status: string;
+  target_version_id: string | null;
+  title: string;
+  trigger_type: string;
+}
+
 export interface ApiEnvelope<TData> {
   data?: TData;
   error?: ApiErrorPayload;
@@ -188,6 +255,7 @@ export interface Pagination {
   page_size: number;
   total: number;
   has_more: boolean;
+  next_cursor?: string | null;
 }
 
 export type JsonObject = Record<string, unknown>;
@@ -388,6 +456,28 @@ export interface ForkSubmissionResponse extends JsonObject {
   job: JsonObject;
   upstream_knowledge_base_id: string | null;
 }
+
+export type SourceWatchScanItemKind =
+  | "discovered"
+  | "skipped"
+  | "new"
+  | "changed"
+  | "unchanged"
+  | "delete_candidate"
+  | "failed";
+
+export interface SourceWatchScanItem extends JsonObject {
+  comparison_status?: string;
+  content_hash?: string;
+  cursor?: JsonObject;
+  item_kind: SourceWatchScanItemKind;
+  payload: JsonObject;
+  safe_error?: JsonObject | null;
+  source_identity: string;
+  source_path?: string;
+  source_url?: string;
+}
+
 export type KnowledgeCheckType =
   | "orphan_pages"
   | "broken_wikilinks"
@@ -1495,19 +1585,26 @@ export class FococontextClient {
 
   getCleanupOperation<TData = CleanupOperation>(
     cleanupOperationId: string,
-    options: RequestOptions = {},
+    options: CleanupOperationItemListOptions = {},
   ): Promise<TData> {
-    return this.getJson(`/cleanup-operations/${encodePath(cleanupOperationId)}`, options);
+    return this.requestJson(`/cleanup-operations/${encodePath(cleanupOperationId)}`, options, {
+      method: "GET",
+      query: toCleanupItemPageQuery(options),
+    });
   }
 
   retryCleanupOperation<TData = CleanupRetryResponse>(
     cleanupOperationId: string,
-    options: RequestOptions = {},
+    options: CleanupOperationItemListOptions = {},
   ): Promise<TData> {
-    return this.postJson(
+    return this.requestJson(
       `/cleanup-operations/${encodePath(cleanupOperationId)}/retry`,
-      {},
       options,
+      {
+        body: {},
+        method: "POST",
+        query: toCleanupItemPageQuery(options),
+      },
     );
   }
 
@@ -1602,6 +1699,22 @@ export class FococontextClient {
     return this.postJson(`/knowledge-bases/${encodePath(knowledgeBaseId)}/imports`, input, options);
   }
 
+  getBatchImportStatus<TData = JsonObject>(
+    knowledgeBaseId: string,
+    importJobId: string,
+    input: ListOptions = {},
+    options: RequestOptions = {},
+  ): Promise<TData> {
+    return this.requestJson(
+      `/knowledge-bases/${encodePath(knowledgeBaseId)}/imports/${encodePath(importJobId)}`,
+      options,
+      {
+        method: "GET",
+        query: toPageQuery(input),
+      },
+    );
+  }
+
   retrieveKnowledgeContext<TData = RetrieveResponse>(
     knowledgeBaseId: string,
     input: RetrieveRequest,
@@ -1672,6 +1785,17 @@ export class FococontextClient {
     options: RequestOptions = {},
   ): Promise<TData> {
     return this.getJson(`/knowledge-bases/${encodePath(knowledgeBaseId)}/graph/insights`, options);
+  }
+
+  refreshGraphInsights<TData = JsonObject>(
+    knowledgeBaseId: string,
+    options: RequestOptions = {},
+  ): Promise<TData> {
+    return this.postJson(
+      `/knowledge-bases/${encodePath(knowledgeBaseId)}/graph/insights/refresh`,
+      {},
+      options,
+    );
   }
 
   listWikiPages<TItem = JsonObject>(
@@ -1780,6 +1904,17 @@ export class FococontextClient {
     return this.getJson(`/scheduled-import-jobs/${encodePath(jobId)}`, options);
   }
 
+  listScheduledImportJobItems<TItem = SourceWatchScanItem>(
+    jobId: string,
+    options: SourceWatchScanItemListOptions = {},
+  ): Promise<ListResult<TItem>> {
+    return this.requestList(
+      `/scheduled-import-jobs/${encodePath(jobId)}/items`,
+      toPageQuery(options),
+      options,
+    );
+  }
+
   listSourceWatchScanHistory<TItem = JsonObject>(
     ruleId: string,
     options: ListOptions = {},
@@ -1824,6 +1959,17 @@ export class FococontextClient {
     return this.getJson(`/knowledge-checks/${encodePath(checkId)}`, options);
   }
 
+  listKnowledgeCheckFindings<TItem = KnowledgeCheckFinding>(
+    checkId: string,
+    options: ListOptions = {},
+  ): Promise<ListResult<TItem>> {
+    return this.requestList(
+      `/knowledge-checks/${encodePath(checkId)}/findings`,
+      toPageQuery(options),
+      options,
+    );
+  }
+
   listKnowledgeBaseVersions<TItem = JsonObject>(
     knowledgeBaseId: string,
     options: ListOptions = {},
@@ -1840,6 +1986,17 @@ export class FococontextClient {
     options: RequestOptions = {},
   ): Promise<TData> {
     return this.getJson(`/change-sets/${encodePath(changeSetId)}`, options);
+  }
+
+  listKnowledgeBaseChangeSets<TItem = ChangeSetSummary>(
+    knowledgeBaseId: string,
+    options: ListOptions = {},
+  ): Promise<ListResult<TItem>> {
+    return this.requestList(
+      `/knowledge-bases/${encodePath(knowledgeBaseId)}/change-sets`,
+      toPageQuery(options),
+      options,
+    );
   }
 
   applyChangeSet<TData = JsonObject>(
@@ -2169,6 +2326,15 @@ function toPageQuery(options: ListOptions): Record<string, string | number | boo
   }
 
   return query;
+}
+
+function toCleanupItemPageQuery(
+  options: CleanupOperationItemListOptions,
+): Record<string, string | number | boolean | undefined> {
+  return {
+    items_page: options.itemsPage,
+    items_page_size: options.itemsPageSize,
+  };
 }
 
 function encodePath(value: string): string {

@@ -6,24 +6,23 @@ import type { WebhookEventType } from "@fococontext/contracts";
 import type { RuntimeConfig } from "@fococontext/core";
 
 import { defaultApiResourceScope, type ApiResourceScope } from "../auth/api-key.guard.js";
-import { isApiResourceInScope, requireScopedWebhook } from "../auth/resource-scope.js";
 import { apiDatabaseMirrorToken, type ApiDatabaseMirror } from "../database/api-database-mirror.js";
-import { KnowledgeBaseService } from "../knowledge-bases/knowledge-base.service.js";
+import {
+  operationalReadStoreToken,
+  type OperationalReadStore,
+} from "../database/operational-read-store.js";
 import {
   webhookDispatchQueueToken,
   type WebhookDispatchQueue,
 } from "../queues/webhook-dispatch.queue.js";
 import { runtimeConfigToken } from "../runtime-config.provider.js";
-import { WebhookRepository } from "./webhook.repository.js";
 import type {
   CreateWebhookInput,
   UpdateWebhookInput,
   WebhookDeliveryEnvelope,
-  WebhookDeliveryListEnvelope,
   WebhookDeliveryRecord,
   WebhookDeliveryResponse,
   WebhookEnvelope,
-  WebhookListEnvelope,
   WebhookRecord,
   WebhookResponse,
 } from "./webhook.types.js";
@@ -31,9 +30,8 @@ import type {
 @Injectable()
 export class WebhookService {
   constructor(
-    private readonly knowledgeBaseService: KnowledgeBaseService,
-    private readonly repository: WebhookRepository,
     @Inject(apiDatabaseMirrorToken) private readonly databaseMirror: ApiDatabaseMirror,
+    @Inject(operationalReadStoreToken) private readonly operationalReadStore: OperationalReadStore,
     @Inject(runtimeConfigToken) private readonly runtimeConfig: RuntimeConfig,
     @Inject(webhookDispatchQueueToken) private readonly webhookDispatchQueue: WebhookDispatchQueue,
   ) {}
@@ -45,11 +43,13 @@ export class WebhookService {
     const knowledgeBaseId = readOptionalKnowledgeBaseId(input.knowledge_base_id);
 
     if (knowledgeBaseId !== null) {
-      this.knowledgeBaseService.get(knowledgeBaseId, scope);
+      await this.requireReadableKnowledgeBase(knowledgeBaseId, scope, () =>
+        createWebhookNotFoundError(knowledgeBaseId),
+      );
     }
 
     const now = new Date().toISOString();
-    const record = this.repository.createWebhook({
+    const record: WebhookRecord = {
       id: createResourceId("webhook"),
       tenantId: scope.tenantId,
       projectId: scope.projectId,
@@ -61,7 +61,7 @@ export class WebhookService {
       secret: readSecret(input.secret),
       createdAt: now,
       updatedAt: now,
-    });
+    };
     await this.databaseMirror.saveWebhook(record);
 
     return {
@@ -69,20 +69,44 @@ export class WebhookService {
     };
   }
 
-  list(scope: ApiResourceScope = defaultApiResourceScope): WebhookListEnvelope {
-    return {
-      webhooks: this.repository
-        .listWebhooks()
-        .filter((webhook) => isApiResourceInScope(webhook, scope))
-        .map((webhook) => this.toWebhookResponse(webhook)),
-    };
+  async listPaginated(
+    input: { page: number; pageSize: number },
+    scope: ApiResourceScope = defaultApiResourceScope,
+  ): Promise<{
+    webhooks: readonly WebhookResponse[];
+    page: number;
+    pageSize: number;
+    total: number;
+    hasMore: boolean;
+  }> {
+    try {
+      const dbResult = await this.operationalReadStore.listWebhooks(scope, input);
+
+      if (dbResult !== null) {
+        return {
+          webhooks: dbResult.items.map((webhook) =>
+            this.toWebhookResponse(webhook, dbResult.latestDeliveriesByWebhookId.get(webhook.id)),
+          ),
+          page: input.page,
+          pageSize: input.pageSize,
+          total: dbResult.total,
+          hasMore: dbResult.hasMore,
+        };
+      }
+    } catch (error) {
+      throw toOperationalListError(error);
+    }
+
+    throw new ApiError("internal_error");
   }
 
-  get(webhookId: string, scope: ApiResourceScope = defaultApiResourceScope): WebhookEnvelope {
-    const webhook = this.requireWebhook(webhookId, scope);
-
+  async get(
+    webhookId: string,
+    scope: ApiResourceScope = defaultApiResourceScope,
+  ): Promise<WebhookEnvelope> {
+    const dbResult = await this.getOperationalWebhook(webhookId, scope);
     return {
-      webhook: this.toWebhookResponse(webhook),
+      webhook: this.toWebhookResponse(dbResult.webhook, dbResult.latestDelivery ?? undefined),
     };
   }
 
@@ -91,7 +115,7 @@ export class WebhookService {
     input: UpdateWebhookInput,
     scope: ApiResourceScope = defaultApiResourceScope,
   ): Promise<WebhookEnvelope> {
-    const current = this.requireWebhook(webhookId, scope);
+    const current = (await this.getOperationalWebhook(webhookId, scope)).webhook;
 
     const now = new Date().toISOString();
     const nextStatus = readOptionalWebhookStatus(input.status) ?? current.status;
@@ -105,14 +129,14 @@ export class WebhookService {
             secret: readSecret(input.secret ?? undefined),
             secretConfigured: readSecretConfigured(input.secret ?? undefined),
           };
-    const updated = this.repository.updateWebhook({
+    const updated: WebhookRecord = {
       ...current,
       ...(input.url === undefined ? {} : { url: readUrl(input.url) }),
       ...(input.events === undefined ? {} : { events: readEvents(input.events) }),
       status: this.runtimeConfig.webhook.delivery.enabled ? nextStatus : "disabled",
       ...nextSecret,
       updatedAt: now,
-    });
+    };
 
     await this.databaseMirror.saveWebhook(updated);
 
@@ -121,17 +145,38 @@ export class WebhookService {
     };
   }
 
-  listDeliveries(
+  async listDeliveriesPaginated(
     webhookId: string,
+    input: { page: number; pageSize: number },
     scope: ApiResourceScope = defaultApiResourceScope,
-  ): WebhookDeliveryListEnvelope {
-    this.requireWebhook(webhookId, scope);
+  ): Promise<{
+    deliveries: readonly WebhookDeliveryResponse[];
+    page: number;
+    pageSize: number;
+    total: number;
+    hasMore: boolean;
+  }> {
+    await this.requireWebhookForRead(webhookId, scope);
+    try {
+      const dbResult = await this.operationalReadStore.listWebhookDeliveriesByWebhookId(
+        webhookId,
+        input,
+      );
 
-    return {
-      deliveries: this.repository
-        .listDeliveriesForWebhook(webhookId)
-        .map((delivery) => toWebhookDeliveryResponse(delivery)),
-    };
+      if (dbResult !== null) {
+        return {
+          deliveries: dbResult.items.map((delivery) => toWebhookDeliveryResponse(delivery)),
+          page: input.page,
+          pageSize: input.pageSize,
+          total: dbResult.total,
+          hasMore: dbResult.hasMore,
+        };
+      }
+    } catch (error) {
+      throw toOperationalListError(error);
+    }
+
+    throw new ApiError("internal_error");
   }
 
   async emit(input: {
@@ -147,14 +192,14 @@ export class WebhookService {
       return deliveries;
     }
 
-    const eventScope = input.scope ?? this.resolveEventScope(input.knowledgeBaseId);
+    const eventScope = input.scope ?? (await this.resolveEventScope(input.knowledgeBaseId));
+    const webhooks = await this.operationalReadStore.listMatchingWebhooks({
+      eventType: input.eventType,
+      knowledgeBaseId: input.knowledgeBaseId,
+      scope: eventScope,
+    });
 
-    for (const webhook of this.repository
-      .listMatchingWebhooks({
-        eventType: input.eventType,
-        knowledgeBaseId: input.knowledgeBaseId,
-      })
-      .filter((candidate) => isApiResourceInScope(candidate, eventScope))) {
+    for (const webhook of webhooks) {
       deliveries.push(await this.createAndEnqueueDelivery(webhook, input));
     }
 
@@ -166,7 +211,7 @@ export class WebhookService {
     input: Record<string, unknown>,
     scope: ApiResourceScope = defaultApiResourceScope,
   ): Promise<WebhookDeliveryEnvelope> {
-    const webhook = this.requireWebhook(webhookId, scope);
+    const webhook = (await this.getOperationalWebhook(webhookId, scope)).webhook;
 
     const eventType = readOptionalEventType(input.event_type) ?? "webhook.test";
 
@@ -194,45 +239,70 @@ export class WebhookService {
     };
   }
 
-  private requireWebhook(webhookId: string, scope: ApiResourceScope): WebhookRecord {
-    const webhook = requireScopedWebhook(this.repository.getWebhook(webhookId), scope, () =>
-      createWebhookNotFoundError(webhookId),
-    );
+  private async requireWebhookForRead(
+    webhookId: string,
+    scope: ApiResourceScope,
+  ): Promise<WebhookRecord> {
+    const dbResult = await this.getOperationalWebhook(webhookId, scope);
 
-    if (webhook.knowledgeBaseId !== null) {
-      try {
-        this.knowledgeBaseService.assertReadableKnowledgeBase(webhook.knowledgeBaseId, scope);
-      } catch (error) {
-        if (error instanceof ApiError && error.code === "knowledge_base_not_found") {
-          throw createWebhookNotFoundError(webhookId);
-        }
-
-        throw error;
-      }
-    }
-
-    return webhook;
+    return dbResult.webhook;
   }
 
-  private resolveEventScope(knowledgeBaseId: string | null): ApiResourceScope {
+  private async requireReadableKnowledgeBase(
+    knowledgeBaseId: string,
+    scope: ApiResourceScope,
+    notFoundFactory: () => ApiError,
+  ): Promise<void> {
+    const knowledgeBase = await this.operationalReadStore.getKnowledgeBaseById(
+      scope,
+      knowledgeBaseId,
+    );
+
+    if (knowledgeBase === null) {
+      throw notFoundFactory();
+    }
+  }
+
+  private async getOperationalWebhook(
+    webhookId: string,
+    scope: ApiResourceScope,
+  ): Promise<{
+    webhook: WebhookRecord;
+    latestDelivery: WebhookDeliveryRecord | null;
+  }> {
+    try {
+      const dbResult = await this.operationalReadStore.getWebhookById(scope, webhookId);
+
+      if (dbResult !== null) {
+        return dbResult;
+      }
+
+      throw createWebhookNotFoundError(webhookId);
+    } catch (error) {
+      throw toOperationalListError(error);
+    }
+  }
+
+  private async resolveEventScope(knowledgeBaseId: string | null): Promise<ApiResourceScope> {
     if (knowledgeBaseId === null) {
       throw new ApiError("invalid_request", {
         messageKey: "api.validation.webhook_scope_required",
       });
     }
 
-    const scope = this.knowledgeBaseService.getResourceScope(knowledgeBaseId);
+    const scope = await this.operationalReadStore.getKnowledgeBaseResourceScope(knowledgeBaseId);
 
-    if (scope === undefined) {
+    if (scope === null) {
       throw new ApiError("knowledge_base_not_found");
     }
 
     return scope;
   }
 
-  private toWebhookResponse(record: WebhookRecord): WebhookResponse {
-    const latestDelivery = this.repository.getLatestDelivery(record.id);
-
+  private toWebhookResponse(
+    record: WebhookRecord,
+    latestDelivery: WebhookDeliveryRecord | undefined = undefined,
+  ): WebhookResponse {
     return {
       id: record.id,
       knowledge_base_id: record.knowledgeBaseId,
@@ -259,15 +329,24 @@ export class WebhookService {
   ): Promise<WebhookDeliveryRecord> {
     const body = createWebhookDeliveryBody(webhook, input);
     const signing = createSigningMetadata(body, webhook.secretConfigured);
-    let delivery = this.repository.createDelivery({
+    let delivery: WebhookDeliveryRecord = {
+      id: createResourceId("webhookDelivery"),
       webhookId: webhook.id,
-      knowledgeBaseId: input.knowledgeBaseId,
+      knowledgeBaseId: input.knowledgeBaseId ?? null,
       eventType: input.eventType,
       payload: body,
+      status: "queued",
       requestTrace: input.requestTrace ?? {},
+      responseStatus: null,
+      responseBody: null,
+      attemptCount: 0,
       maxAttempts: this.runtimeConfig.limits.webhookDelivery.maxRetries + 1,
+      nextAttemptAt: null,
+      lastAttemptAt: null,
       signing,
-    });
+      createdAt: new Date().toISOString(),
+      deliveredAt: null,
+    };
 
     await this.databaseMirror.saveWebhookDelivery(delivery);
     try {
@@ -288,13 +367,13 @@ export class WebhookService {
         retry_backoff: this.runtimeConfig.limits.webhookDelivery.retryBackoff,
       });
     } catch (error) {
-      delivery = this.repository.updateDelivery({
+      delivery = {
         ...delivery,
         status: "failed",
         responseBody: error instanceof Error ? error.message : "Webhook queue enqueue failed.",
         attemptCount: 1,
         lastAttemptAt: new Date().toISOString(),
-      });
+      };
       await this.databaseMirror.saveWebhookDelivery(delivery);
     }
 
@@ -486,6 +565,10 @@ function toWebhookDeliveryResponse(record: WebhookDeliveryRecord): WebhookDelive
     created_at: record.createdAt,
     delivered_at: record.deliveredAt,
   };
+}
+
+function toOperationalListError(error: unknown): ApiError {
+  return error instanceof ApiError ? error : new ApiError("internal_error");
 }
 
 function createWebhookNotFoundError(webhookId: string): ApiError {

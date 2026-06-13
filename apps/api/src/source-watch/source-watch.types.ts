@@ -176,6 +176,27 @@ export interface SourceWatchSkippedSource {
   metadata?: Record<string, unknown>;
 }
 
+export type SourceWatchScanItemKind =
+  | "discovered"
+  | "skipped"
+  | "new"
+  | "changed"
+  | "unchanged"
+  | "delete_candidate"
+  | "failed";
+
+export interface SourceWatchScanStageItem {
+  comparison_status?: string;
+  content_hash?: string;
+  cursor?: Record<string, unknown>;
+  item_kind: SourceWatchScanItemKind;
+  payload: Record<string, unknown>;
+  safe_error?: Record<string, unknown> | null;
+  source_identity: string;
+  source_path?: string;
+  source_url?: string;
+}
+
 export interface SourceWatchScanDiscovery {
   status: SourceWatchScanStatus;
   newSources: readonly SourceWatchDiscoveredSource[];
@@ -241,6 +262,20 @@ export interface ListScheduledImportJobsInput {
 
 export interface ListScheduledImportJobsResult {
   items: readonly ScheduledImportJobResponse[];
+  page: number;
+  pageSize: number;
+  total: number;
+  hasMore: boolean;
+}
+
+export interface ListSourceWatchScanItemsInput {
+  itemKind?: SourceWatchScanItemKind;
+  page: number;
+  pageSize: number;
+}
+
+export interface ListSourceWatchScanItemsResult {
+  items: readonly SourceWatchScanStageItem[];
   page: number;
   pageSize: number;
   total: number;

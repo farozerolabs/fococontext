@@ -13,6 +13,7 @@
     { "path": "../../packages/db" },
     { "path": "../../packages/llm" },
     { "path": "../../packages/parsers" },
+    { "path": "../../packages/retrieval" },
     { "path": "../../packages/storage" }
   ]
 }

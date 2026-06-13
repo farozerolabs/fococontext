@@ -5,6 +5,7 @@ import base64
 import os
 from functools import lru_cache
 from importlib import metadata
+from threading import Lock
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -28,6 +29,7 @@ DEFAULT_LANGUAGES = [
     for item in os.getenv("OCR_LANGS", "ch,en").split(",")
     if item.strip()
 ]
+ENGINE_LOCK = Lock()
 
 
 class OcrPageInput(BaseModel):
@@ -169,7 +171,8 @@ def _recognize_page(page: OcrPageInput, confidence_threshold: float) -> OcrPageR
         image_bytes = base64.b64decode(page.image_base64, validate=True)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail={"code": "invalid_image_base64"}) from exc
-    result = _get_engine()(image_bytes, text_score=confidence_threshold)
+    with ENGINE_LOCK:
+        result = _get_engine()(image_bytes, text_score=confidence_threshold)
     return OcrPageResponse(
         page_number=page.page_number,
         blocks=_normalize_blocks(result, confidence_threshold),

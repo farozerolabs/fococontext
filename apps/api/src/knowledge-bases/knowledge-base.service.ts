@@ -3,43 +3,40 @@ import { ApiError, createResourceId } from "@fococontext/contracts";
 import type { RuntimeConfig } from "@fococontext/core";
 
 import { apiDatabaseMirrorToken, type ApiDatabaseMirror } from "../database/api-database-mirror.js";
+import {
+  operationalReadStoreToken,
+  type OperationalReadStore,
+} from "../database/operational-read-store.js";
 import { defaultApiResourceScope, type ApiResourceScope } from "../auth/api-key.guard.js";
-import { isApiResourceInScope, requireScopedKnowledgeBase } from "../auth/resource-scope.js";
+import { isApiResourceInScope } from "../auth/resource-scope.js";
 import {
   createQueuedDeletionCleanupOperation,
   toDeletionCleanupOperationSummaryResponse,
 } from "../deletion-cleanup/deletion-cleanup.response.js";
-import {
-  applyManifestToOperation,
-  DeletionCleanupManifestCollector,
-} from "../deletion-cleanup/deletion-cleanup.manifest.js";
-import { DeletionCleanupRepository } from "../deletion-cleanup/deletion-cleanup.repository.js";
-import { DocumentRepository } from "../documents/document.repository.js";
+import type { DeletionCleanupOperationRecord } from "../deletion-cleanup/deletion-cleanup.types.js";
 import { runtimeConfigToken } from "../runtime-config.provider.js";
 import {
   deletionCleanupQueueToken,
   type DeletionCleanupQueue,
 } from "../queues/deletion-cleanup.queue.js";
-import type { JobDetailResponse } from "../documents/document.types.js";
-import {
-  retrievalEmbeddingProviderToken,
-  type ApiRetrievalEmbeddingProvider,
-} from "../retrieve/retrieve.provider.js";
-import { wikiStoreToken, type WikiPageApiRecord, type WikiStore } from "../wiki/wiki-store.js";
-import { KnowledgeBaseRepository } from "./knowledge-base.repository.js";
+import type { JobDetailResponse, JobEventRecord, JobRecord } from "../documents/document.types.js";
+import { reindexQueueToken, type ReindexQueue } from "../queues/reindex.queue.js";
+import { wikiStoreToken, type WikiStore } from "../wiki/wiki-store.js";
 import {
   findKnowledgeBaseTemplate,
   listKnowledgeBaseTemplates,
 } from "./knowledge-base.templates.js";
 import {
+  toDatasetConfigurationRecordFromResponse,
+  toKnowledgeBaseRecordFromResponse,
+  toOperationalListError,
+} from "./knowledge-base.operational-read.js";
+import {
   cloneJsonObject,
-  createCompletedIndexJobEvent,
   createDatasetConfigurationRecord,
   createDatasetConfigurationValues,
   createInitialSystemPages,
   createRetentionTimestamp,
-  filterByKeyword,
-  filterByStatus,
   normalizeSlug,
   readForkOwner,
   readOptionalString,
@@ -51,7 +48,6 @@ import {
   throwForkTargetInvalid,
   throwValidationError,
   toDatasetConfigurationResponse,
-  toDocumentKnowledgeBaseScope,
   toJobDetailResponse,
   toKnowledgeBaseResponse,
   toSystemPageResponse,
@@ -82,27 +78,28 @@ import type {
   ResolveKnowledgeBaseForkResponse,
   SyncKnowledgeBaseForkInput,
   SystemPageResponse,
+  SystemPageRecord,
   UpdateDatasetConfigurationInput,
   UpdateKnowledgeBaseInput,
 } from "./knowledge-base.types.js";
 
 const defaultTemplate: KnowledgeBaseTemplate = "general";
 const defaultOutputLanguage: KnowledgeBaseOutputLanguage = "auto";
+const reindexJobType = "retrieval.reindex";
+const queuedReindexMessage = "Queued retrieval index rebuild.";
+const failedReindexMessage = "Retrieval index rebuild could not be queued.";
 
 @Injectable()
 export class KnowledgeBaseService {
   constructor(
-    private readonly repository: KnowledgeBaseRepository,
-    private readonly documentRepository: DocumentRepository,
-    private readonly deletionCleanupRepository: DeletionCleanupRepository,
-    private readonly deletionCleanupManifestCollector: DeletionCleanupManifestCollector,
     @Inject(apiDatabaseMirrorToken) private readonly databaseMirror: ApiDatabaseMirror,
+    @Inject(operationalReadStoreToken) private readonly operationalReadStore: OperationalReadStore,
     @Inject(wikiStoreToken) private readonly wikiStore: WikiStore,
-    @Inject(retrievalEmbeddingProviderToken)
-    private readonly embeddingProvider: ApiRetrievalEmbeddingProvider,
     @Inject(runtimeConfigToken) private readonly runtimeConfig: RuntimeConfig,
     @Inject(deletionCleanupQueueToken)
     private readonly deletionCleanupQueue: DeletionCleanupQueue,
+    @Inject(reindexQueueToken)
+    private readonly reindexQueue: ReindexQueue,
   ) {}
 
   async create(
@@ -113,7 +110,7 @@ export class KnowledgeBaseService {
     const name = readRequiredName(input.name);
     const templateId = input.template ?? defaultTemplate;
     const template = findKnowledgeBaseTemplate(templateId);
-    const id = this.createUniqueKnowledgeBaseId();
+    const id = await this.createUniqueKnowledgeBaseId();
     const slug = input.slug === undefined ? normalizeSlug(name, id) : normalizeSlug(input.slug);
 
     if (template === undefined) {
@@ -125,7 +122,7 @@ export class KnowledgeBaseService {
       });
     }
 
-    this.ensureSlugAvailable(slug, scope);
+    await this.ensureSlugAvailable(slug, scope);
 
     const record: KnowledgeBaseRecord = {
       id,
@@ -173,79 +170,77 @@ export class KnowledgeBaseService {
 
     record.systemPages = createInitialSystemPages(record, now);
 
-    const created = this.repository.create(record);
+    const created = record;
 
-    this.documentRepository.upsertKnowledgeBaseScope(toDocumentKnowledgeBaseScope(created));
     await this.databaseMirror.saveKnowledgeBase(created);
 
     return toKnowledgeBaseResponse(created);
   }
 
-  list(
+  async list(
     input: ListKnowledgeBaseInput,
     scope: ApiResourceScope = defaultApiResourceScope,
-  ): ListKnowledgeBaseResult {
-    const keyword = input.keyword?.trim().toLowerCase();
-    const filtered = this.repository
-      .list()
-      .filter((record) => isApiResourceInScope(record, scope))
-      .filter((record) => record.deletedAt === undefined)
-      .filter((record) => filterByStatus(record, input.status))
-      .filter((record) => filterByKeyword(record, keyword))
-      .sort((left, right) =>
-        compareUpdatedAtDesc(left.updatedAt, left.id, right.updatedAt, right.id),
-      );
-    const start = (input.page - 1) * input.pageSize;
-    const end = start + input.pageSize;
-    const items = filtered.slice(start, end).map(toKnowledgeBaseResponse);
+  ): Promise<ListKnowledgeBaseResult> {
+    try {
+      const dbResult = await this.operationalReadStore.listKnowledgeBases(scope, input);
 
-    return {
-      items,
-      page: input.page,
-      pageSize: input.pageSize,
-      total: filtered.length,
-      hasMore: end < filtered.length,
-    };
+      if (dbResult !== null) {
+        return {
+          items: dbResult.items,
+          page: input.page,
+          pageSize: input.pageSize,
+          total: dbResult.total,
+          hasMore: dbResult.hasMore,
+        };
+      }
+    } catch (error) {
+      throw toOperationalListError(error);
+    }
+
+    throw new ApiError("internal_error");
   }
 
-  get(id: string, scope: ApiResourceScope = defaultApiResourceScope): KnowledgeBaseResponse {
-    return toKnowledgeBaseResponse(this.requireActiveRecord(id, scope));
+  async get(
+    id: string,
+    scope: ApiResourceScope = defaultApiResourceScope,
+  ): Promise<KnowledgeBaseResponse> {
+    return toKnowledgeBaseResponse(await this.requireActiveRecord(id, scope));
   }
 
-  getFork(id: string, scope: ApiResourceScope = defaultApiResourceScope): KnowledgeBaseResponse {
-    return toKnowledgeBaseResponse(this.requireForkRecord(id, scope));
+  async getFork(
+    id: string,
+    scope: ApiResourceScope = defaultApiResourceScope,
+  ): Promise<KnowledgeBaseResponse> {
+    return toKnowledgeBaseResponse(await this.requireForkRecord(id, scope));
   }
 
-  listForks(
+  async listForks(
     upstreamKnowledgeBaseId: string,
     input: ListKnowledgeBaseInput,
     scope: ApiResourceScope = defaultApiResourceScope,
-  ): ListKnowledgeBaseForksResult {
-    const upstream = this.requireForkableUpstream(upstreamKnowledgeBaseId, scope);
+  ): Promise<ListKnowledgeBaseForksResult> {
+    const upstream = await this.requireForkableUpstreamResponse(upstreamKnowledgeBaseId, scope);
 
-    const keyword = input.keyword?.trim().toLowerCase();
-    const filtered = this.repository
-      .list()
-      .filter((record) => isApiResourceInScope(record, scope))
-      .filter((record) => record.deletedAt === undefined)
-      .filter((record) => record.status !== "deleted")
-      .filter((record) => record.knowledgeBaseType === "fork")
-      .filter((record) => record.upstreamKnowledgeBaseId === upstream.id)
-      .filter((record) => filterByStatus(record, input.status))
-      .filter((record) => filterByKeyword(record, keyword))
-      .sort((left, right) =>
-        compareUpdatedAtDesc(left.updatedAt, left.id, right.updatedAt, right.id),
-      );
-    const start = (input.page - 1) * input.pageSize;
-    const end = start + input.pageSize;
+    try {
+      const dbResult = await this.operationalReadStore.listKnowledgeBaseForks(scope, {
+        ...input,
+        upstreamKnowledgeBaseId: upstream.id,
+      });
 
-    return {
-      items: filtered.slice(start, end).map(toKnowledgeBaseResponse),
-      page: input.page,
-      pageSize: input.pageSize,
-      total: filtered.length,
-      hasMore: end < filtered.length,
-    };
+      if (dbResult !== null) {
+        return {
+          items: dbResult.items,
+          page: input.page,
+          pageSize: input.pageSize,
+          total: dbResult.total,
+          hasMore: dbResult.hasMore,
+        };
+      }
+    } catch (error) {
+      throw toOperationalListError(error);
+    }
+
+    throw new ApiError("internal_error");
   }
 
   async resolveFork(
@@ -269,10 +264,10 @@ export class KnowledgeBaseService {
     input: ResolveKnowledgeBaseForkInput,
     scope: ApiResourceScope,
   ): Promise<ResolveKnowledgeBaseForkResponse> {
-    const upstream = this.requireForkableUpstream(upstreamKnowledgeBaseId, scope);
+    const upstream = await this.requireForkableUpstream(upstreamKnowledgeBaseId, scope);
 
     const owner = readForkOwner(input);
-    const existing = this.findActiveForkForOwner(scope, upstream.id, owner);
+    const existing = await this.findActiveForkForOwner(scope, upstream.id, owner);
 
     if (existing !== undefined) {
       return {
@@ -282,7 +277,7 @@ export class KnowledgeBaseService {
     }
 
     const now = new Date().toISOString();
-    const forkId = this.createUniqueKnowledgeBaseId();
+    const forkId = await this.createUniqueKnowledgeBaseId();
     const forkRecord: KnowledgeBaseRecord = {
       id: forkId,
       tenantId: scope.tenantId,
@@ -325,15 +320,12 @@ export class KnowledgeBaseService {
     let created: KnowledgeBaseRecord;
 
     try {
-      created = this.repository.create(forkRecord);
+      created = forkRecord;
+      await this.databaseMirror.saveKnowledgeBase(created);
     } catch (error) {
-      const conflict = this.findActiveForkForOwner(scope, upstream.id, owner);
+      const conflict = await this.findActiveForkForOwner(scope, upstream.id, owner);
 
-      if (
-        error instanceof ApiError &&
-        error.code === "resource_conflict" &&
-        conflict !== undefined
-      ) {
+      if (conflict !== undefined) {
         return {
           created: false,
           fork: toKnowledgeBaseResponse(conflict),
@@ -343,32 +335,35 @@ export class KnowledgeBaseService {
       throw error;
     }
 
-    this.documentRepository.upsertKnowledgeBaseScope(toDocumentKnowledgeBaseScope(created));
-    await this.databaseMirror.saveKnowledgeBase(created);
-
     return {
       created: true,
       fork: toKnowledgeBaseResponse(created),
     };
   }
 
-  private findActiveForkForOwner(
+  private async findActiveForkForOwner(
     scope: ApiResourceScope,
     upstreamKnowledgeBaseId: string,
     owner: NonNullable<KnowledgeBaseRecord["forkOwner"]>,
-  ): KnowledgeBaseRecord | undefined {
-    return this.repository
-      .list()
-      .find(
-        (record) =>
-          isApiResourceInScope(record, scope) &&
-          record.deletedAt === undefined &&
-          record.status !== "deleted" &&
-          record.knowledgeBaseType === "fork" &&
-          record.upstreamKnowledgeBaseId === upstreamKnowledgeBaseId &&
-          record.forkOwner?.ownerType === owner.ownerType &&
-          record.forkOwner.externalOwnerId === owner.externalOwnerId,
-      );
+  ): Promise<KnowledgeBaseRecord | undefined> {
+    const dbResult = await this.operationalReadStore.listKnowledgeBaseForks(scope, {
+      upstreamKnowledgeBaseId,
+      page: 1,
+      pageSize: 100,
+    });
+    const match = dbResult?.items.find(
+      (record) =>
+        record.fork_owner?.owner_type === owner.ownerType &&
+        record.fork_owner.external_owner_id === owner.externalOwnerId,
+    );
+
+    return match === undefined
+      ? undefined
+      : toKnowledgeBaseRecordFromResponse(match, {
+          datasetConfiguration: await this.requireDatasetConfigurationRecord(match.id, scope),
+          systemPages: await this.listSystemPageRecords(match.id),
+          scope,
+        });
   }
 
   listDatasetConfigurationPresets(): DatasetConfigurationPresetResponse[] {
@@ -382,32 +377,35 @@ export class KnowledgeBaseService {
     }));
   }
 
-  assertReadableKnowledgeBase(id: string, scope: ApiResourceScope = defaultApiResourceScope): void {
-    this.requireActiveRecord(id, scope);
-  }
-
-  assertReadableFork(id: string, scope: ApiResourceScope = defaultApiResourceScope): void {
-    this.requireForkRecord(id, scope);
-  }
-
-  getResourceScope(id: string): ApiResourceScope | undefined {
-    const record = this.repository.findById(id);
-
-    if (record === undefined) {
-      return undefined;
-    }
-
-    return {
-      projectId: record.projectId,
-      tenantId: record.tenantId,
-    };
-  }
-
-  getDatasetConfiguration(
+  async assertReadableKnowledgeBase(
     id: string,
     scope: ApiResourceScope = defaultApiResourceScope,
-  ): DatasetConfigurationResponse {
-    return toDatasetConfigurationResponse(this.requireActiveRecord(id, scope).datasetConfiguration);
+  ): Promise<void> {
+    await this.requireActiveResponse(id, scope);
+  }
+
+  async assertReadableFork(
+    id: string,
+    scope: ApiResourceScope = defaultApiResourceScope,
+  ): Promise<void> {
+    const response = await this.requireActiveResponse(id, scope);
+
+    if (response.knowledge_base_type !== "fork") {
+      throwValidationError(["fork_id"]);
+    }
+  }
+
+  async getResourceScope(id: string): Promise<ApiResourceScope | undefined> {
+    return (await this.operationalReadStore.getKnowledgeBaseResourceScope(id)) ?? undefined;
+  }
+
+  async getDatasetConfiguration(
+    id: string,
+    scope: ApiResourceScope = defaultApiResourceScope,
+  ): Promise<DatasetConfigurationResponse> {
+    return toDatasetConfigurationResponse(
+      (await this.requireActiveRecord(id, scope)).datasetConfiguration,
+    );
   }
 
   async updateDatasetConfiguration(
@@ -415,7 +413,7 @@ export class KnowledgeBaseService {
     input: UpdateDatasetConfigurationInput,
     scope: ApiResourceScope = defaultApiResourceScope,
   ): Promise<DatasetConfigurationResponse> {
-    const record = this.requireLiveRecord(id, scope);
+    const record = await this.requireLiveRecord(id, scope);
     const presetId = input.preset_id ?? record.datasetConfiguration.presetId;
     const template = findKnowledgeBaseTemplate(presetId);
 
@@ -456,7 +454,7 @@ export class KnowledgeBaseService {
     record.updatedAt = now;
     record.systemPages = refreshSystemPages(record, now);
 
-    const updated = this.repository.update(record);
+    const updated = record;
 
     await this.databaseMirror.updateKnowledgeBase(updated);
 
@@ -468,7 +466,7 @@ export class KnowledgeBaseService {
     input: UpdateKnowledgeBaseInput,
     scope: ApiResourceScope = defaultApiResourceScope,
   ): Promise<KnowledgeBaseResponse> {
-    const record = this.requireLiveRecord(id, scope);
+    const record = await this.requireLiveRecord(id, scope);
     const resetFields = readResetToTemplateFields(input.reset_to_template);
     const template = findKnowledgeBaseTemplate(record.template);
     let nextPurpose = record.purpose;
@@ -513,7 +511,7 @@ export class KnowledgeBaseService {
     record.updatedAt = new Date().toISOString();
     record.systemPages = refreshSystemPages(record, record.updatedAt);
 
-    const updated = this.repository.update(record);
+    const updated = record;
 
     await this.databaseMirror.updateKnowledgeBase(updated);
 
@@ -524,49 +522,35 @@ export class KnowledgeBaseService {
     id: string,
     scope: ApiResourceScope = defaultApiResourceScope,
   ): Promise<DeletedKnowledgeBaseResponse> {
-    const record = this.requireActiveRecord(id, scope);
+    const record = await this.requireActiveRecord(id, scope);
     const now = new Date().toISOString();
 
     await this.cancelOpenJobsForDeletedKnowledgeBase(id, now);
     record.status = "deleted";
     record.deletedAt = now;
     record.updatedAt = now;
-    const updated = this.repository.update(record);
-    const createdCleanupOperation = this.deletionCleanupRepository.createOperation(
-      createQueuedDeletionCleanupOperation({
-        targetType: "knowledge_base",
-        targetId: id,
-        knowledgeBaseId: id,
-        now,
-        maxAttempts: this.runtimeConfig.limits.deletionCleanup.maxRetries + 1,
-        retentionExpiresAt: createRetentionTimestamp(
-          now,
-          this.runtimeConfig.limits.deletionCleanup.operationRetentionDays,
-        ),
-        itemRetentionExpiresAt: createRetentionTimestamp(
-          now,
-          this.runtimeConfig.limits.deletionCleanup.itemRetentionDays,
-        ),
-      }),
-    );
-    const manifest = this.deletionCleanupManifestCollector.collectKnowledgeBaseManifest({
+    const updated = record;
+    const createdCleanupOperation = createQueuedDeletionCleanupOperation({
+      targetType: "knowledge_base",
+      targetId: id,
       knowledgeBaseId: id,
-      knowledgeBaseType: record.knowledgeBaseType,
-      operationId: createdCleanupOperation.id,
       now,
-      maxAttempts: createdCleanupOperation.maxAttempts,
-      retainedUntil: createdCleanupOperation.itemRetentionExpiresAt,
+      maxAttempts: this.runtimeConfig.limits.deletionCleanup.maxRetries + 1,
+      retentionExpiresAt: createRetentionTimestamp(
+        now,
+        this.runtimeConfig.limits.deletionCleanup.operationRetentionDays,
+      ),
+      itemRetentionExpiresAt: createRetentionTimestamp(
+        now,
+        this.runtimeConfig.limits.deletionCleanup.itemRetentionDays,
+      ),
     });
-    const cleanupOperation = this.deletionCleanupRepository.updateOperation(
-      applyManifestToOperation(createdCleanupOperation, manifest),
-    );
-
-    this.deletionCleanupRepository.replaceItemsForOperation(cleanupOperation.id, manifest.items);
 
     await this.databaseMirror.updateKnowledgeBase(updated);
-    await this.databaseMirror.saveDeletionCleanupOperation(cleanupOperation);
-    await this.databaseMirror.saveDeletionCleanupItems(manifest.items);
-    const queuedCleanupOperation = await this.enqueueDeletionCleanupOperation(cleanupOperation);
+    await this.databaseMirror.markSourceDocumentsDeletedForKnowledgeBase(id, now);
+    await this.databaseMirror.saveDeletionCleanupOperation(createdCleanupOperation);
+    const queuedCleanupOperation =
+      await this.enqueueDeletionCleanupOperation(createdCleanupOperation);
 
     return {
       id,
@@ -579,7 +563,7 @@ export class KnowledgeBaseService {
     id: string,
     scope: ApiResourceScope = defaultApiResourceScope,
   ): Promise<DeletedForkResponse> {
-    const record = this.requireForkRecord(id, scope);
+    const record = await this.requireForkRecord(id, scope);
     const deleted = await this.delete(record.id, scope);
 
     return {
@@ -594,11 +578,13 @@ export class KnowledgeBaseService {
     input: SyncKnowledgeBaseForkInput = {},
     scope: ApiResourceScope = defaultApiResourceScope,
   ): Promise<ForkSyncResponse> {
-    const fork = this.requireForkRecord(id, scope);
+    const fork = await this.requireForkRecord(id, scope);
     const upstream =
       fork.upstreamKnowledgeBaseId === null
         ? undefined
-        : this.repository.findById(fork.upstreamKnowledgeBaseId);
+        : await this.requireActiveRecord(fork.upstreamKnowledgeBaseId, scope).catch(
+            () => undefined,
+          );
 
     if (
       upstream === undefined ||
@@ -652,15 +638,14 @@ export class KnowledgeBaseService {
       conflicts,
     });
     const now = new Date().toISOString();
-    const updated = this.repository.update({
+    const updated: KnowledgeBaseRecord = {
       ...fork,
       upstreamSyncedVersionId: targetUpstreamVersionId,
       syncStatus: "synced",
       currentVersionId: syncResult.knowledgeVersionId,
       updatedAt: now,
-    });
+    };
 
-    this.documentRepository.upsertKnowledgeBaseScope(toDocumentKnowledgeBaseScope(updated));
     await this.databaseMirror.updateKnowledgeBase(updated);
 
     return {
@@ -697,36 +682,10 @@ export class KnowledgeBaseService {
     upstreamKnowledgeBaseId: string,
     forkId: string,
   ): Promise<ForkSyncConflictResponse[]> {
-    const [upstreamPages, forkPages] = await Promise.all([
-      this.wikiStore.listPages(upstreamKnowledgeBaseId),
-      this.wikiStore.listPages(forkId),
-    ]);
-    const upstreamBySlug = new Map(
-      upstreamPages.map((page) => [page.slug, page] satisfies [string, WikiPageApiRecord]),
-    );
-    const conflicts: ForkSyncConflictResponse[] = [];
-
-    for (const forkPage of forkPages) {
-      if (forkPage.visibility_origin !== "fork_owned") {
-        continue;
-      }
-
-      const upstreamPage = upstreamBySlug.get(forkPage.slug);
-
-      if (upstreamPage === undefined) {
-        continue;
-      }
-
-      conflicts.push({
-        type: "fork_page_conflict",
-        upstream_page_id: upstreamPage.id,
-        fork_page_id: forkPage.id,
-        slug: forkPage.slug,
-        title: forkPage.title,
-      });
-    }
-
-    return conflicts;
+    return this.wikiStore.listForkSyncPageConflicts({
+      forkKnowledgeBaseId: forkId,
+      upstreamKnowledgeBaseId,
+    });
   }
 
   private async cancelOpenJobsForDeletedKnowledgeBase(
@@ -734,62 +693,44 @@ export class KnowledgeBaseService {
     now: string,
   ): Promise<void> {
     const message = "Canceled because the knowledge base was deleted.";
-    const openJobs = this.documentRepository
-      .listJobs(knowledgeBaseId)
-      .filter((job) => job.status === "queued" || job.status === "running");
-
-    for (const job of openJobs) {
-      const updated = this.documentRepository.updateJob({
-        ...job,
-        status: "canceled",
-        progressMessage: message,
-        updatedAt: now,
-      });
-      const event = this.documentRepository.appendJobEvent({
-        jobId: updated.id,
-        type: "job.canceled",
-        stage: updated.stage,
-        status: updated.status,
-        message,
-        metadata: {
-          knowledge_base_deleted: true,
-        },
-        createdAt: now,
-      });
-
-      await this.databaseMirror.updateJob(updated);
-      await this.databaseMirror.appendJobEvent(event);
-    }
+    await this.databaseMirror.cancelOpenJobsForKnowledgeBase({
+      knowledgeBaseId,
+      message,
+      metadata: {
+        knowledge_base_deleted: true,
+      },
+      now,
+    });
   }
 
   private async enqueueDeletionCleanupOperation(
-    operation: ReturnType<DeletionCleanupRepository["updateOperation"]>,
-  ): Promise<ReturnType<DeletionCleanupRepository["updateOperation"]>> {
+    operation: DeletionCleanupOperationRecord,
+  ): Promise<DeletionCleanupOperationRecord> {
     const now = new Date().toISOString();
 
     try {
       const enqueued = await this.deletionCleanupQueue.enqueueDeletionCleanupJob({
         operation_id: operation.id,
       });
-      const updated = this.deletionCleanupRepository.updateOperation({
+      const updated: DeletionCleanupOperationRecord = {
         ...operation,
         queueJobId: enqueued.job_id,
         lastError: null,
         updatedAt: now,
-      });
+      };
 
       await this.databaseMirror.updateDeletionCleanupOperation(updated);
 
       return updated;
     } catch (error) {
-      const updated = this.deletionCleanupRepository.updateOperation({
+      const updated: DeletionCleanupOperationRecord = {
         ...operation,
         lastError: {
           message: "Cleanup queue enqueue failed.",
           detail: error instanceof Error ? error.message : "Unknown cleanup queue error.",
         },
         updatedAt: now,
-      });
+      };
 
       await this.databaseMirror.updateDeletionCleanupOperation(updated);
 
@@ -801,54 +742,81 @@ export class KnowledgeBaseService {
     id: string,
     scope: ApiResourceScope = defaultApiResourceScope,
   ): Promise<JobDetailResponse> {
-    const record = this.requireActiveRecord(id, scope);
+    const record = await this.requireActiveRecord(id, scope);
     const now = new Date().toISOString();
-    const indexStats = await this.wikiStore.rebuildRetrievalIndex(
-      record.id,
-      this.embeddingProvider,
-    );
-    const job = this.documentRepository.createJob({
+    const job: JobRecord = {
       id: createResourceId("ingestJob"),
       knowledgeBaseId: record.id,
       documentId: null,
+      jobType: reindexJobType,
       stage: "indexing",
-      status: "completed",
-      progress: 100,
-      progressMessage: "Indexes rebuilt.",
+      status: "queued",
+      progress: 5,
+      progressMessage: queuedReindexMessage,
       contentHash: `reindex:${record.id}:${record.currentVersionId}`,
       idempotencyKey: null,
       deduped: false,
       lockedByKnowledgeBaseId: record.id,
-      inputSnapshotId: record.currentVersionId,
+      inputSnapshotId: record.currentVersionId ?? record.id,
       retryOfJobId: null,
       parsedContentId: null,
       changeSetId: null,
       error: null,
       createdAt: now,
       updatedAt: now,
+    };
+    const event = createReindexJobEvent(job, {
+      requested_knowledge_version_id: record.currentVersionId,
     });
-    const event = createCompletedIndexJobEvent(job, indexStats);
-    const events = this.documentRepository.replaceJobEvents(job.id, [event]);
+    const events = [event];
 
     await this.databaseMirror.saveJob(job);
     await this.databaseMirror.appendJobEvent(event);
 
+    try {
+      await this.reindexQueue.enqueueReindexJob({
+        job_id: job.id,
+        knowledge_base_id: record.id,
+        requested_knowledge_version_id: record.currentVersionId,
+      });
+    } catch (error) {
+      const failed: JobRecord = {
+        ...job,
+        status: "failed",
+        progressMessage: failedReindexMessage,
+        error: {
+          code: "retrieval_reindex_enqueue_failed",
+          message: error instanceof Error ? error.message : "Unknown queue enqueue error.",
+          retryable: true,
+        },
+        updatedAt: new Date().toISOString(),
+      };
+      const failedEvent = createReindexJobEvent(failed, {
+        requested_knowledge_version_id: record.currentVersionId,
+      });
+
+      await this.databaseMirror.updateJob(failed);
+      await this.databaseMirror.appendJobEvent(failedEvent);
+
+      return toJobDetailResponse(failed, [event, failedEvent]);
+    }
+
     return toJobDetailResponse(job, events);
   }
 
-  listSystemPages(
+  async listSystemPages(
     id: string,
     scope: ApiResourceScope = defaultApiResourceScope,
-  ): SystemPageResponse[] {
-    return this.requireActiveRecord(id, scope).systemPages.map(toSystemPageResponse);
+  ): Promise<SystemPageResponse[]> {
+    return (await this.requireActiveRecord(id, scope)).systemPages.map(toSystemPageResponse);
   }
 
-  getSystemPage(
+  async getSystemPage(
     id: string,
     type: string,
     scope: ApiResourceScope = defaultApiResourceScope,
-  ): SystemPageResponse {
-    const record = this.requireActiveRecord(id, scope);
+  ): Promise<SystemPageResponse> {
+    const record = await this.requireActiveRecord(id, scope);
     const systemPage = record.systemPages.find((page) => page.type === type);
 
     if (systemPage === undefined) {
@@ -858,11 +826,11 @@ export class KnowledgeBaseService {
     return toSystemPageResponse(systemPage);
   }
 
-  validateMarkdownContract(
+  async validateMarkdownContract(
     id: string,
     scope: ApiResourceScope = defaultApiResourceScope,
-  ): MarkdownContractValidationResponse {
-    const record = this.requireActiveRecord(id, scope);
+  ): Promise<MarkdownContractValidationResponse> {
+    const record = await this.requireActiveRecord(id, scope);
     const systemPageTypes = new Set(record.systemPages.map((page) => page.type));
     const missingSystemPages = systemPageOrder.filter((type) => !systemPageTypes.has(type));
     const issues = missingSystemPages.map((type) => ({
@@ -883,12 +851,12 @@ export class KnowledgeBaseService {
     };
   }
 
-  exportMarkdown(
+  async exportMarkdown(
     id: string,
     input: { format: "single_file" | "zip"; includeSources: boolean },
     scope: ApiResourceScope = defaultApiResourceScope,
-  ): MarkdownExportResponse {
-    const record = this.requireActiveRecord(id, scope);
+  ): Promise<MarkdownExportResponse> {
+    const record = await this.requireActiveRecord(id, scope);
     const files = record.systemPages.map((page) => ({
       path: `${page.type}.md`,
       content: renderMarkdownExportFile(page, input.includeSources),
@@ -903,11 +871,11 @@ export class KnowledgeBaseService {
     };
   }
 
-  private createUniqueKnowledgeBaseId(): string {
+  private async createUniqueKnowledgeBaseId(): Promise<string> {
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const id = createResourceId("knowledgeBase");
 
-      if (this.repository.findById(id) === undefined) {
+      if ((await this.operationalReadStore.getKnowledgeBaseResourceScope(id)) === null) {
         return id;
       }
     }
@@ -920,16 +888,13 @@ export class KnowledgeBaseService {
     });
   }
 
-  private ensureSlugAvailable(slug: string, scope: ApiResourceScope): void {
-    const conflict = this.repository
-      .list()
-      .find(
-        (record) =>
-          isApiResourceInScope(record, scope) &&
-          record.deletedAt === undefined &&
-          record.status !== "deleted" &&
-          record.slug === slug,
-      );
+  private async ensureSlugAvailable(slug: string, scope: ApiResourceScope): Promise<void> {
+    const result = await this.operationalReadStore.listKnowledgeBases(scope, {
+      page: 1,
+      pageSize: 100,
+      keyword: slug,
+    });
+    const conflict = result?.items.find((record) => record.slug === slug);
 
     if (conflict !== undefined) {
       throw new ApiError("resource_conflict", {
@@ -943,37 +908,24 @@ export class KnowledgeBaseService {
     }
   }
 
-  private requireActiveRecord(
+  private async requireActiveRecord(
     id: string,
     scope: ApiResourceScope = defaultApiResourceScope,
-  ): KnowledgeBaseRecord {
-    const record = this.repository.findById(id);
-    const scopedRecord = requireScopedKnowledgeBase(record, scope);
+  ): Promise<KnowledgeBaseRecord> {
+    const response = await this.requireActiveResponse(id, scope);
 
-    if (scopedRecord.deletedAt !== undefined || scopedRecord.status === "deleted") {
-      const cleanupOperation = this.deletionCleanupRepository.findLatestOperationForTarget({
-        targetType: "knowledge_base",
-        targetId: id,
-      });
-
-      throw new ApiError("resource_deleted", {
-        details: {
-          target_type: "knowledge_base",
-          target_id: id,
-          cleanup_operation_id: cleanupOperation?.id ?? null,
-          guidance: "Reload the resource list and select an active knowledge base.",
-        },
-      });
-    }
-
-    return scopedRecord;
+    return toKnowledgeBaseRecordFromResponse(response, {
+      datasetConfiguration: await this.requireDatasetConfigurationRecord(id, scope),
+      systemPages: await this.listSystemPageRecords(id),
+      scope,
+    });
   }
 
-  private requireForkRecord(
+  private async requireForkRecord(
     id: string,
     scope: ApiResourceScope = defaultApiResourceScope,
-  ): KnowledgeBaseRecord {
-    const record = this.requireActiveRecord(id, scope);
+  ): Promise<KnowledgeBaseRecord> {
+    const record = await this.requireActiveRecord(id, scope);
 
     if (record.knowledgeBaseType !== "fork") {
       throwValidationError(["fork_id"]);
@@ -982,20 +934,17 @@ export class KnowledgeBaseService {
     return record;
   }
 
-  private requireForkableUpstream(
+  private async requireForkableUpstream(
     id: string,
     scope: ApiResourceScope = defaultApiResourceScope,
-  ): KnowledgeBaseRecord {
-    const record = this.requireActiveRecord(id, scope);
+  ): Promise<KnowledgeBaseRecord> {
+    const record = await this.requireActiveRecord(id, scope);
 
     if (record.knowledgeBaseType !== "canonical") {
       throwForkTargetInvalid(record.id);
     }
 
-    const cleanupOperation = this.deletionCleanupRepository.findLatestOperationForTarget({
-      targetType: "knowledge_base",
-      targetId: id,
-    });
+    const cleanupOperation = await this.findLatestKnowledgeBaseCleanupOperation(id, scope);
 
     if (
       cleanupOperation !== undefined &&
@@ -1014,40 +963,133 @@ export class KnowledgeBaseService {
     return record;
   }
 
-  private requireLiveRecord(
+  private async requireForkableUpstreamResponse(
     id: string,
     scope: ApiResourceScope = defaultApiResourceScope,
-  ): KnowledgeBaseRecord {
-    const record = this.repository.findById(id);
-    const scopedRecord = requireScopedKnowledgeBase(record, scope);
+  ): Promise<KnowledgeBaseResponse> {
+    const response = await this.requireActiveResponse(id, scope);
 
-    if (scopedRecord.deletedAt !== undefined || scopedRecord.status === "deleted") {
-      const cleanupOperation = this.deletionCleanupRepository.findLatestOperationForTarget({
-        targetType: "knowledge_base",
-        targetId: id,
-      });
+    if (response.knowledge_base_type !== "canonical") {
+      throwForkTargetInvalid(response.id);
+    }
 
-      throw new ApiError("resource_deleted", {
+    const cleanupOperation = await this.findLatestKnowledgeBaseCleanupOperation(id, scope);
+
+    if (
+      cleanupOperation !== undefined &&
+      (cleanupOperation.status === "queued" || cleanupOperation.status === "running")
+    ) {
+      throw new ApiError("resource_cleanup_pending", {
         details: {
           target_type: "knowledge_base",
           target_id: id,
-          cleanup_operation_id: cleanupOperation?.id ?? null,
-          guidance: "Reload the resource list and select an active knowledge base.",
+          cleanup_operation_id: cleanupOperation.id,
+          guidance: "Wait for cleanup to complete before creating a fork.",
         },
       });
     }
 
-    return scopedRecord;
+    return response;
+  }
+
+  private async requireLiveRecord(
+    id: string,
+    scope: ApiResourceScope = defaultApiResourceScope,
+  ): Promise<KnowledgeBaseRecord> {
+    return this.requireActiveRecord(id, scope);
+  }
+
+  private async requireActiveResponse(
+    id: string,
+    scope: ApiResourceScope,
+  ): Promise<KnowledgeBaseResponse> {
+    const response = await this.operationalReadStore.getKnowledgeBaseById(scope, id);
+
+    if (response === null) {
+      await this.throwDeletedKnowledgeBaseIfPresent(id, scope);
+      throw new ApiError("knowledge_base_not_found");
+    }
+
+    return response;
+  }
+
+  private async requireDatasetConfigurationRecord(
+    id: string,
+    scope: ApiResourceScope,
+  ): Promise<DatasetConfigurationRecord> {
+    const configuration = await this.operationalReadStore.getDatasetConfigurationByKnowledgeBaseId(
+      scope,
+      id,
+    );
+
+    if (configuration === null) {
+      throw new ApiError("internal_error");
+    }
+
+    return toDatasetConfigurationRecordFromResponse(configuration);
+  }
+
+  private async listSystemPageRecords(id: string): Promise<SystemPageRecord[]> {
+    const pagination = await this.wikiStore.listSystemPagesPaginated(id, {
+      page: 1,
+      pageSize: Math.max(systemPageOrder.length, 20),
+    });
+    const order = new Map(systemPageOrder.map((type, index) => [type, index]));
+
+    return [...pagination.items].sort((left, right) => {
+      const leftOrder = order.get(left.type) ?? systemPageOrder.length;
+      const rightOrder = order.get(right.type) ?? systemPageOrder.length;
+
+      return leftOrder - rightOrder || left.id.localeCompare(right.id);
+    });
+  }
+
+  private async throwDeletedKnowledgeBaseIfPresent(
+    id: string,
+    scope: ApiResourceScope,
+  ): Promise<never | void> {
+    const cleanupOperation = await this.findLatestKnowledgeBaseCleanupOperation(id, scope);
+
+    if (cleanupOperation !== undefined) {
+      throw new ApiError("resource_deleted", {
+        details: {
+          target_type: "knowledge_base",
+          target_id: id,
+          cleanup_operation_id: cleanupOperation.id,
+          guidance: "Reload the resource list and select an active knowledge base.",
+        },
+      });
+    }
+  }
+
+  private async findLatestKnowledgeBaseCleanupOperation(
+    id: string,
+    scope: ApiResourceScope,
+  ): Promise<DeletionCleanupOperationRecord | undefined> {
+    const result = await this.operationalReadStore.listDeletionCleanupOperations(scope, {
+      knowledgeBaseId: id,
+      page: 1,
+      pageSize: 50,
+    });
+
+    return result?.items.find(
+      (operation) => operation.targetType === "knowledge_base" && operation.targetId === id,
+    );
   }
 }
 
-function compareUpdatedAtDesc(
-  leftUpdatedAt: string,
-  leftId: string,
-  rightUpdatedAt: string,
-  rightId: string,
-): number {
-  const updatedAtOrder = rightUpdatedAt.localeCompare(leftUpdatedAt);
-
-  return updatedAtOrder === 0 ? rightId.localeCompare(leftId) : updatedAtOrder;
+function createReindexJobEvent(job: JobRecord, metadata: Record<string, unknown>): JobEventRecord {
+  return {
+    jobId: job.id,
+    type: job.status === "failed" ? "job.failed" : "job.queued",
+    stage: job.stage,
+    status: job.status,
+    message: job.progressMessage,
+    metadata: {
+      ...metadata,
+      job_type: reindexJobType,
+      rebuild_kind: "retrieval_index",
+    },
+    createdAt: job.updatedAt,
+  };
 }

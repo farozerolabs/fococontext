@@ -114,6 +114,10 @@ const apiMessageCatalog = {
     "en-US": "Parser output empty.",
     "zh-CN": "解析结果为空。",
   },
+  "api.error.parser_limit_exceeded": {
+    "en-US": "Parser limit exceeded.",
+    "zh-CN": "解析超过配置限制。",
+  },
   "api.error.invalid_request": {
     "en-US": "Invalid request.",
     "zh-CN": "请求参数错误。",
@@ -149,6 +153,22 @@ const apiMessageCatalog = {
   "api.error.retrieve_index_not_ready": {
     "en-US": "Retrieve index not ready.",
     "zh-CN": "检索索引尚未就绪。",
+  },
+  "api.error.durable_backend_unavailable": {
+    "en-US": "Durable backend unavailable.",
+    "zh-CN": "持久化后端不可用。",
+  },
+  "api.error.bounded_retrieval_unavailable": {
+    "en-US": "Bounded retrieval backend unavailable.",
+    "zh-CN": "有界检索后端不可用。",
+  },
+  "api.error.graph_index_unavailable": {
+    "en-US": "Graph index unavailable.",
+    "zh-CN": "图谱索引不可用。",
+  },
+  "api.error.redis_metrics_degraded": {
+    "en-US": "Redis metrics degraded.",
+    "zh-CN": "Redis 指标状态降级。",
   },
   "api.error.fork_target_invalid": {
     "en-US": "Fork target is invalid.",
@@ -190,6 +210,22 @@ const apiMessageCatalog = {
     "en-US": "Rate limited.",
     "zh-CN": "请求过于频繁。",
   },
+  "api.error.admission_limited": {
+    "en-US": "Admission limited.",
+    "zh-CN": "系统当前限制接收新的高成本任务。",
+  },
+  "api.error.request_size_limit_exceeded": {
+    "en-US": "Request size limit exceeded.",
+    "zh-CN": "请求大小超过限制。",
+  },
+  "api.error.retrieve_limit_exceeded": {
+    "en-US": "Retrieve limit exceeded.",
+    "zh-CN": "检索请求超过限制。",
+  },
+  "api.error.export_limit_exceeded": {
+    "en-US": "Export limit exceeded.",
+    "zh-CN": "导出请求超过限制。",
+  },
   "api.error.internal_error": {
     "en-US": "Internal error.",
     "zh-CN": "服务内部错误。",
@@ -197,6 +233,10 @@ const apiMessageCatalog = {
   "api.validation.admin_session_required": {
     "en-US": "Admin session required.",
     "zh-CN": "需要管理员会话。",
+  },
+  "api.validation.admin_csrf_required": {
+    "en-US": "Admin CSRF proof required.",
+    "zh-CN": "需要管理员 CSRF 请求证明。",
   },
   "api.validation.openapi_document_auth_required": {
     "en-US":
@@ -210,6 +250,14 @@ const apiMessageCatalog = {
   "api.validation.invalid_admin_credentials": {
     "en-US": "Invalid admin credentials.",
     "zh-CN": "管理员账号或密码无效。",
+  },
+  "api.validation.admin_login_rate_limited": {
+    "en-US": "Too many failed admin login attempts. Try again later.",
+    "zh-CN": "管理员登录失败次数过多，请稍后再试。",
+  },
+  "api.validation.request_boundary_invalid": {
+    "en-US": "Request boundary validation failed.",
+    "zh-CN": "请求边界校验失败。",
   },
   "api.validation.knowledge_base_slug_invalid": {
     "en-US": "Knowledge base slug is invalid.",
@@ -331,6 +379,14 @@ const apiMessageCatalog = {
     "en-US": "Media caption retry requires parsed content and an ingest job.",
     "zh-CN": "重试图片说明需要已有解析内容和入库任务。",
   },
+  "api.validation.document_processing_stage_filter_invalid": {
+    "en-US": "Document processing stage filter is invalid.",
+    "zh-CN": "资料处理阶段筛选无效。",
+  },
+  "api.validation.document_processing_status_filter_invalid": {
+    "en-US": "Document processing status filter is invalid.",
+    "zh-CN": "资料处理状态筛选无效。",
+  },
   "api.validation.ocr_pdf_required": {
     "en-US": "OCR retry requires a PDF source document.",
     "zh-CN": "OCR 重试需要 PDF 资料。",
@@ -358,6 +414,10 @@ const apiMessageCatalog = {
   "api.validation.source_url_invalid": {
     "en-US": "Source URL is invalid.",
     "zh-CN": "资料 URL 无效。",
+  },
+  "api.validation.remote_source_unsafe": {
+    "en-US": "Remote source URL is not allowed by the configured safety policy.",
+    "zh-CN": "远程资料 URL 未通过当前安全策略。",
   },
   "api.validation.source_upload_failed": {
     "en-US": "Source object upload failed.",
@@ -387,9 +447,25 @@ const apiMessageCatalog = {
     "en-US": "Completed jobs cannot be canceled.",
     "zh-CN": "已完成任务不能取消。",
   },
+  "api.validation.terminal_job_cancel": {
+    "en-US": "Terminal jobs cannot be canceled.",
+    "zh-CN": "终态任务不能取消。",
+  },
   "api.validation.running_job_retry": {
-    "en-US": "Running jobs cannot be retried.",
-    "zh-CN": "运行中的任务不能重试。",
+    "en-US": "Queued or running jobs cannot be retried.",
+    "zh-CN": "排队中或运行中的任务不能重试。",
+  },
+  "api.validation.completed_job_retry": {
+    "en-US": "Completed jobs cannot be retried.",
+    "zh-CN": "已完成任务不能重试。",
+  },
+  "api.validation.non_retryable_job_retry": {
+    "en-US": "This failed job is not retryable.",
+    "zh-CN": "该失败任务不可重试。",
+  },
+  "api.validation.job_retry_document_required": {
+    "en-US": "Job retry requires a source document.",
+    "zh-CN": "任务重试需要关联资料。",
   },
   "api.validation.cleanup_status_invalid": {
     "en-US": "Cleanup operation status filter is invalid.",

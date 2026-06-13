@@ -39,18 +39,18 @@ cp docker-compose.example.yml docker-compose.yml
 
 ## 步骤 2：启动服务
 
-发布式自托管部署时，在 `.env` 中固定明确镜像版本，例如
+基于镜像自托管部署时，在 `.env` 中固定明确镜像版本，例如
 `FOCOCONTEXT_IMAGE_TAG=0.1.0`，然后执行：
 
 ```bash
 docker compose up -d
 ```
 
-默认 Compose 模板会从 GitHub Container Registry 的 `ghcr.io/farozerolabs` 拉取已发布的 API、Admin、Worker 和 OCR 镜像。本地源码构建开发时，通过 `docker-compose.dev.example.yml` 执行 `pnpm install` 和 `pnpm run docker:up`。
+默认 Compose 模板会从 GitHub Container Registry 的 `ghcr.io/farozerolabs` 拉取已发布的 API、Admin、Worker 和 OCR 镜像。
 
-发布模板要求显式设置 `FOCOCONTEXT_IMAGE_TAG`。这个值应来自 Git release tag 对应的产品镜像 tag，例如 `v0.1.0` -> `0.1.0`。
+Compose 模板要求显式设置 `FOCOCONTEXT_IMAGE_TAG`。这个值应来自 Git release tag 对应的产品镜像 tag，例如 `v0.1.0` -> `0.1.0`。
 
-发布模板有两种启动路径：
+Compose 模板有两种启动路径：
 
 | 模板                                      | 命令                                                                                             | OCR 行为             |
 | ----------------------------------------- | ------------------------------------------------------------------------------------------------ | -------------------- |
@@ -58,7 +58,16 @@ docker compose up -d
 | `docker-compose.optional-ocr.example.yml` | `OCR_ENABLED=false docker compose -f docker-compose.optional-ocr.example.yml up -d`              | 默认不启动 OCR       |
 | `docker-compose.optional-ocr.example.yml` | `OCR_ENABLED=true docker compose -f docker-compose.optional-ocr.example.yml --profile ocr up -d` | 需要时显式启动 OCR   |
 
-首个公开版本发布后，维护者需要先确认 GHCR packages 已经公开，再发布引用这些镜像的安装说明。
+Compose 模板会先启动专用的 `migrate` one-shot 服务，再启动 API 和 Worker。新部署会初始化到最新 schema。已有部署在执行 `docker compose up -d` 时会运行待执行迁移一次。如果迁移失败，API 和 Worker 会被 Compose 依赖检查阻止启动；查看 `docker compose logs migrate`，修复原因后再次执行 `docker compose up -d`。
+
+常规升级：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+如果新版本已经改变 schema 或数据，回滚时应恢复到上一个镜像版本对应的数据库快照。只涉及 API、Worker 或 Admin 代码的回滚，可以把 `FOCOCONTEXT_IMAGE_TAG` 改回上一个版本后重启服务栈。
 
 发布端口默认通过 `FOCOCONTEXT_BIND_HOST=127.0.0.1` 只监听本机，适合反向代理部署。只有明确需要直接开放服务端口时，才设置 `FOCOCONTEXT_BIND_HOST=0.0.0.0`。`FOCOCONTEXT_API_PORT`、`FOCOCONTEXT_ADMIN_PORT`、`FOCOCONTEXT_POSTGRES_PORT` 和 `FOCOCONTEXT_REDIS_PORT` 继续只填写数字端口。不要把 `127.0.0.1:18080` 这类带 host 的值填进这些字段。
 
@@ -121,6 +130,40 @@ server {
 | Redis        | `127.0.0.1:18379`                     |
 
 OpenAPI JSON 需要鉴权。可以在已登录的管理后台会话中读取，或由服务端进程发送 `Authorization: Bearer <FOCOCONTEXT_API_KEY>` 读取。
+
+运行时压力可以在后台设置页和 `/health` 中查看。大量入库、图谱刷新或 Retrieve 变慢时，优先检查 `dependencies.migration`、`dependencies.pressure.queue`、`dependencies.pressure.compile`、`dependencies.pressure.objectStorageOperations`、`dependencies.metrics.api`、`dependencies.metrics.cache` 和 `dependencies.metrics.retrievalQuality`。
+
+## 源码开发
+
+从源码 checkout 运行 FocoContext 时使用这条路径：
+
+```bash
+pnpm install
+pnpm run docker:up
+```
+
+源码开发栈使用 `docker-compose.dev.example.yml`，从本地源码构建服务镜像，并在后台启动运行时。源码开发栈默认也会启动 OCR：
+
+```bash
+pnpm run docker:up:ocr
+```
+
+常用开发检查：
+
+```bash
+pnpm run format:check
+pnpm run lint
+pnpm run typecheck
+pnpm run test
+pnpm run build
+pnpm run verify
+```
+
+运行文档站：
+
+```bash
+pnpm run docs:dev
+```
 
 ## 步骤 3：登录后台
 

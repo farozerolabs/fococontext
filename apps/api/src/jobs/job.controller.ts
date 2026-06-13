@@ -26,7 +26,7 @@ export class KnowledgeBaseJobController {
     @Req() request: ApiKeyRequest,
   ) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     const result = await this.jobService.list(knowledgeBaseId, parsePaginationQuery(query), scope);
 
     return createListEnvelope(result.items, {
@@ -49,7 +49,7 @@ export class KnowledgeBaseIngestProgressController {
   @Get()
   async detail(@Param("knowledgeBaseId") knowledgeBaseId: string, @Req() request: ApiKeyRequest) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
 
     return createSuccessEnvelope(
       await this.jobService.getKnowledgeBaseIngestProgress(knowledgeBaseId, scope),

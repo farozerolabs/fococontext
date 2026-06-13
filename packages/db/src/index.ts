@@ -3,10 +3,19 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Kysely, PostgresDialect, sql } from "kysely";
-import { type Migration, type MigrationProvider, Migrator } from "kysely/migration";
+import {
+  type Migration,
+  type MigrationProvider,
+  Migrator,
+  type MigrationResultSet,
+} from "kysely/migration";
 import { Pool } from "pg";
 
 export * from "./tenant-project-scope.js";
+export * from "./background-operation-checkpoint.js";
+export * from "./bounded-pagination.js";
+export * from "./idempotent-batch.js";
+export { sql };
 
 export const expectedSchemaTables = [
   "tenants",
@@ -19,6 +28,8 @@ export const expectedSchemaTables = [
   "knowledge_base_dataset_configuration_snapshots",
   "source_documents",
   "upload_sessions",
+  "upload_batches",
+  "upload_batch_items",
   "parsed_contents",
   "media_assets",
   "ocr_page_statuses",
@@ -42,15 +53,22 @@ export const expectedSchemaTables = [
   "rollback_records",
   "page_merge_records",
   "knowledge_checks",
+  "knowledge_check_findings",
+  "knowledge_check_window_checkpoints",
+  "document_processing_units",
+  "document_processing_checkpoints",
   "duplicate_decisions",
   "delete_impact_previews",
   "source_watch_rules",
   "scheduled_import_jobs",
+  "source_watch_scan_items",
   "import_previews",
   "webhooks",
   "webhook_deliveries",
   "page_embeddings",
   "retrieval_traces",
+  "security_audit_events",
+  "background_operations",
   "deletion_cleanup_operations",
   "deletion_cleanup_items",
 ] as const;
@@ -63,6 +81,11 @@ export interface SqlMigration {
   name: string;
   upSql: string;
   downSql: string;
+}
+
+export interface MigrationLogOptions {
+  logger?: Pick<Console, "info">;
+  serviceName?: string;
 }
 
 export type DefaultIdentityScope = "tenant" | "account" | "project";
@@ -112,6 +135,227 @@ const defaultIdentityName = {
 } as const;
 
 const defaultIdentitySlug = "default";
+
+const operationalListIndexSql = String.raw`
+create index if not exists jobs_kb_visible_updated_idx
+  on jobs(knowledge_base_id, updated_at desc, id desc)
+  where coalesce(job_type, '') <> 'graph.insights.refresh';
+
+create index if not exists jobs_kb_visible_status_updated_idx
+  on jobs(knowledge_base_id, status, updated_at desc, id desc)
+  where coalesce(job_type, '') <> 'graph.insights.refresh';
+
+create index if not exists jobs_kb_visible_stage_updated_idx
+  on jobs(knowledge_base_id, stage, updated_at desc, id desc)
+  where coalesce(job_type, '') <> 'graph.insights.refresh';
+
+create index if not exists jobs_kb_visible_queued_idx
+  on jobs(knowledge_base_id, queued_at desc, id desc)
+  where coalesce(job_type, '') <> 'graph.insights.refresh';
+
+create index if not exists job_events_job_created_id_idx
+  on job_events(job_id, created_at asc, id asc);
+
+create index if not exists knowledge_bases_scope_active_updated_idx
+  on knowledge_bases(tenant_id, project_id, updated_at desc, id desc)
+  where deleted_at is null and status <> 'deleted';
+
+create index if not exists knowledge_bases_scope_status_updated_idx
+  on knowledge_bases(tenant_id, project_id, status, updated_at desc, id desc)
+  where deleted_at is null;
+
+create index if not exists knowledge_bases_scope_upstream_fork_updated_idx
+  on knowledge_bases(tenant_id, project_id, upstream_knowledge_base_id, updated_at desc, id desc)
+  where deleted_at is null and status <> 'deleted' and knowledge_base_type = 'fork';
+
+create index if not exists source_documents_kb_visible_updated_idx
+  on source_documents(knowledge_base_id, updated_at desc, id desc)
+  where deleted_at is null and status <> 'deleted';
+
+create index if not exists source_documents_scope_visible_updated_idx
+  on source_documents(tenant_id, project_id, knowledge_base_id, updated_at desc, id desc)
+  where deleted_at is null and status <> 'deleted';
+
+create index if not exists source_documents_kb_owner_visible_updated_idx
+  on source_documents(knowledge_base_id, owner_knowledge_base_id, updated_at desc, id desc)
+  where deleted_at is null and status <> 'deleted' and fork_tombstoned_at is null;
+
+create index if not exists source_documents_kb_visible_status_updated_idx
+  on source_documents(knowledge_base_id, status, updated_at desc, id desc)
+  where deleted_at is null;
+
+create index if not exists source_documents_kb_visible_type_updated_idx
+  on source_documents(knowledge_base_id, source_type, updated_at desc, id desc)
+  where deleted_at is null and status <> 'deleted';
+
+create index if not exists source_documents_kb_source_path_updated_idx
+  on source_documents(knowledge_base_id, lower((metadata->>'source_path')), updated_at desc, id desc)
+  where deleted_at is null and status <> 'deleted' and fork_tombstoned_at is null;
+
+create index if not exists source_documents_kb_hash_updated_idx
+  on source_documents(knowledge_base_id, content_hash, updated_at desc, id desc)
+  where deleted_at is null and status <> 'deleted' and content_hash is not null;
+
+create index if not exists parsed_contents_document_created_id_idx
+  on parsed_contents(source_document_id, created_at desc, id desc)
+  where fork_tombstoned_at is null;
+
+create index if not exists media_assets_document_created_id_idx
+  on media_assets(source_document_id, created_at desc, id desc)
+  where fork_tombstoned_at is null;
+
+create index if not exists wiki_pages_kb_visible_updated_idx
+  on wiki_pages(knowledge_base_id, updated_at desc, id desc)
+  where deleted_at is null and fork_tombstoned_at is null;
+
+create index if not exists wiki_pages_owner_visible_updated_idx
+  on wiki_pages(owner_knowledge_base_id, updated_at desc, id desc)
+  where deleted_at is null and fork_tombstoned_at is null;
+
+create index if not exists wiki_pages_kb_slug_visible_idx
+  on wiki_pages(knowledge_base_id, slug, updated_at desc, id desc)
+  where deleted_at is null and fork_tombstoned_at is null;
+
+create index if not exists wiki_pages_kb_status_visible_updated_idx
+  on wiki_pages(knowledge_base_id, status, updated_at desc, id desc)
+  where deleted_at is null and fork_tombstoned_at is null;
+
+create index if not exists wiki_pages_kb_type_visible_updated_idx
+  on wiki_pages(knowledge_base_id, page_type, updated_at desc, id desc)
+  where deleted_at is null and fork_tombstoned_at is null;
+
+create index if not exists wiki_pages_kb_lexical_simple_idx
+  on wiki_pages using gin (
+    to_tsvector(
+      'simple',
+      coalesce(title, '') || ' ' ||
+      coalesce(slug, '') || ' ' ||
+      coalesce(markdown, '') || ' ' ||
+      coalesce(metadata::text, '')
+    )
+  )
+  where deleted_at is null and fork_tombstoned_at is null;
+
+create index if not exists wiki_pages_source_document_ids_gin_idx
+  on wiki_pages using gin (source_document_ids)
+  where deleted_at is null and fork_tombstoned_at is null;
+
+create index if not exists wiki_page_versions_source_snapshot_lexical_simple_idx
+  on wiki_page_versions using gin (
+    to_tsvector('simple', coalesce(source_snapshot::text, ''))
+  );
+
+create index if not exists system_pages_kb_updated_idx
+  on system_pages(knowledge_base_id, updated_at desc, id desc);
+
+create index if not exists system_pages_kb_key_updated_idx
+  on system_pages(knowledge_base_id, system_key, updated_at desc, id desc);
+
+create index if not exists knowledge_versions_kb_created_idx
+  on knowledge_versions(knowledge_base_id, created_at desc, id desc);
+
+create index if not exists change_sets_kb_created_idx
+  on change_sets(knowledge_base_id, created_at desc, id desc);
+
+create index if not exists change_sets_kb_status_created_idx
+  on change_sets(knowledge_base_id, status, created_at desc, id desc);
+
+create index if not exists wiki_page_versions_page_created_idx
+  on wiki_page_versions(page_id, created_at desc, id desc);
+
+create index if not exists wiki_edges_kb_from_relation_updated_idx
+  on wiki_edges(knowledge_base_id, from_page_id, relation_type, updated_at desc, id desc)
+  where fork_tombstoned_at is null;
+
+create index if not exists wiki_edges_kb_to_relation_updated_idx
+  on wiki_edges(knowledge_base_id, to_page_id, relation_type, updated_at desc, id desc)
+  where fork_tombstoned_at is null;
+
+create index if not exists wiki_edges_kb_version_updated_idx
+  on wiki_edges(knowledge_base_id, knowledge_version_id, updated_at desc, id desc)
+  where fork_tombstoned_at is null and knowledge_version_id is not null;
+
+create index if not exists wiki_edges_owner_from_relation_updated_idx
+  on wiki_edges(owner_knowledge_base_id, from_page_id, relation_type, updated_at desc, id desc)
+  where fork_tombstoned_at is null;
+
+create index if not exists wiki_edge_sources_source_document_created_idx
+  on wiki_edge_sources(source_document_id, created_at desc, id desc)
+  where source_document_id is not null and fork_tombstoned_at is null;
+
+create index if not exists page_embeddings_kb_model_dimensions_idx
+  on page_embeddings(knowledge_base_id, model, dimensions, created_at desc, id desc)
+  where embedding is not null and fork_tombstoned_at is null;
+
+create index if not exists page_embeddings_owner_model_dimensions_idx
+  on page_embeddings(owner_knowledge_base_id, model, dimensions, created_at desc, id desc)
+  where embedding is not null and fork_tombstoned_at is null;
+
+create index if not exists background_operations_scope_kind_status_updated_idx
+  on background_operations(tenant_id, project_id, knowledge_base_id, operation_kind, status, updated_at desc, id desc);
+
+create index if not exists background_operations_job_stage_idx
+  on background_operations(job_id, stage, updated_at desc, id desc)
+  where job_id is not null;
+
+create index if not exists source_watch_rules_kb_updated_idx
+  on source_watch_rules(knowledge_base_id, updated_at desc, id desc);
+
+create index if not exists scheduled_import_jobs_rule_updated_idx
+  on scheduled_import_jobs(source_watch_rule_id, updated_at desc, id desc);
+
+create index if not exists scheduled_import_jobs_kb_updated_idx
+  on scheduled_import_jobs(knowledge_base_id, updated_at desc, id desc);
+
+create index if not exists webhooks_kb_updated_idx
+  on webhooks(knowledge_base_id, updated_at desc, id desc);
+
+create index if not exists webhook_deliveries_webhook_created_idx
+  on webhook_deliveries(webhook_id, created_at desc, id desc);
+
+create index if not exists deletion_cleanup_operations_scope_updated_idx
+  on deletion_cleanup_operations(tenant_id, project_id, updated_at desc, id desc);
+
+create index if not exists deletion_cleanup_operations_scope_kb_status_updated_idx
+  on deletion_cleanup_operations(tenant_id, project_id, knowledge_base_id, status, updated_at desc, id desc);
+
+create index if not exists deletion_cleanup_items_operation_created_idx
+  on deletion_cleanup_items(operation_id, created_at asc, id asc);
+
+create index if not exists deletion_cleanup_items_operation_retryable_type_idx
+  on deletion_cleanup_items(operation_id, item_type, status, created_at asc, id asc)
+  where status in ('pending', 'failed') and attempt_count < max_attempts;
+
+create index if not exists knowledge_checks_kb_updated_idx
+  on knowledge_checks(knowledge_base_id, updated_at desc, id desc);
+
+create index if not exists knowledge_check_findings_scope_status_idx
+  on knowledge_check_findings(tenant_id, project_id, knowledge_base_id, check_id, status, created_at asc, id asc);
+
+create index if not exists knowledge_check_findings_check_stage_idx
+  on knowledge_check_findings(check_id, stage, created_at asc, id asc);
+
+create index if not exists knowledge_check_findings_retention_idx
+  on knowledge_check_findings(retained_until asc, id asc)
+  where retained_until is not null;
+
+create index if not exists knowledge_check_window_checkpoints_scope_status_idx
+  on knowledge_check_window_checkpoints(tenant_id, project_id, knowledge_base_id, check_id, status, updated_at desc, id desc);
+
+create index if not exists knowledge_check_window_checkpoints_retention_idx
+  on knowledge_check_window_checkpoints(retained_until asc, id asc)
+  where retained_until is not null;
+
+create index if not exists source_watch_scan_items_scope_kind_idx
+  on source_watch_scan_items(tenant_id, project_id, knowledge_base_id, source_watch_rule_id, scheduled_import_job_id, item_kind, updated_at desc, id desc);
+
+create index if not exists source_watch_scan_items_source_identity_idx
+  on source_watch_scan_items(source_watch_rule_id, source_identity, updated_at desc, id desc);
+
+create index if not exists source_watch_scan_items_retention_idx
+  on source_watch_scan_items(retained_until asc, id asc)
+  where retained_until is not null;
+`;
 
 export function getDefaultMigrationDirectory(): string {
   return fileURLToPath(new URL("../migrations", import.meta.url));
@@ -172,6 +416,18 @@ export function createSqlMigrationProvider(
       );
     },
   };
+}
+
+export function getOperationalListIndexSql(): string {
+  return operationalListIndexSql;
+}
+
+export async function ensureOperationalListIndexes(
+  db: Kysely<DatabaseSchema>,
+  options: MigrationLogOptions = {},
+): Promise<void> {
+  await sql.raw(operationalListIndexSql).execute(db);
+  options.logger?.info(formatOperationalIndexLogMessage(options.serviceName));
 }
 
 export function createInternalIdentityId(scope: DefaultIdentityScope): string {
@@ -256,7 +512,7 @@ export function createMigrator(db: Kysely<DatabaseSchema>): Migrator {
   });
 }
 
-export async function migrateToLatest(databaseUrl: string) {
+export async function migrateToLatest(databaseUrl: string, options: MigrationLogOptions = {}) {
   const db = createPostgresDatabase(databaseUrl);
 
   try {
@@ -266,10 +522,51 @@ export async function migrateToLatest(databaseUrl: string) {
       throw result.error;
     }
 
+    options.logger?.info(formatMigrationLogMessage(result, options.serviceName));
+    await ensureOperationalListIndexes(db, options);
+
     return result;
   } finally {
     await db.destroy();
   }
+}
+
+export function describeMigrationResult(result: MigrationResultSet): string {
+  const appliedMigrations =
+    result.results
+      ?.filter((migration) => migration.status === "Success")
+      .map((migration) => migration.migrationName) ?? [];
+
+  if (appliedMigrations.length === 0) {
+    return "Database migrations are already up to date.";
+  }
+
+  return `Applied database migrations (${appliedMigrations.length}): ${appliedMigrations.join(", ")}.`;
+}
+
+function formatMigrationLogMessage(
+  result: MigrationResultSet,
+  serviceName: string | undefined,
+): string {
+  const message = describeMigrationResult(result);
+  const trimmedServiceName = serviceName?.trim();
+
+  if (trimmedServiceName === undefined || trimmedServiceName.length === 0) {
+    return message;
+  }
+
+  return `[${trimmedServiceName}] ${message}`;
+}
+
+function formatOperationalIndexLogMessage(serviceName: string | undefined): string {
+  const message = "Operational list indexes are ensured.";
+  const trimmedServiceName = serviceName?.trim();
+
+  if (trimmedServiceName === undefined || trimmedServiceName.length === 0) {
+    return message;
+  }
+
+  return `[${trimmedServiceName}] ${message}`;
 }
 
 export function assertSafeLocalResetDatabaseUrl(databaseUrl: string): void {
@@ -357,6 +654,7 @@ export interface WikiAnalysisResultRecord {
   relationships: readonly Record<string, unknown>[];
   sourceRefs: readonly Record<string, unknown>[];
   locatorRefs: readonly Record<string, unknown>[];
+  reuseKey: string | null;
   metadata: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
@@ -383,6 +681,7 @@ export interface WikiDraftCandidateRecord {
   status: string;
   targetPageId: string | null;
   changeSetId: string | null;
+  reuseKey: string | null;
   metadata: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
@@ -418,6 +717,7 @@ export type SaveWikiAnalysisResultInput = Omit<
   "createdAt" | "updatedAt"
 > & {
   createdAt?: string;
+  reuseKey?: string | null;
   updatedAt?: string;
 };
 
@@ -426,6 +726,7 @@ export type SaveWikiDraftCandidateInput = Omit<
   "createdAt" | "updatedAt"
 > & {
   createdAt?: string;
+  reuseKey?: string | null;
   updatedAt?: string;
 };
 
@@ -444,10 +745,18 @@ export interface CompileArtifactRepository {
   listModelCallsByChangeSet(changeSetId: string): Promise<PersistedModelCallRecord[]>;
   saveAnalysisResult(input: SaveWikiAnalysisResultInput): Promise<WikiAnalysisResultRecord>;
   findAnalysisResultById(id: string): Promise<WikiAnalysisResultRecord | null>;
+  findReusableAnalysisResult(input: {
+    knowledgeBaseId: string;
+    reuseKey: string;
+  }): Promise<WikiAnalysisResultRecord | null>;
   listAnalysisResultsByJob(jobId: string): Promise<WikiAnalysisResultRecord[]>;
   listAnalysisResultsByParsedContent(parsedContentId: string): Promise<WikiAnalysisResultRecord[]>;
   saveDraftCandidate(input: SaveWikiDraftCandidateInput): Promise<WikiDraftCandidateRecord>;
   findDraftCandidateById(id: string): Promise<WikiDraftCandidateRecord | null>;
+  listReusableDraftCandidates(input: {
+    knowledgeBaseId: string;
+    reuseKey: string;
+  }): Promise<WikiDraftCandidateRecord[]>;
   listDraftCandidatesByAnalysisResult(
     analysisResultId: string,
   ): Promise<WikiDraftCandidateRecord[]>;
@@ -599,6 +908,7 @@ class PostgresCompileArtifactRepository implements CompileArtifactRepository {
         source_refs,
         locator_refs,
         metadata,
+        reuse_key,
         created_at,
         updated_at
       )
@@ -620,6 +930,7 @@ class PostgresCompileArtifactRepository implements CompileArtifactRepository {
         ${JSON.stringify(input.sourceRefs)}::jsonb,
         ${JSON.stringify(input.locatorRefs)}::jsonb,
         ${JSON.stringify(input.metadata)}::jsonb,
+        ${input.reuseKey ?? null},
         ${createdAt},
         ${updatedAt}
       )
@@ -632,6 +943,7 @@ class PostgresCompileArtifactRepository implements CompileArtifactRepository {
         source_refs = excluded.source_refs,
         locator_refs = excluded.locator_refs,
         metadata = excluded.metadata,
+        reuse_key = excluded.reuse_key,
         updated_at = excluded.updated_at
       returning *
     `.execute(this.db);
@@ -646,6 +958,22 @@ class PostgresCompileArtifactRepository implements CompileArtifactRepository {
       select *
       from wiki_analysis_results
       where id = ${id}
+    `.execute(this.db);
+
+    return result.rows[0] === undefined ? null : toWikiAnalysisResultRecord(result.rows[0]);
+  }
+
+  async findReusableAnalysisResult(input: {
+    knowledgeBaseId: string;
+    reuseKey: string;
+  }): Promise<WikiAnalysisResultRecord | null> {
+    const result = await sql<WikiAnalysisResultRow>`
+      select *
+      from wiki_analysis_results
+      where knowledge_base_id = ${input.knowledgeBaseId}
+        and reuse_key = ${input.reuseKey}
+      order by created_at desc, id desc
+      limit 1
     `.execute(this.db);
 
     return result.rows[0] === undefined ? null : toWikiAnalysisResultRecord(result.rows[0]);
@@ -701,6 +1029,7 @@ class PostgresCompileArtifactRepository implements CompileArtifactRepository {
         target_page_id,
         change_set_id,
         metadata,
+        reuse_key,
         created_at,
         updated_at
       )
@@ -726,6 +1055,7 @@ class PostgresCompileArtifactRepository implements CompileArtifactRepository {
         ${input.targetPageId},
         ${input.changeSetId},
         ${JSON.stringify(input.metadata)}::jsonb,
+        ${input.reuseKey ?? null},
         ${createdAt},
         ${updatedAt}
       )
@@ -741,6 +1071,7 @@ class PostgresCompileArtifactRepository implements CompileArtifactRepository {
         target_page_id = excluded.target_page_id,
         change_set_id = excluded.change_set_id,
         metadata = excluded.metadata,
+        reuse_key = excluded.reuse_key,
         updated_at = excluded.updated_at
       returning *
     `.execute(this.db);
@@ -771,6 +1102,21 @@ class PostgresCompileArtifactRepository implements CompileArtifactRepository {
     `.execute(this.db);
 
     return result.rows[0] === undefined ? null : toWikiDraftCandidateRecord(result.rows[0]);
+  }
+
+  async listReusableDraftCandidates(input: {
+    knowledgeBaseId: string;
+    reuseKey: string;
+  }): Promise<WikiDraftCandidateRecord[]> {
+    const result = await sql<WikiDraftCandidateRow>`
+      select *
+      from wiki_draft_candidates
+      where knowledge_base_id = ${input.knowledgeBaseId}
+        and reuse_key = ${input.reuseKey}
+      order by created_at asc, id asc
+    `.execute(this.db);
+
+    return result.rows.map(toWikiDraftCandidateRecord);
   }
 
   async listDraftCandidatesByJob(jobId: string): Promise<WikiDraftCandidateRecord[]> {
@@ -940,6 +1286,7 @@ interface WikiAnalysisResultRow {
   relationships: unknown;
   source_refs: unknown;
   locator_refs: unknown;
+  reuse_key: string | null;
   metadata: unknown;
   created_at: string | Date;
   updated_at: string | Date;
@@ -966,6 +1313,7 @@ interface WikiDraftCandidateRow {
   status: string;
   target_page_id: string | null;
   change_set_id: string | null;
+  reuse_key: string | null;
   metadata: unknown;
   created_at: string | Date;
   updated_at: string | Date;
@@ -1032,6 +1380,7 @@ function toWikiAnalysisResultRecord(row: WikiAnalysisResultRow): WikiAnalysisRes
     relationships: normalizeJsonObjectArray(row.relationships),
     sourceRefs: normalizeJsonObjectArray(row.source_refs),
     locatorRefs: normalizeJsonObjectArray(row.locator_refs),
+    reuseKey: row.reuse_key,
     metadata: normalizeJsonObject(row.metadata),
     createdAt: normalizeDate(row.created_at),
     updatedAt: normalizeDate(row.updated_at),
@@ -1060,6 +1409,7 @@ function toWikiDraftCandidateRecord(row: WikiDraftCandidateRow): WikiDraftCandid
     status: row.status,
     targetPageId: row.target_page_id,
     changeSetId: row.change_set_id,
+    reuseKey: row.reuse_key,
     metadata: normalizeJsonObject(row.metadata),
     createdAt: normalizeDate(row.created_at),
     updatedAt: normalizeDate(row.updated_at),

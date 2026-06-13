@@ -81,6 +81,12 @@ export interface DeletionCleanupOperationDetailResponse extends DeletionCleanupO
   failed_at: string | null;
   canceled_at: string | null;
   items: DeletionCleanupItemSummaryResponse[];
+  items_pagination: {
+    page: number;
+    page_size: number;
+    total: number;
+    has_more: boolean;
+  };
 }
 
 export function createQueuedDeletionCleanupOperation(input: {
@@ -157,6 +163,17 @@ export function toDeletionCleanupOperationSummaryResponse(
 export function toDeletionCleanupOperationDetailResponse(
   record: DeletionCleanupOperationRecord,
   items: readonly DeletionCleanupItemRecord[],
+  itemPagination: {
+    page: number;
+    pageSize: number;
+    total: number;
+    hasMore: boolean;
+  } = {
+    page: 1,
+    pageSize: items.length,
+    total: items.length,
+    hasMore: false,
+  },
 ): DeletionCleanupOperationDetailResponse {
   return {
     ...toDeletionCleanupOperationSummaryResponse(record),
@@ -175,6 +192,12 @@ export function toDeletionCleanupOperationDetailResponse(
     failed_at: record.failedAt,
     canceled_at: record.canceledAt,
     items: items.map(toDeletionCleanupItemSummaryResponse),
+    items_pagination: {
+      page: itemPagination.page,
+      page_size: itemPagination.pageSize,
+      total: itemPagination.total,
+      has_more: itemPagination.hasMore,
+    },
   };
 }
 

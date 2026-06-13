@@ -21,7 +21,7 @@ export const adminQueryClient = createAdminQueryClient()
 export function handleAdminAuthError(error: unknown) {
   if (
     !(error instanceof ApiClientError) ||
-    error.status !== 401 ||
+    !isAdminAuthError(error) ||
     typeof window === "undefined"
   ) {
     return
@@ -32,6 +32,13 @@ export function handleAdminAuthError(error: unknown) {
   if (window.location.pathname !== "/login") {
     window.location.assign("/login")
   }
+}
+
+function isAdminAuthError(error: ApiClientError): boolean {
+  return (
+    error.status === 401 ||
+    error.messageKey === "api.validation.admin_session_required"
+  )
 }
 
 export function handleAdminRequestError(error: unknown) {

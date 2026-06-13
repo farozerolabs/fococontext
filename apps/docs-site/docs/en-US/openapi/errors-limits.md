@@ -26,16 +26,42 @@ Use this page to handle structured errors, limits, cleanup operations, request I
 
 ## Field Guide
 
-| Field                                           | Meaning                                                                                                        |
-| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `error.code`                                    | Stable enum for client logic.                                                                                  |
-| `error.message`                                 | Localized human-readable message.                                                                              |
-| `message_key`                                   | Translation key for clients that want to localize themselves.                                                  |
-| `details`                                       | Structured fields such as invalid fields, target resource, cleanup operation, retry timing, or limit name.     |
-| Cleanup operations                              | Async deletion status for hidden Knowledge Bases, sources, objects, indexes, and row cleanup.                  |
-| `settled_state`                                 | Phase-level cleanup verification with object-storage, database, pending, failed, and residual artifact counts. |
-| `dependencies.metrics.objectStorageOperations`  | Recent S3-compatible operation counts by class, operation, caller, and status.                                 |
-| `dependencies.pressure.objectStorageOperations` | Operation pressure state, Class A/B thresholds, hot callers, and tuning guidance keys.                         |
+| Field                                           | Meaning                                                                                                         |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `error.code`                                    | Stable enum for client logic.                                                                                   |
+| `error.message`                                 | Localized human-readable message.                                                                               |
+| `message_key`                                   | Translation key for clients that want to localize themselves.                                                   |
+| `details`                                       | Structured fields such as invalid fields, target resource, cleanup operation, retry timing, or limit name.      |
+| Cleanup operations                              | Async deletion status for hidden Knowledge Bases, sources, objects, indexes, and row cleanup.                   |
+| Cleanup operation lists                         | Return operation summaries and `item_counts`; load cleanup item pages from operation detail or retry responses. |
+| `items_page` / `items_page_size`                | Bound the cleanup item section returned by cleanup detail and retry endpoints.                                  |
+| `settled_state`                                 | Phase-level cleanup verification with object-storage, database, pending, failed, and residual artifact counts.  |
+| `dependencies.metrics.api`                      | Recent API endpoint group counts, status counts, latency buckets, returned counts, page sizes, and warnings.    |
+| `dependencies.metrics.cache`                    | Runtime cache hit, miss, expired miss, set, delete, and invalidation summaries by resource kind.                |
+| `dependencies.migration`                        | Startup migration ownership and known migration target summary for deployed Docker Compose releases.            |
+| `dependencies.metrics.objectStorageOperations`  | Recent S3-compatible operation counts by class, operation, caller, and status.                                  |
+| `dependencies.pressure.objectStorageOperations` | Operation pressure state, Class A/B thresholds, hot callers, and tuning guidance keys.                          |
+
+## Runtime Diagnostics
+
+`GET /health` and settings/status payloads expose safe runtime diagnostics for large Knowledge Bases. API metrics group endpoints into categories such as jobs, sources, wiki, graph, retrieve, cleanup, and runtime status. They report counts, latency buckets, returned item counts, page sizes, totals, `has_more`, graph readiness states, and warning-code counts.
+
+Cache metrics summarize runtime cache behavior by resource kind. Use them to detect repeated misses or invalidation-heavy workflows. Migration status reports that schema changes are owned by the dedicated startup migration service in Docker Compose deployments, so API and Worker containers can start against an already prepared schema.
+
+## Durable Backend Errors
+
+Production OpenAPI requests use PostgreSQL, pgvector, Redis, S3-compatible storage, queue workers, and persisted graph/source-evidence indexes. If a required backend is missing or unavailable, the API returns a typed response instead of switching to an in-memory compatibility path.
+
+| Code                            | Typical status | When it appears                                                              |
+| ------------------------------- | -------------: | ---------------------------------------------------------------------------- |
+| `durable_backend_unavailable`   |          `503` | A required production backend or runtime dependency is not available.        |
+| `bounded_retrieval_unavailable` |          `503` | Retrieve cannot reach the bounded PostgreSQL/pgvector retrieval backend.     |
+| `graph_index_unavailable`       |          `503` | Graph traversal or graph insight indexes are not ready or cannot be queried. |
+| `redis_metrics_degraded`        |          `503` | Redis-backed runtime metrics are unavailable for status or diagnostics.      |
+| `parser_limit_exceeded`         |          `413` | Parser or Worker hard limits stop a source before unbounded memory use.      |
+| `retrieve_index_not_ready`      |          `409` | Ingest has not produced usable Wiki/index state for this Knowledge Base yet. |
+
+The response still includes `request_id`, a safe localized message, and structured `details`. Secrets, raw source text, prompts, signed URLs, storage keys, and raw SQL are not returned.
 
 ## OpenAPI
 
@@ -53,7 +79,7 @@ paths:
   "/cleanup-operations":
     get:
       summary: "List deletion cleanup operations"
-      description: "Returns asynchronous cleanup operations for visible deletion, object cleanup, database cleanup, and retry status."
+      description: "Returns asynchronous cleanup operation summaries for visible deletion, object cleanup, database cleanup, and retry status. Operation items are loaded through the detail endpoint with item pagination."
       operationId: "listCleanupOperations"
       responses:
         200:
@@ -78,8 +104,26 @@ paths:
   "/cleanup-operations/{cleanup_operation_id}":
     get:
       summary: "Get deletion cleanup operation"
-      description: "Returns cleanup phase, item counts, settled-state verification, retry eligibility, and safe error summaries without provider secrets."
+      description: "Returns cleanup phase, item counts, a bounded cleanup item page, settled-state verification, retry eligibility, and safe error summaries without provider secrets."
       operationId: "getCleanupOperation"
+      parameters:
+        - name: "items_page"
+          in: "query"
+          required: false
+          description: "Cleanup item page number. Values start at 1."
+          schema:
+            type: "integer"
+            default: 1
+            minimum: 1
+        - name: "items_page_size"
+          in: "query"
+          required: false
+          description: "Number of cleanup items to return in the bounded item section."
+          schema:
+            type: "integer"
+            default: 100
+            minimum: 1
+            maximum: 500
       responses:
         200:
           description: "Deletion cleanup operation."
@@ -101,8 +145,26 @@ paths:
   "/cleanup-operations/{cleanup_operation_id}/retry":
     post:
       summary: "Retry deletion cleanup operation"
-      description: "Queues retry work for retryable failed or pending cleanup items."
+      description: "Queues retry work for retryable failed or pending cleanup items and returns the operation with a bounded cleanup item page."
       operationId: "retryCleanupOperation"
+      parameters:
+        - name: "items_page"
+          in: "query"
+          required: false
+          description: "Cleanup item page number in the returned operation. Values start at 1."
+          schema:
+            type: "integer"
+            default: 1
+            minimum: 1
+        - name: "items_page_size"
+          in: "query"
+          required: false
+          description: "Number of cleanup items to return in the bounded item section."
+          schema:
+            type: "integer"
+            default: 100
+            minimum: 1
+            maximum: 500
       responses:
         200:
           description: "Deletion cleanup retry accepted."
@@ -277,11 +339,39 @@ components:
           type: "boolean"
         item_counts:
           "$ref": "#/components/schemas/CleanupItemCounts"
+        items:
+          type: "array"
+          description: "Bounded cleanup item page returned by operation detail and retry responses. Cleanup operation list responses return summaries and item counts without this section."
+          items:
+            "$ref": "#/components/schemas/CleanupItemSummary"
+        items_pagination:
+          "$ref": "#/components/schemas/CleanupItemPagination"
         created_at:
           "$ref": "#/components/schemas/Timestamp"
         updated_at:
           "$ref": "#/components/schemas/Timestamp"
       additionalProperties: true
+    CleanupItemPagination:
+      type: "object"
+      required:
+        - "page"
+        - "page_size"
+        - "total"
+        - "has_more"
+      properties:
+        page:
+          type: "integer"
+          minimum: 1
+        page_size:
+          type: "integer"
+          minimum: 1
+          maximum: 500
+        total:
+          type: "integer"
+          minimum: 0
+        has_more:
+          type: "boolean"
+      additionalProperties: false
     CleanupRetryResponse:
       type: "object"
       required:

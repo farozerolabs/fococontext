@@ -39,7 +39,7 @@ Do not commit admin passwords or API Keys. Settings shows masked status only.
 
 ## Step 2: Start the Service
 
-For released self-hosted deployments, set an exact image tag such as
+For image-based self-hosted deployments, set an exact image tag such as
 `FOCOCONTEXT_IMAGE_TAG=0.1.0` in `.env`, then run:
 
 ```bash
@@ -48,12 +48,10 @@ docker compose up -d
 
 The default Compose template pulls published API, Admin, Worker, and OCR images
 from GitHub Container Registry under `ghcr.io/farozerolabs`.
-`FOCOCONTEXT_IMAGE_TAG` is required by the release template and should match the
-product image tag derived from a Git release tag, for example `v0.1.0` ->
-`0.1.0`. For local source-build development, use
-`docker-compose.dev.example.yml` through `pnpm install` and `pnpm run docker:up`.
+`FOCOCONTEXT_IMAGE_TAG` is required and should match the product image tag
+derived from a Git release tag, for example `v0.1.0` -> `0.1.0`.
 
-The release templates have two startup paths:
+The Compose templates have two startup paths:
 
 | Template                                  | Command                                                                                          | OCR behavior                        |
 | ----------------------------------------- | ------------------------------------------------------------------------------------------------ | ----------------------------------- |
@@ -61,8 +59,22 @@ The release templates have two startup paths:
 | `docker-compose.optional-ocr.example.yml` | `OCR_ENABLED=false docker compose -f docker-compose.optional-ocr.example.yml up -d`              | Starts without OCR                  |
 | `docker-compose.optional-ocr.example.yml` | `OCR_ENABLED=true docker compose -f docker-compose.optional-ocr.example.yml --profile ocr up -d` | Starts OCR explicitly when required |
 
-For the first public release, maintainers should confirm the GHCR packages are
-public before publishing install instructions that reference those images.
+The Compose templates start a dedicated `migrate` one-shot service before API
+and Worker. Fresh deployments initialize the latest schema. Existing deployments
+run pending migrations once during `docker compose up -d`. If migration fails,
+API and Worker stay blocked; inspect `docker compose logs migrate`, fix the
+cause, and run `docker compose up -d` again.
+
+For routine upgrades:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Rollback after a schema or data migration should restore the database snapshot
+that belongs to the previous image tag. Code-only rollbacks can pin
+`FOCOCONTEXT_IMAGE_TAG` back to the previous tag and restart the stack.
 
 Published service ports bind to localhost by default. Keep
 `FOCOCONTEXT_BIND_HOST=127.0.0.1` for reverse-proxy deployments. Set
@@ -130,6 +142,47 @@ After startup, open:
 | Redis        | `127.0.0.1:18379`                     |
 
 OpenAPI JSON is protected. Read it from an authenticated Admin Console session, or send `Authorization: Bearer <FOCOCONTEXT_API_KEY>` from a server process.
+
+Runtime pressure is visible in Admin Settings and `/health`. Check
+`dependencies.migration`, `dependencies.pressure.queue`,
+`dependencies.pressure.compile`,
+`dependencies.pressure.objectStorageOperations`, `dependencies.metrics.api`,
+`dependencies.metrics.cache`, and `dependencies.metrics.retrievalQuality` when
+large imports, graph refreshes, or Retrieve calls feel slow.
+
+## Source Development
+
+Use this path when you want to run FocoContext from a source checkout:
+
+```bash
+pnpm install
+pnpm run docker:up
+```
+
+The source stack uses `docker-compose.dev.example.yml`, builds local service
+images, and starts the runtime in the background. The source stack also starts
+OCR by default:
+
+```bash
+pnpm run docker:up:ocr
+```
+
+Common development checks:
+
+```bash
+pnpm run format:check
+pnpm run lint
+pnpm run typecheck
+pnpm run test
+pnpm run build
+pnpm run verify
+```
+
+Run the documentation site:
+
+```bash
+pnpm run docs:dev
+```
 
 ## Step 3: Sign in to Admin
 

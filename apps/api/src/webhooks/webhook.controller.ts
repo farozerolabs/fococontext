@@ -2,11 +2,7 @@ import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query, Req } from 
 import { createListEnvelope, createRequestId, createSuccessEnvelope } from "@fococontext/contracts";
 
 import { requireApiKeyScope, type ApiKeyRequest } from "../auth/api-key.guard.js";
-import {
-  parsePaginationQuery,
-  type PaginationInput,
-  type PaginationQuery,
-} from "../http/pagination.js";
+import { parsePaginationQuery, type PaginationQuery } from "../http/pagination.js";
 import { WebhookService } from "./webhook.service.js";
 import type { CreateWebhookInput, UpdateWebhookInput } from "./webhook.types.js";
 
@@ -16,12 +12,12 @@ export class WebhookController {
 
   @Get()
   async list(@Req() request: ApiKeyRequest, @Query() query: PaginationQuery) {
-    const pagination = paginateItems(
-      this.webhookService.list(requireApiKeyScope(request)).webhooks,
+    const pagination = await this.webhookService.listPaginated(
       parsePaginationQuery(query),
+      requireApiKeyScope(request),
     );
 
-    return createListEnvelope(pagination.items, {
+    return createListEnvelope(pagination.webhooks, {
       has_more: pagination.hasMore,
       page: pagination.page,
       page_size: pagination.pageSize,
@@ -42,7 +38,7 @@ export class WebhookController {
   @Get(":webhookId")
   async get(@Param("webhookId") webhookId: string, @Req() request: ApiKeyRequest) {
     return createSuccessEnvelope(
-      this.webhookService.get(webhookId, requireApiKeyScope(request)),
+      await this.webhookService.get(webhookId, requireApiKeyScope(request)),
       createRequestId(),
     );
   }
@@ -78,12 +74,13 @@ export class WebhookController {
     @Req() request: ApiKeyRequest,
     @Query() query: PaginationQuery,
   ) {
-    const pagination = paginateItems(
-      this.webhookService.listDeliveries(webhookId, requireApiKeyScope(request)).deliveries,
+    const pagination = await this.webhookService.listDeliveriesPaginated(
+      webhookId,
       parsePaginationQuery(query),
+      requireApiKeyScope(request),
     );
 
-    return createListEnvelope(pagination.items, {
+    return createListEnvelope(pagination.deliveries, {
       has_more: pagination.hasMore,
       page: pagination.page,
       page_size: pagination.pageSize,
@@ -91,18 +88,4 @@ export class WebhookController {
       total: pagination.total,
     });
   }
-}
-
-function paginateItems<TItem>(items: readonly TItem[], input: PaginationInput) {
-  const start = (input.page - 1) * input.pageSize;
-  const end = start + input.pageSize;
-  const total = items.length;
-
-  return {
-    hasMore: end < total,
-    items: items.slice(start, end),
-    page: input.page,
-    pageSize: input.pageSize,
-    total,
-  };
 }

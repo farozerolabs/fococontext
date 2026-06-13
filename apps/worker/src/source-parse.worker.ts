@@ -2,8 +2,9 @@ import { Worker } from "bullmq";
 import { createResourceId } from "@fococontext/contracts";
 import type { RuntimeConfig } from "@fococontext/core";
 import {
-  createInMemoryParserCache,
   createDefaultParserRegistry,
+  createNoopParserCache,
+  createParserLimitError,
   type DocumentParser,
   type ParserFatalError,
   type ParserCache,
@@ -13,26 +14,40 @@ import {
   type ParserRegistry,
   evaluatePdfOcrEligibility,
   parseWithCache,
+  parseWithErrorBoundary,
   parseWithLimits,
 } from "@fococontext/parsers";
 import type { ObjectStorageAdapter } from "@fococontext/storage";
 import type {
-  WorkerJobGuardReason,
   WorkerJobProgressWriter,
   WorkerJobStateGuard,
 } from "./job-progress.postgres-writer.js";
+import type { DocumentProcessingStateStore } from "./document-processing-state.js";
 import type { MediaCaptionQueue } from "./media-caption.worker.js";
 import { createMarkdownPreview, defaultParsedMarkdownPreviewMaxChars } from "./parsed-preview.js";
+import {
+  createMarkdownWindows,
+  createMediaExtractionProcessingUnits,
+  createParserConfigHash,
+  createParserProcessingUnits,
+  createParserUnitDedupeKey,
+  type ParserMarkdownWindow,
+} from "./source-parse-processing-state.js";
 import type {
   DatasetConfigurationSnapshotPayload,
   WikiAnalyzeQueue,
 } from "./wiki-compile.worker.js";
+import { runSourceThreatScan, type SourceThreatScanner } from "./source-threat-scan.js";
+import { resumeSourceParseCheckpoint } from "./source-parse-checkpoint-resume.js";
+import { createOcrRequiredError, createSkippedParseError } from "./source-parse-errors.js";
 
 export const sourceParseQueueName = "source.parse";
 export const sourceParseJobName = "source.parse.document";
 
 export interface SourceParsePayload {
   job_id: string;
+  tenant_id: string;
+  project_id: string;
   knowledge_base_id: string;
   document_id: string;
   content_hash: string;
@@ -89,6 +104,8 @@ export interface SourceOcrQueue {
 
 export interface SourceOcrPayload {
   job_id: string;
+  tenant_id: string;
+  project_id: string;
   knowledge_base_id: string;
   document_id: string;
   parsed_content_id: string;
@@ -120,7 +137,11 @@ export interface SourceParseProcessorOptions {
   parserRegistry?: ParserRegistry;
   parserCache?: ParserCache;
   parserLimits?: ParserLimitConfig;
+  threatScanner?: SourceThreatScanner;
+  mediaAssetUploadConcurrency?: number;
   previewMaxChars?: number;
+  processingStateMarkdownWindowChars?: number;
+  processingState?: DocumentProcessingStateStore;
 }
 
 export interface SourceParseProcessorResult {
@@ -148,7 +169,11 @@ export class SourceParseProcessor {
   private readonly parserRegistry: ParserRegistry;
   private readonly parserCache: ParserCache;
   private readonly parserLimits: ParserLimitConfig | undefined;
+  private readonly threatScanner: SourceThreatScanner | undefined;
+  private readonly mediaAssetUploadConcurrency: number;
   private readonly previewMaxChars: number;
+  private readonly processingStateMarkdownWindowChars: number;
+  private readonly processingState: DocumentProcessingStateStore | undefined;
 
   constructor(options: SourceParseProcessorOptions) {
     this.objectStorage = options.objectStorage;
@@ -159,9 +184,19 @@ export class SourceParseProcessor {
     this.jobProgress = options.jobProgress;
     this.jobGuard = options.jobGuard;
     this.parserRegistry = options.parserRegistry ?? createDefaultParserRegistry();
-    this.parserCache = options.parserCache ?? createInMemoryParserCache();
+    this.parserCache = options.parserCache ?? createNoopParserCache();
     this.parserLimits = options.parserLimits;
+    this.threatScanner = options.threatScanner;
+    this.mediaAssetUploadConcurrency = normalizePositiveInteger(
+      options.mediaAssetUploadConcurrency,
+      4,
+    );
     this.previewMaxChars = options.previewMaxChars ?? defaultParsedMarkdownPreviewMaxChars;
+    this.processingStateMarkdownWindowChars = normalizePositiveInteger(
+      options.processingStateMarkdownWindowChars,
+      64_000,
+    );
+    this.processingState = options.processingState;
   }
 
   async process(payload: SourceParsePayload): Promise<SourceParseProcessorResult> {
@@ -171,11 +206,20 @@ export class SourceParseProcessor {
       return this.createFailedResult(payload, initialGuardError);
     }
 
-    const original = await this.objectStorage.getObject({
-      key: payload.object_key,
-    });
-    const content = await readBody(original.body);
     const fileName = basename(payload.object_key);
+    const threatScanResult = await runSourceThreatScan({
+      fileName,
+      payload,
+      processingState: this.processingState,
+      threatScanner: this.threatScanner,
+    });
+
+    if (threatScanResult.kind === "fatal") {
+      await this.markParsingFailed(payload, threatScanResult.error);
+
+      return this.createFailedResult(payload, threatScanResult.error);
+    }
+
     const resolution = this.parserRegistry.resolve({
       fileName,
       mimeType: payload.mime_type,
@@ -187,6 +231,79 @@ export class SourceParseProcessor {
       return this.createFailedResult(payload, resolution.error);
     }
 
+    const parserConfigHash = createParserConfigHash(payload, resolution.parser);
+    const parserDedupeKey = createParserUnitDedupeKey(payload, parserConfigHash);
+    const completedCheckpoint = await this.processingState?.findCheckpoint({
+      checkpointKey: parserDedupeKey,
+      jobId: payload.job_id,
+      sourceDocumentId: payload.document_id,
+      stage: "parsing",
+    });
+
+    if (completedCheckpoint?.status === "completed") {
+      const parsedContentId = readString(completedCheckpoint.summary.parsed_content_id);
+
+      if (parsedContentId !== null) {
+        await resumeSourceParseCheckpoint({
+          checkpointSummary: completedCheckpoint.summary,
+          compileQueue: this.compileQueue,
+          jobProgress: this.jobProgress,
+          parsedContentId,
+          payload,
+        });
+
+        return {
+          status: "completed",
+          should_continue: true,
+          document_id: payload.document_id,
+          parsed_content_id: parsedContentId,
+          error: null,
+        };
+      }
+    }
+
+    await this.processingState?.upsertUnit({
+      configHash: parserConfigHash,
+      contentHash: payload.content_hash,
+      dedupeKey: parserDedupeKey,
+      jobId: payload.job_id,
+      metadata: {
+        mime_type: payload.mime_type,
+        source_type: payload.source_type,
+      },
+      objectKey: payload.object_key,
+      parserName: resolution.parser.name,
+      parserVersion: resolution.parser.version,
+      sourceDocumentId: payload.document_id,
+      stage: "parsing",
+      status: "running",
+      unitKey: payload.object_key,
+      unitType: "source_object",
+    });
+
+    const original = await this.objectStorage.getObject({
+      key: payload.object_key,
+    });
+    const contentResult = await this.readOriginalContentWithinLimits(
+      original.body,
+      original.contentLength,
+      resolution.parser,
+      fileName,
+      payload.mime_type,
+    );
+
+    if (contentResult.kind === "fatal") {
+      await this.markParsingUnitFailed(
+        payload,
+        parserConfigHash,
+        parserDedupeKey,
+        contentResult.error,
+      );
+      await this.markParsingFailed(payload, contentResult.error);
+
+      return this.createFailedResult(payload, contentResult.error);
+    }
+
     const parsedContentId = createResourceId("parsedContent");
     const result = await parseWithCache(
       this.createParserWithRuntimeLimits(resolution.parser),
@@ -196,7 +313,7 @@ export class SourceParseProcessor {
         fileName,
         mimeType: payload.mime_type,
         contentHash: payload.content_hash,
-        content,
+        content: contentResult.content,
       },
       this.parserCache,
       {
@@ -205,6 +322,7 @@ export class SourceParseProcessor {
     );
 
     if (result.kind === "fatal") {
+      await this.markParsingUnitFailed(payload, parserConfigHash, parserDedupeKey, result.error);
       await this.markParsingFailed(payload, result.error);
 
       return this.createFailedResult(payload, result.error);
@@ -213,12 +331,23 @@ export class SourceParseProcessor {
     const postParseGuardError = await this.createStaleJobError(payload);
 
     if (postParseGuardError !== undefined) {
+      await this.markParsingUnitFailed(
+        payload,
+        parserConfigHash,
+        parserDedupeKey,
+        postParseGuardError,
+      );
       await this.markParsingFailed(payload, postParseGuardError);
 
       return this.createFailedResult(payload, postParseGuardError);
     }
 
     const normalizedMarkdownObjectKey = createNormalizedMarkdownObjectKey(payload);
+    const markdownWindows = createMarkdownWindows({
+      markdown: result.parsedContent.normalizedMarkdown,
+      maxChars: this.processingStateMarkdownWindowChars,
+      payload,
+    });
 
     await this.objectStorage.putObject({
       key: normalizedMarkdownObjectKey,
@@ -229,6 +358,7 @@ export class SourceParseProcessor {
         parsedContentId,
       },
     });
+    await this.writeMarkdownWindowObjects(markdownWindows, payload, parsedContentId);
     await this.writer.saveParsedContent({
       id: parsedContentId,
       document_id: payload.document_id,
@@ -252,6 +382,64 @@ export class SourceParseProcessor {
 
     await this.writeMediaAssetObjects(result.parsedContent.mediaAssets, payload, parsedContentId);
     await this.writer.saveMediaAssets(mediaAssets);
+    await this.processingState?.upsertUnits(
+      createParserProcessingUnits({
+        configHash: parserConfigHash,
+        markdownWindows,
+        parsedContent: result.parsedContent,
+        parsedContentId,
+        payload,
+      }),
+    );
+    await this.processingState?.upsertUnit({
+      configHash: parserConfigHash,
+      contentHash: payload.content_hash,
+      counters: {
+        locator_count: result.parsedContent.locators.length,
+        markdown_chars: result.parsedContent.normalizedMarkdown.length,
+        media_asset_count: result.parsedContent.mediaAssets.length,
+        table_count: result.parsedContent.tables.length,
+        warning_count: result.parsedContent.warnings.length,
+      },
+      jobId: payload.job_id,
+      objectKey: normalizedMarkdownObjectKey,
+      parsedContentId,
+      parserName: result.parsedContent.parserName,
+      parserVersion: result.parsedContent.parserVersion,
+      sourceDocumentId: payload.document_id,
+      stage: "parsed_artifact",
+      status: "succeeded",
+      unitKey: "normalized_markdown",
+      unitType: "normalized_markdown",
+      warnings: result.parsedContent.warnings.map(toJsonObject),
+    });
+    await this.processingState?.upsertUnits(
+      createMediaExtractionProcessingUnits({
+        mediaAssets,
+        parsedContentId,
+        payload,
+      }),
+    );
+    await this.processingState?.upsertUnit({
+      configHash: parserConfigHash,
+      contentHash: payload.content_hash,
+      counters: {
+        content_bytes: Buffer.isBuffer(contentResult.content)
+          ? contentResult.content.byteLength
+          : undefined,
+      },
+      dedupeKey: parserDedupeKey,
+      jobId: payload.job_id,
+      objectKey: payload.object_key,
+      parsedContentId,
+      parserName: result.parsedContent.parserName,
+      parserVersion: result.parsedContent.parserVersion,
+      sourceDocumentId: payload.document_id,
+      stage: "parsing",
+      status: "succeeded",
+      unitKey: payload.object_key,
+      unitType: "source_object",
+    });
 
     const ocrDecision = evaluateSourceOcrDecision({
       payload,
@@ -262,6 +450,8 @@ export class SourceParseProcessor {
     if (ocrDecision.kind === "enqueue") {
       await this.ocrQueue?.enqueueSourceOcrJob({
         job_id: payload.job_id,
+        tenant_id: payload.tenant_id,
+        project_id: payload.project_id,
         knowledge_base_id: payload.knowledge_base_id,
         document_id: payload.document_id,
         parsed_content_id: parsedContentId,
@@ -289,6 +479,14 @@ export class SourceParseProcessor {
           parser_cache: result.cache,
         },
       });
+      await this.markParsingCheckpointCompleted(payload, {
+        checkpointKey: parserDedupeKey,
+        configHash: parserConfigHash,
+        downstreamStage: "ocr",
+        normalizedMarkdownObjectKey,
+        parsedContentId,
+        parserCache: result.cache,
+      });
 
       return {
         status: "completed",
@@ -305,6 +503,11 @@ export class SourceParseProcessor {
         const error = createOcrRequiredError(ocrDecision.reason);
 
         await this.markParsingFailed(payload, error);
+        await this.markParsingCheckpointFailed(payload, {
+          checkpointKey: parserDedupeKey,
+          configHash: parserConfigHash,
+          error,
+        });
 
         return this.createFailedResult(payload, error);
       }
@@ -329,6 +532,8 @@ export class SourceParseProcessor {
     if (this.captionQueue !== undefined && mediaAssets.length > 0) {
       await this.captionQueue.enqueueMediaCaptionJob({
         job_id: payload.job_id,
+        tenant_id: payload.tenant_id,
+        project_id: payload.project_id,
         knowledge_base_id: payload.knowledge_base_id,
         document_id: payload.document_id,
         parsed_content_id: parsedContentId,
@@ -355,6 +560,14 @@ export class SourceParseProcessor {
           parser_cache: result.cache,
         },
       });
+      await this.markParsingCheckpointCompleted(payload, {
+        checkpointKey: parserDedupeKey,
+        configHash: parserConfigHash,
+        downstreamStage: "captioning",
+        normalizedMarkdownObjectKey,
+        parsedContentId,
+        parserCache: result.cache,
+      });
 
       return {
         status: "completed",
@@ -368,6 +581,8 @@ export class SourceParseProcessor {
 
     await this.compileQueue?.enqueueWikiAnalyzeJob({
       job_id: payload.job_id,
+      tenant_id: payload.tenant_id,
+      project_id: payload.project_id,
       knowledge_base_id: payload.knowledge_base_id,
       document_id: payload.document_id,
       parsed_content_id: parsedContentId,
@@ -391,6 +606,14 @@ export class SourceParseProcessor {
         parser_cache: result.cache,
       },
     });
+    await this.markParsingCheckpointCompleted(payload, {
+      checkpointKey: parserDedupeKey,
+      configHash: parserConfigHash,
+      downstreamStage: "analyzing",
+      normalizedMarkdownObjectKey,
+      parsedContentId,
+      parserCache: result.cache,
+    });
 
     return {
       status: "completed",
@@ -406,7 +629,10 @@ export class SourceParseProcessor {
     const limits = this.parserLimits;
 
     if (limits === undefined) {
-      return parser;
+      return {
+        ...parser,
+        parse: (input) => parseWithErrorBoundary(parser, input),
+      };
     }
 
     return {
@@ -415,25 +641,85 @@ export class SourceParseProcessor {
     };
   }
 
+  private async readOriginalContentWithinLimits(
+    body: unknown,
+    contentLength: number | undefined,
+    parser: DocumentParser,
+    fileName: string,
+    mimeType: string,
+  ): Promise<
+    { kind: "success"; content: Buffer | string } | { kind: "fatal"; error: ParserFatalError }
+  > {
+    const limit = this.parserLimits?.maxFileSizeBytes;
+
+    if (limit !== undefined && contentLength !== undefined && contentLength > limit) {
+      return {
+        kind: "fatal",
+        error: createParserLimitError("file_size", contentLength, limit, {
+          parserName: parser.name,
+          parserVersion: parser.version,
+          fileName,
+          mimeType,
+        }),
+      };
+    }
+
+    const content = isTextSourceParser(parser, fileName, mimeType)
+      ? await readTextBodyWithinLimit(body, limit)
+      : await readBodyWithinLimit(body, limit);
+
+    if (content.kind === "fatal") {
+      return {
+        kind: "fatal",
+        error: createParserLimitError("file_size", content.actual, content.limit, {
+          parserName: parser.name,
+          parserVersion: parser.version,
+          fileName,
+          mimeType,
+        }),
+      };
+    }
+
+    return content;
+  }
+
   private async writeMediaAssetObjects(
     assets: readonly ParserMediaAsset[],
     payload: SourceParsePayload,
     parsedContentId: string,
   ): Promise<void> {
-    await Promise.all(
-      assets
-        .filter((asset) => asset.content !== undefined)
-        .map((asset) =>
-          this.objectStorage.putObject({
-            key: asset.objectKey,
-            body: asset.content ?? Buffer.alloc(0),
-            contentType: asset.mimeType,
-            metadata: {
-              documentId: payload.document_id,
-              parsedContentId,
-            },
-          }),
-        ),
+    await mapWithConcurrency(
+      assets.filter((asset) => asset.content !== undefined),
+      this.mediaAssetUploadConcurrency,
+      (asset) =>
+        this.objectStorage.putObject({
+          key: asset.objectKey,
+          body: asset.content ?? Buffer.alloc(0),
+          contentType: asset.mimeType,
+          metadata: {
+            documentId: payload.document_id,
+            parsedContentId,
+          },
+        }),
+    );
+  }
+
+  private async writeMarkdownWindowObjects(
+    windows: readonly ParserMarkdownWindow[],
+    payload: SourceParsePayload,
+    parsedContentId: string,
+  ): Promise<void> {
+    await mapWithConcurrency(windows, this.mediaAssetUploadConcurrency, (window) =>
+      this.objectStorage.putObject({
+        key: window.objectKey,
+        body: Buffer.from(window.content),
+        contentType: "text/markdown",
+        metadata: {
+          documentId: payload.document_id,
+          parsedContentId,
+          sha256: window.sha256,
+        },
+      }),
     );
   }
 
@@ -469,6 +755,78 @@ export class SourceParseProcessor {
     });
   }
 
+  private async markParsingUnitFailed(
+    payload: SourceParsePayload,
+    configHash: string,
+    dedupeKey: string,
+    error: ParserFatalError,
+  ): Promise<void> {
+    await this.processingState?.upsertUnit({
+      configHash,
+      contentHash: payload.content_hash,
+      dedupeKey,
+      jobId: payload.job_id,
+      objectKey: payload.object_key,
+      retryEligible: error.retryable,
+      safeError: toJsonObject(error),
+      sourceDocumentId: payload.document_id,
+      stage: "parsing",
+      status: "failed",
+      unitKey: payload.object_key,
+      unitType: "source_object",
+    });
+  }
+
+  private async markParsingCheckpointCompleted(
+    payload: SourceParsePayload,
+    input: {
+      checkpointKey: string;
+      configHash: string;
+      downstreamStage: "ocr" | "captioning" | "analyzing";
+      normalizedMarkdownObjectKey: string;
+      parsedContentId: string;
+      parserCache?: ParserCacheMetadata;
+    },
+  ): Promise<void> {
+    await this.processingState?.upsertCheckpoint({
+      checkpointKey: input.checkpointKey,
+      configHash: input.configHash,
+      jobId: payload.job_id,
+      parsedContentId: input.parsedContentId,
+      sourceDocumentId: payload.document_id,
+      stage: "parsing",
+      status: "completed",
+      summary: {
+        downstream_stage: input.downstreamStage,
+        normalized_markdown_object_key: input.normalizedMarkdownObjectKey,
+        parsed_content_id: input.parsedContentId,
+        parser_cache: input.parserCache ?? {},
+      },
+    });
+  }
+
+  private async markParsingCheckpointFailed(
+    payload: SourceParsePayload,
+    input: {
+      checkpointKey: string;
+      configHash: string;
+      error: ParserFatalError;
+    },
+  ): Promise<void> {
+    await this.processingState?.upsertCheckpoint({
+      checkpointKey: input.checkpointKey,
+      configHash: input.configHash,
+      jobId: payload.job_id,
+      safeError: toJsonObject(input.error),
+      sourceDocumentId: payload.document_id,
+      stage: "parsing",
+      status: "failed",
+      summary: {
+        retryable: input.error.retryable,
+      },
+    });
+  }
+
   private async createStaleJobError(
     payload: SourceParsePayload,
   ): Promise<ParserFatalError | undefined> {
@@ -476,6 +834,8 @@ export class SourceParseProcessor {
       jobId: payload.job_id,
       knowledgeBaseId: payload.knowledge_base_id,
       inputSnapshotId: payload.input_snapshot_id,
+      tenantId: payload.tenant_id,
+      projectId: payload.project_id,
       sourceDocumentId: payload.document_id,
     });
 
@@ -683,40 +1043,139 @@ function createNormalizedMarkdownObjectKey(payload: SourceParsePayload): string 
   )}/normalized.md`;
 }
 
-function createSkippedParseError(reason: WorkerJobGuardReason | undefined): ParserFatalError {
-  return {
-    kind: "parser_failed",
-    message: `Source parse skipped because the ingest job is not runnable: ${reason ?? "unknown"}.`,
-    retryable: false,
-  };
-}
-
-function createOcrRequiredError(reason: "disabled" | "no_candidate_pages"): ParserFatalError {
-  return {
-    kind: "parser_output_empty",
-    message: `OCR is required to produce usable PDF text, but OCR was skipped: ${reason}.`,
-    retryable: reason !== "disabled",
-    parserName: "ts-pdf-parse",
-    parserVersion: "0.1.0",
-    mimeType: "application/pdf",
-    fileExtension: ".pdf",
-  };
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 function sanitizeObjectKeySegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]+/g, "_");
 }
 
+function normalizePositiveInteger(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  mapper: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const normalizedConcurrency = Math.min(Math.max(1, concurrency), items.length);
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  await Promise.all(
+    Array.from({ length: normalizedConcurrency }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex;
+
+        nextIndex += 1;
+        results[currentIndex] = await mapper(items[currentIndex] as T);
+      }
+    }),
+  );
+
+  return results;
+}
+
 function basename(path: string): string {
   return path.split("/").filter(Boolean).at(-1) ?? "source.bin";
 }
 
-async function readBody(body: unknown): Promise<Buffer> {
+function isTextSourceParser(parser: DocumentParser, fileName: string, mimeType: string): boolean {
+  const normalizedMimeType = mimeType.trim().toLowerCase();
+  const extension = fileName.includes(".")
+    ? `.${fileName.split(".").at(-1)?.toLowerCase() ?? ""}`
+    : "";
+  const textMimeTypes = new Set([
+    "application/json",
+    "application/jsonl",
+    "application/ndjson",
+    "application/x-ndjson",
+    "application/xml",
+    "application/yaml",
+  ]);
+  const textExtensions = new Set([
+    ".csv",
+    ".html",
+    ".htm",
+    ".json",
+    ".jsonl",
+    ".markdown",
+    ".md",
+    ".ndjson",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+  ]);
+
+  return (
+    normalizedMimeType.startsWith("text/") ||
+    textMimeTypes.has(normalizedMimeType) ||
+    textExtensions.has(extension) ||
+    parser.mimeTypes.some((item) => item.trim().toLowerCase().startsWith("text/")) ||
+    parser.extensions.some((item) => textExtensions.has(item.trim().toLowerCase()))
+  );
+}
+
+async function readBodyWithinLimit(
+  body: unknown,
+  maxBytes: number | undefined,
+): Promise<
+  { kind: "success"; content: Buffer } | { kind: "fatal"; actual: number; limit: number }
+> {
   const chunks: Buffer[] = [];
+  let totalBytes = 0;
 
   for await (const chunk of body as AsyncIterable<Buffer | string>) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.byteLength;
+
+    if (maxBytes !== undefined && totalBytes > maxBytes) {
+      return {
+        kind: "fatal",
+        actual: totalBytes,
+        limit: maxBytes,
+      };
+    }
+
+    chunks.push(buffer);
   }
 
-  return Buffer.concat(chunks);
+  return {
+    kind: "success",
+    content: Buffer.concat(chunks, totalBytes),
+  };
+}
+
+async function readTextBodyWithinLimit(
+  body: unknown,
+  maxBytes: number | undefined,
+): Promise<
+  { kind: "success"; content: string } | { kind: "fatal"; actual: number; limit: number }
+> {
+  const chunks: string[] = [];
+  let totalBytes = 0;
+
+  for await (const chunk of body as AsyncIterable<Buffer | string>) {
+    const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+
+    totalBytes += Buffer.byteLength(text);
+
+    if (maxBytes !== undefined && totalBytes > maxBytes) {
+      return {
+        kind: "fatal",
+        actual: totalBytes,
+        limit: maxBytes,
+      };
+    }
+
+    chunks.push(text);
+  }
+
+  return {
+    kind: "success",
+    content: chunks.join(""),
+  };
 }

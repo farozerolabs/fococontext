@@ -242,6 +242,9 @@ importers:
       "@fococontext/parsers":
         specifier: workspace:*
         version: link:../../packages/parsers
+      "@fococontext/retrieval":
+        specifier: workspace:*
+        version: link:../../packages/retrieval
       "@fococontext/storage":
         specifier: workspace:*
         version: link:../../packages/storage

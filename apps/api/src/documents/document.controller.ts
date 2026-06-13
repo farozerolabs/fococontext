@@ -5,6 +5,7 @@ import {
   Body,
   Headers,
   HttpCode,
+  Inject,
   Param,
   Post,
   Query,
@@ -16,12 +17,18 @@ import {
   createRequestId,
   createSuccessEnvelope,
 } from "@fococontext/contracts";
+import type { RuntimeConfig } from "@fococontext/core";
 
 import { DocumentService, type MultipartRequest } from "./document.service.js";
 import { requireApiKeyScope, type ApiKeyRequest } from "../auth/api-key.guard.js";
 import { parsePaginationQuery } from "../http/pagination.js";
 import { KnowledgeBaseService } from "../knowledge-bases/knowledge-base.service.js";
+import { runtimeConfigToken } from "../runtime-config.provider.js";
 import {
+  documentProcessingStages,
+  documentProcessingUnitStatuses,
+  type DocumentProcessingStage,
+  type DocumentProcessingUnitStatus,
   sourceDocumentStatuses,
   sourceTypes,
   type SourceDocumentStatus,
@@ -69,6 +76,14 @@ interface MediaAssetListQuery {
   page_size?: string;
 }
 
+interface ProcessingUnitListQuery {
+  job_id?: string;
+  page?: string;
+  page_size?: string;
+  stage?: string;
+  status?: string;
+}
+
 interface SourceEvidenceQuery {
   allow_fallback?: string;
   context_chars?: string;
@@ -102,7 +117,7 @@ export class DocumentController {
     @Req() request: ApiKeyRequest,
   ) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     const result = await this.documentService.listDocuments(
       knowledgeBaseId,
       {
@@ -133,7 +148,7 @@ export class DocumentController {
     @Req() request: ApiKeyRequest & { body: CreateTextSourceBody },
   ) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.documentService.createTextSource(
         knowledgeBaseId,
@@ -153,7 +168,7 @@ export class DocumentController {
     @Req() request: ApiKeyRequest & { body: CreateUrlSourceBody },
   ) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.documentService.createUrlSource(
         knowledgeBaseId,
@@ -173,7 +188,7 @@ export class DocumentController {
     @Req() request: ApiKeyRequest & { body: CreateUploadSessionBody },
   ) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.documentService.createUploadSession(
         knowledgeBaseId,
@@ -194,7 +209,7 @@ export class DocumentController {
     @Req() request: ApiKeyRequest & { body: FinalizeUploadSessionBody },
   ) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.documentService.finalizeUploadSession(
         knowledgeBaseId,
@@ -215,7 +230,7 @@ export class DocumentController {
     @Req() request: MultipartRequest & ApiKeyRequest,
   ) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.documentService.uploadMultipart(knowledgeBaseId, request, idempotencyKey, scope),
       createRequestId(),
@@ -225,7 +240,10 @@ export class DocumentController {
 
 @Controller("v1/documents")
 export class DocumentLookupController {
-  constructor(private readonly documentService: DocumentService) {}
+  constructor(
+    private readonly documentService: DocumentService,
+    @Inject(runtimeConfigToken) private readonly runtimeConfig: RuntimeConfig,
+  ) {}
 
   @Get(":documentId/evidence")
   async evidence(
@@ -257,6 +275,37 @@ export class DocumentLookupController {
       documentId,
       {
         ...parsePaginationQuery(query),
+      },
+      requireApiKeyScope(request),
+    );
+
+    return createListEnvelope(result.items, {
+      page: result.page,
+      page_size: result.pageSize,
+      total: result.total,
+      has_more: result.hasMore,
+      requestId: createRequestId(),
+    });
+  }
+
+  @Get(":documentId/processing-units")
+  async processingUnits(
+    @Param("documentId") documentId: string,
+    @Query() query: ProcessingUnitListQuery,
+    @Req() request: ApiKeyRequest,
+  ) {
+    const result = await this.documentService.listDocumentProcessingUnits(
+      documentId,
+      {
+        ...parsePaginationQuery(query, {
+          defaultPageSize: this.runtimeConfig.limits.documentProcessing.detailDefaultPageSize,
+          maxPageSize: this.runtimeConfig.limits.documentProcessing.detailMaxPageSize,
+        }),
+        ...(query.job_id === undefined ? {} : { jobId: query.job_id }),
+        ...(query.stage === undefined ? {} : { stage: readDocumentProcessingStage(query.stage) }),
+        ...(query.status === undefined
+          ? {}
+          : { status: readDocumentProcessingUnitStatus(query.status) }),
       },
       requireApiKeyScope(request),
     );
@@ -384,6 +433,32 @@ function readSourceType(value: string): SourceType {
     messageKey: "api.validation.document_source_type_filter_invalid",
     details: {
       fields: ["source_type"],
+    },
+  });
+}
+
+function readDocumentProcessingStage(value: string): DocumentProcessingStage {
+  if (documentProcessingStages.includes(value as DocumentProcessingStage)) {
+    return value as DocumentProcessingStage;
+  }
+
+  throw new ApiError("invalid_request", {
+    messageKey: "api.validation.document_processing_stage_filter_invalid",
+    details: {
+      fields: ["stage"],
+    },
+  });
+}
+
+function readDocumentProcessingUnitStatus(value: string): DocumentProcessingUnitStatus {
+  if (documentProcessingUnitStatuses.includes(value as DocumentProcessingUnitStatus)) {
+    return value as DocumentProcessingUnitStatus;
+  }
+
+  throw new ApiError("invalid_request", {
+    messageKey: "api.validation.document_processing_status_filter_invalid",
+    details: {
+      fields: ["status"],
     },
   });
 }

@@ -69,7 +69,7 @@ Admin should show webhook state, recent deliveries, failure reason, attempt coun
 Webhooks are notifications. After receiving an event, query final state through API and let your business workflow record its own processing state.
 
 ```text
-Webhook event -> Fetch job/source/version -> Update business cache -> Acknowledge internal workflow
+Webhook event -> Fetch job/source/version -> Update business cache -> Acknowledge business workflow
 ```
 
 ## Production Notes

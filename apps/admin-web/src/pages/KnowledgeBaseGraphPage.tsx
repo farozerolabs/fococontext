@@ -4,7 +4,7 @@ import {
   useRegisterEvents,
   useSigma,
 } from "@react-sigma/core"
-import { useQuery } from "@tanstack/react-query"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { MultiDirectedGraph } from "graphology"
 import * as forceAtlas2 from "graphology-layout-forceatlas2"
 import type {
@@ -21,6 +21,7 @@ import {
 } from "react"
 import { useTranslation } from "react-i18next"
 import { useParams } from "react-router"
+import { NodeCircleProgram } from "sigma/rendering"
 import type { NodeHoverDrawingFunction } from "sigma/rendering"
 import type { SigmaEdgeEventPayload, SigmaNodeEventPayload } from "sigma/types"
 import "@react-sigma/core/lib/style.css"
@@ -47,6 +48,7 @@ import { ResourceIdDisplay } from "@/components/resource-id/ResourceIdDisplay.js
 import { EmptyState } from "@/components/state/EmptyState.js"
 import { ErrorAlert } from "@/components/state/ErrorAlert.js"
 import { LoadingState } from "@/components/state/LoadingState.js"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert.js"
 import { Badge } from "@/components/ui/badge.js"
 import { Button } from "@/components/ui/button.js"
 import { cn } from "@/lib/utils.js"
@@ -150,6 +152,7 @@ export function KnowledgeBaseGraphPage() {
   const { knowledgeBaseId } = useParams()
   const { t } = useTranslation()
   const apiClient = useApiClient()
+  const queryClient = useQueryClient()
   const [selection, setSelection] = useState<GraphSelection | null>(null)
   const [focusStack, setFocusStack] = useState<string[]>([])
   const [knowledgeCheckOpen, setKnowledgeCheckOpen] = useState(false)
@@ -191,12 +194,41 @@ export function KnowledgeBaseGraphPage() {
       isActiveGraphInsightStatus(query.state.data?.status) ? 3000 : false,
     refetchIntervalInBackground: true,
   })
+  const refreshInsightsMutation = useMutation({
+    mutationFn: () =>
+      knowledgeBaseId === undefined
+        ? Promise.reject(new Error("Knowledge Base ID is required."))
+        : apiClient.refreshGraphInsights(knowledgeBaseId),
+    onSuccess: async () => {
+      if (knowledgeBaseId === undefined) {
+        return
+      }
+
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: adminQueryKeys.graph(knowledgeBaseId),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: adminQueryKeys.graphInsights(knowledgeBaseId),
+        }),
+      ])
+    },
+  })
+  const handleRefreshInsights = useCallback(() => {
+    if (knowledgeBaseId === undefined || refreshInsightsMutation.isPending) {
+      return
+    }
+
+    refreshInsightsMutation.mutate()
+  }, [knowledgeBaseId, refreshInsightsMutation])
 
   const graph = graphQuery.data
   const insights = collectInsights(insightsQuery.data)
   const emptyReasons = insightsQuery.data?.empty_reasons ?? {}
   const insightStatus =
-    insightsQuery.data?.status ?? createDefaultGraphInsightStatus()
+    insightsQuery.data?.status ??
+    graph?.graph_readiness ??
+    createDefaultGraphInsightStatus()
   const visibleGraph = useMemo(
     () => filterGraph(graph, focusNodeId),
     [focusNodeId, graph]
@@ -239,7 +271,20 @@ export function KnowledgeBaseGraphPage() {
       ) : null}
       {graphQuery.isError ? (
         <div className="p-6">
-          <ErrorAlert title={t("state.loadFailed")} />
+          <ErrorAlert
+            action={
+              <Button
+                onClick={() => void graphQuery.refetch()}
+                size="sm"
+                type="button"
+                variant="outline"
+              >
+                {t("action.retry")}
+              </Button>
+            }
+            description={t("graph.loadFailedDescription")}
+            title={t("state.loadFailed")}
+          />
         </div>
       ) : null}
       {graph !== null && graph !== undefined && graph.nodes.length === 0 ? (
@@ -284,6 +329,9 @@ export function KnowledgeBaseGraphPage() {
           visibleGraph={visibleGraph}
           insightStatus={insightStatus}
           insights={insights}
+          isInsightsError={insightsQuery.isError}
+          isRefreshPending={refreshInsightsMutation.isPending}
+          onRefresh={handleRefreshInsights}
           onClearSelection={handleClearSelection}
           onDrillDown={(nodeId) =>
             setFocusStack((current) =>
@@ -314,6 +362,9 @@ function GraphWorkbenchDetail({
   graph,
   insightStatus,
   insights,
+  isInsightsError,
+  isRefreshPending,
+  onRefresh,
   onClearSelection,
   onDrillDown,
   onDrillUp,
@@ -329,6 +380,9 @@ function GraphWorkbenchDetail({
   graph: GraphResponse
   insightStatus: GraphInsightStatus
   insights: GraphInsightItem[]
+  isInsightsError: boolean
+  isRefreshPending: boolean
+  onRefresh: () => void
   onClearSelection: () => void
   onDrillDown: (nodeId: string) => void
   onDrillUp: () => void
@@ -415,17 +469,25 @@ function GraphWorkbenchDetail({
       }
       contentClassName="overflow-hidden p-0"
       primary={
-        <GraphWorkbenchPrimary
-          focusNodeId={focusNodeId}
-          graph={graph}
-          insights={insights}
-          onClearSelection={onClearSelection}
-          onSelect={onSelect}
-          selectedEdgeIds={selectionHighlight.selectedEdgeIds}
-          selectedNodeIds={selectionHighlight.selectedNodeIds}
-          selection={selection}
-          visibleGraph={visibleGraph}
-        />
+        <div className="flex h-full min-h-0 flex-col">
+          <GraphReadinessBanner
+            isInsightsError={isInsightsError}
+            isRefreshPending={isRefreshPending}
+            onRefresh={onRefresh}
+            status={insightStatus}
+          />
+          <GraphWorkbenchPrimary
+            focusNodeId={focusNodeId}
+            graph={graph}
+            insights={insights}
+            onClearSelection={onClearSelection}
+            onSelect={onSelect}
+            selectedEdgeIds={selectionHighlight.selectedEdgeIds}
+            selectedNodeIds={selectionHighlight.selectedNodeIds}
+            selection={selection}
+            visibleGraph={visibleGraph}
+          />
+        </div>
       }
       subtitle={
         focusNodeId === null ? (
@@ -436,6 +498,93 @@ function GraphWorkbenchDetail({
       }
       title={t("graph.graphView")}
     />
+  )
+}
+
+function GraphReadinessBanner({
+  isInsightsError,
+  isRefreshPending,
+  onRefresh,
+  status,
+}: {
+  isInsightsError: boolean
+  isRefreshPending: boolean
+  onRefresh: () => void
+  status: GraphInsightStatus
+}) {
+  const { t } = useTranslation()
+  const shouldShow =
+    isInsightsError ||
+    status.state === "queued" ||
+    status.state === "updating" ||
+    status.state === "partial" ||
+    status.state === "stale" ||
+    status.state === "failed"
+
+  if (!shouldShow) {
+    return null
+  }
+
+  const title = isInsightsError
+    ? t("graph.readiness.loadFailedTitle")
+    : t(`graph.readiness.${status.state}.title`)
+  const description = isInsightsError
+    ? t("graph.readiness.loadFailedDescription")
+    : t(`graph.readiness.${status.state}.description`)
+
+  return (
+    <Alert
+      className="m-3 mb-0"
+      variant={
+        status.state === "failed" || isInsightsError ? "destructive" : "default"
+      }
+    >
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <AlertTitle>{title}</AlertTitle>
+          <AlertDescription>
+            <div className="flex flex-col gap-2">
+              <p>{description}</p>
+              <div className="flex flex-wrap gap-2 text-xs">
+                <Badge variant="secondary">
+                  {t("graph.readiness.state", {
+                    state: t(`status.${toStatusLabelKey(status.state)}`),
+                  })}
+                </Badge>
+                {status.updated_at === null ? null : (
+                  <Badge variant="outline">
+                    {t("graph.readiness.updatedAt", {
+                      value: status.updated_at,
+                    })}
+                  </Badge>
+                )}
+                {status.source_job_id === null ? null : (
+                  <Badge variant="outline">
+                    {t("graph.readiness.sourceJob", {
+                      value: status.source_job_id,
+                    })}
+                  </Badge>
+                )}
+              </div>
+              {status.failure_reason === null ? null : (
+                <code className="w-fit rounded border bg-background px-1.5 py-0.5 text-xs">
+                  {status.failure_reason}
+                </code>
+              )}
+            </div>
+          </AlertDescription>
+        </div>
+        <Button
+          disabled={isRefreshPending}
+          onClick={onRefresh}
+          size="sm"
+          type="button"
+          variant="outline"
+        >
+          {t("action.retry")}
+        </Button>
+      </div>
+    </Alert>
   )
 }
 
@@ -548,6 +697,7 @@ function GraphCanvas({
           defaultEdgeColor: "#cbd5e1",
           defaultEdgeType: "arrow",
           defaultNodeColor: "#e2e8f0",
+          defaultNodeType: "circle",
           edgeLabelColor: { color: "#e5e7eb" },
           edgeLabelSize: 12,
           hideEdgesOnMove: false,
@@ -560,6 +710,12 @@ function GraphCanvas({
           renderEdgeLabels: true,
           stagePadding: 42,
           defaultDrawNodeHover: drawGraphNodeHover,
+          nodeProgramClasses: {
+            circle: NodeCircleProgram,
+          },
+          nodeHoverProgramClasses: {
+            circle: NodeCircleProgram,
+          },
           edgeReducer: (_edge, attributes) => reduceSigmaEdge(attributes),
           nodeReducer: (_node, attributes) => reduceSigmaNode(attributes),
         }}

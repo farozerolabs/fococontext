@@ -4,19 +4,17 @@ import { Queue } from "bullmq";
 import { loadRuntimeConfig } from "@fococontext/core";
 import type { RuntimeConfig } from "@fococontext/core";
 import {
+  createPostgresBackgroundOperationCheckpointRepository,
   createPostgresCompileArtifactRepository,
   createPostgresDatabase,
-  migrateToLatest,
+  requireKnowledgeBaseTenantProject,
 } from "@fococontext/db";
 import {
   createOpenAICompatibleChatProvider,
   createOpenAICompatibleVisionCaptionProvider,
   resolveModelProviderProfiles,
 } from "@fococontext/llm";
-import {
-  createS3ObjectStorageAdapter,
-  defaultObjectStorageOperationRecorder,
-} from "@fococontext/storage";
+import { createS3ObjectStorageAdapter } from "@fococontext/storage";
 import { createRapidOcrProvider, type ParserLimitConfig } from "@fococontext/parsers";
 
 import { PostgresWorkerJobProgressWriter } from "./job-progress.postgres-writer.js";
@@ -25,11 +23,35 @@ import {
   PostgresDeletionCleanupDatabaseCleaner,
   DeletionCleanupProcessor,
   deletionCleanupQueueName,
+  PostgresDeletionCleanupManifestPlanner,
   PostgresDeletionCleanupRepository,
   PostgresDeletionCleanupTargetGuard,
 } from "./deletion-cleanup.worker.js";
+import { DocumentProcessingIntermediateCleaner } from "./document-processing-cleanup.js";
 import { PostgresModelCallRecorder } from "./model-call.postgres-recorder.js";
+import {
+  DocumentProcessingRetentionDelegate,
+  PostgresDocumentProcessingStateStore,
+} from "./document-processing-state.js";
+import { createRedisObjectStorageOperationRecorder } from "./redis-object-storage-operation-recorder.js";
+import { createRedisRuntimeQueuePressureRecorder } from "./redis-runtime-queue-pressure.js";
 import { PostgresSourceParseWriter } from "./source-parse.postgres-writer.js";
+import {
+  BullMqKnowledgeCheckWorker,
+  KnowledgeCheckProcessor,
+  knowledgeCheckQueueName,
+  PostgresKnowledgeCheckStore,
+} from "./knowledge-check.worker.js";
+import {
+  BullMqGraphInsightsRefreshWorker,
+  graphInsightsRefreshQueueName,
+  PostgresGraphInsightsRefreshProcessor,
+} from "./graph-insights-refresh.worker.js";
+import {
+  BullMqReindexWorker,
+  createPostgresReindexProcessor,
+  reindexQueueName,
+} from "./reindex.worker.js";
 import {
   BullMqMediaCaptionQueue,
   BullMqMediaCaptionWorker,
@@ -44,9 +66,9 @@ import {
 import {
   BullMqSourceOcrQueue,
   BullMqSourceOcrWorker,
-  PostgresSourceOcrRepository,
   SourceOcrProcessor,
 } from "./source-ocr.worker.js";
+import { PostgresSourceOcrRepository } from "./source-ocr.postgres-repository.js";
 import {
   BullMqWebhookDispatchWorker,
   PostgresWebhookEventEmitter,
@@ -76,32 +98,55 @@ const WORKER_READY_FILE = "/tmp/fococontext-worker-ready";
 async function main(): Promise<void> {
   const config = loadRuntimeConfig(process.env);
 
-  await migrateToLatest(config.database.url);
-
   const db = createPostgresDatabase(config.database.url);
   const webhookEventEmitter = config.webhook.delivery.enabled
     ? new PostgresWebhookEventEmitter(db, config)
     : undefined;
+  const queuePressureRecorder = createRedisRuntimeQueuePressureRecorder(config);
+  const objectStorageOperationRecorder = createRedisObjectStorageOperationRecorder(config);
   const objectStorage = createS3ObjectStorageAdapter(config.storage, {
     instrumentation: {
       caller: "worker.object_storage",
       enabled: config.limits.objectStorageOperations.metricsEnabled,
-      recorder: defaultObjectStorageOperationRecorder,
+      recorder: objectStorageOperationRecorder,
       scope: "system",
     },
     multipartPartSizeBytes: config.limits.objectStorageOperations.multipartPartSizeBytes,
   });
   const artifactRepository = createPostgresCompileArtifactRepository(db);
+  const backgroundOperationCheckpoints = createPostgresBackgroundOperationCheckpointRepository(db);
+  const documentProcessingState = new DocumentProcessingRetentionDelegate(
+    new PostgresDocumentProcessingStateStore(db),
+    {
+      failureRetentionDays: config.limits.documentProcessing.failureRetentionDays,
+      successRetentionDays: config.limits.documentProcessing.successRetentionDays,
+    },
+  );
+  await new DocumentProcessingIntermediateCleaner({
+    batchSize: config.limits.documentProcessing.cleanupBatchSize,
+    objectStorage,
+    stateStore: documentProcessingState,
+  })
+    .cleanupExpired()
+    .catch((error: unknown) => {
+      console.warn("Document processing intermediate cleanup failed.", error);
+    });
   const modelCallRecorder = new PostgresModelCallRecorder(artifactRepository);
   const modelProfiles = resolveModelProviderProfiles(config.models);
   const chatProvider = createOpenAICompatibleChatProvider(modelProfiles.chat);
-  const jobProgress = new PostgresWorkerJobProgressWriter(db, webhookEventEmitter);
+  const jobProgress = new PostgresWorkerJobProgressWriter(
+    db,
+    webhookEventEmitter,
+    queuePressureRecorder,
+  );
   const contextReader = new PostgresWikiCompileContextReader(db);
   const pageEmbeddingIndexer = new OpenAICompatiblePageEmbeddingIndexer(
     db,
     config.models.embedding,
   );
-  const mergeApplier = new PostgresWikiMergeApplier(db, undefined, pageEmbeddingIndexer);
+  const mergeApplier = new PostgresWikiMergeApplier(db, undefined, pageEmbeddingIndexer, {
+    graphInsightBatchSize: config.limits.backgroundJobs.graphInsights.batchSize,
+  });
   const wikiAnalyzeQueue = new BullMqWikiAnalyzeQueue(config);
   const wikiGenerateQueue = new BullMqWikiGenerateQueue(config);
   const wikiMergeQueue = new BullMqWikiMergeQueue(config);
@@ -110,10 +155,20 @@ async function main(): Promise<void> {
     new DeletionCleanupProcessor({
       repository: new PostgresDeletionCleanupRepository(db),
       databaseCleanup: new PostgresDeletionCleanupDatabaseCleaner(db),
+      checkpointRepository: backgroundOperationCheckpoints,
+      manifestPlanner: new PostgresDeletionCleanupManifestPlanner(db),
       targetGuard: new PostgresDeletionCleanupTargetGuard(db),
       ...(webhookEventEmitter === undefined ? {} : { webhookEvents: webhookEventEmitter }),
       objectStorage,
-      objectBatchSize: config.limits.deletionCleanup.objectBatchSize,
+      objectBatchSize: config.limits.backgroundJobs.cleanup.batchSize,
+    }),
+  );
+  const knowledgeCheckWorker = new BullMqKnowledgeCheckWorker(
+    config,
+    new KnowledgeCheckProcessor(new PostgresKnowledgeCheckStore(db), {
+      batchSize: config.limits.backgroundJobs.knowledgeCheck.batchSize,
+      checkpointRepository: backgroundOperationCheckpoints,
+      ...(webhookEventEmitter === undefined ? {} : { webhookEvents: webhookEventEmitter }),
     }),
   );
   const mediaCaptionQueue =
@@ -130,9 +185,12 @@ async function main(): Promise<void> {
           new MediaCaptionProcessor({
             compileQueue: wikiAnalyzeQueue,
             config: {
+              checkpointInterval: config.limits.residualMemory.mediaCaption.checkpointInterval,
               concurrency: config.limits.visionCaption.imageConcurrency,
               contextChars: config.limits.visionCaption.contextChars,
+              maxImageBytes: config.limits.parser.maxImageBytes,
               maxImagesPerDocument: config.limits.visionCaption.maxImagesPerDocument,
+              maxMarkdownBytes: config.limits.parser.maxFileSizeMb * 1024 * 1024,
               maxOutputTokens: config.limits.visionCaption.maxOutputTokens,
               model: modelProfiles.visionCaption.model,
               previewMaxChars: config.limits.objectStorageOperations.previewMaxChars,
@@ -140,11 +198,13 @@ async function main(): Promise<void> {
               requestMaxRetries: modelProfiles.visionCaption.requestMaxRetries,
               retryBaseDelayMs: config.limits.visionCaption.retryBaseDelayMs,
               timeoutSeconds: config.limits.visionCaption.timeoutSeconds,
+              windowSize: config.limits.residualMemory.mediaCaption.windowSize,
             },
             jobGuard: jobProgress,
             jobProgress,
             modelCallRecorder,
             objectStorage,
+            processingState: documentProcessingState,
             repository: new PostgresMediaCaptionRepository(db),
             visionProvider: createOpenAICompatibleVisionCaptionProvider(
               modelProfiles.visionCaption,
@@ -161,6 +221,9 @@ async function main(): Promise<void> {
       jobProgress,
       objectStorage,
       parserLimits: createParserLimitConfig(config.limits.parser),
+      processingState: documentProcessingState,
+      processingStateMarkdownWindowChars: config.limits.documentProcessing.markdownWindowChars,
+      mediaAssetUploadConcurrency: config.limits.parser.mediaUploadConcurrency,
       previewMaxChars: config.limits.objectStorageOperations.previewMaxChars,
       writer: new PostgresSourceParseWriter(db),
     }),
@@ -174,8 +237,10 @@ async function main(): Promise<void> {
             compileQueue: wikiAnalyzeQueue,
             config: {
               concurrency: config.limits.ocr.pageConcurrency,
+              checkpointInterval: config.limits.residualMemory.ocr.checkpointInterval,
               confidenceThreshold: config.limits.ocr.confidenceThreshold,
               languages: config.ocr.languages,
+              maxObjectBytes: config.limits.parser.maxFileSizeMb * 1024 * 1024,
               maxPagePixels: config.limits.ocr.maxPagePixels,
               maxPagesPerDocument: config.limits.ocr.maxPagesPerDocument,
               maxRetries: config.limits.ocr.maxRetries,
@@ -183,6 +248,7 @@ async function main(): Promise<void> {
               retryBaseDelayMs: config.limits.ocr.retryBaseDelayMs,
               storePageImages: config.limits.ocr.storePageImages,
               timeoutSeconds: config.limits.ocr.timeoutSeconds,
+              windowSize: config.limits.residualMemory.ocr.windowSize,
             },
             jobGuard: jobProgress,
             jobProgress,
@@ -195,7 +261,10 @@ async function main(): Promise<void> {
                 ? {}
                 : { apiKey: config.ocr.serviceApiKey }),
             }),
-            repository: new PostgresSourceOcrRepository(db),
+            repository: new PostgresSourceOcrRepository(db, {
+              writeBatchSize: config.limits.backgroundJobs.ocr.batchSize,
+            }),
+            processingState: documentProcessingState,
           }),
         )
       : undefined;
@@ -208,6 +277,7 @@ async function main(): Promise<void> {
       generateQueue: wikiGenerateQueue,
       jobGuard: jobProgress,
       jobProgress,
+      maxParsedMarkdownBytes: config.limits.parser.maxFileSizeMb * 1024 * 1024,
       objectStorage,
       promptLimits: config.limits.compile,
     }),
@@ -228,6 +298,24 @@ async function main(): Promise<void> {
     new WikiMergeProcessorService({
       applier: mergeApplier,
       artifactRepository,
+      jobGuard: jobProgress,
+      jobProgress,
+    }),
+  );
+  const graphInsightsRefreshWorker = new BullMqGraphInsightsRefreshWorker(
+    config,
+    new PostgresGraphInsightsRefreshProcessor(mergeApplier, {
+      checkpointRepository: backgroundOperationCheckpoints,
+      resolveKnowledgeBaseScope: (knowledgeBaseId) =>
+        requireKnowledgeBaseTenantProject(db, knowledgeBaseId),
+    }),
+  );
+  const reindexWorker = new BullMqReindexWorker(
+    config,
+    createPostgresReindexProcessor({
+      checkpointRepository: backgroundOperationCheckpoints,
+      config,
+      db,
       jobGuard: jobProgress,
       jobProgress,
     }),
@@ -259,12 +347,17 @@ async function main(): Promise<void> {
     ...(mediaCaptionWorker === undefined ? [] : [mediaCaptionWorker]),
     ...(sourceOcrWorker === undefined ? [] : [sourceOcrWorker]),
     deletionCleanupWorker,
+    knowledgeCheckWorker,
+    graphInsightsRefreshWorker,
+    reindexWorker,
     wikiAnalyzeWorker,
     wikiGenerateWorker,
     wikiMergeWorker,
     ...(webhookDispatchWorker === undefined ? [] : [webhookDispatchWorker]),
     ...(webhookEventEmitter === undefined ? [] : [webhookEventEmitter]),
     ...(webhookRetryQueue === undefined ? [] : [webhookRetryQueue]),
+    queuePressureRecorder,
+    objectStorageOperationRecorder,
   ];
 
   const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
@@ -284,7 +377,7 @@ async function main(): Promise<void> {
 
   writeFileSync(WORKER_READY_FILE, "ready\n", "utf8");
   console.log(
-    `FocoContext worker runtime started with ${deletionCleanupQueueName}, ${webhookDispatchQueueName}.`,
+    `FocoContext worker runtime started with ${deletionCleanupQueueName}, ${knowledgeCheckQueueName}, ${graphInsightsRefreshQueueName}, ${reindexQueueName}, ${webhookDispatchQueueName}.`,
   );
 }
 
@@ -315,9 +408,9 @@ function createParserLimitConfig(config: RuntimeConfig["limits"]["parser"]): Par
     maxFileSizeBytes,
     timeoutMs: config.timeoutSeconds * 1000,
     zip: {
-      maxEntries: 10_000,
-      maxExpandedBytes: maxFileSizeBytes * 20,
-      maxEntryBytes: maxFileSizeBytes,
+      maxEntries: config.maxZipEntries,
+      maxExpandedBytes: config.maxZipExpandedMb * 1024 * 1024,
+      maxEntryBytes: config.maxZipEntryMb * 1024 * 1024,
     },
     images: {
       maxImagesPerDocument: config.maxImagesPerDocument,

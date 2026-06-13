@@ -22,7 +22,7 @@ export class RetrieveController {
   ) {
     const scope = requireApiKeyScope(request);
 
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.retrieveService.retrieve(knowledgeBaseId, body, scope),
       createRequestId(),
@@ -38,7 +38,7 @@ export class RetrieveController {
   ) {
     const scope = requireApiKeyScope(request);
 
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.retrieveService.expand(knowledgeBaseId, body, scope),
       createRequestId(),

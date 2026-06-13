@@ -1,5 +1,7 @@
 import { Queue } from "bullmq";
-import type { RuntimeConfig } from "@fococontext/core";
+import type { RuntimeConfig, RuntimeQueuePressureRecorder } from "@fococontext/core";
+
+import { recordQueuePressureBackpressure, recordQueuePressureQueued } from "./queue-pressure.js";
 
 export const mediaCaptionQueueToken = Symbol("mediaCaptionQueue");
 export const mediaCaptionQueueName = "media.caption";
@@ -7,6 +9,8 @@ export const mediaCaptionJobName = "media.caption.document";
 
 export interface MediaCaptionQueuePayload {
   job_id: string;
+  tenant_id: string;
+  project_id: string;
   knowledge_base_id: string;
   document_id: string;
   parsed_content_id: string;
@@ -38,7 +42,10 @@ export interface MediaCaptionQueue {
 export class BullMqMediaCaptionQueue implements MediaCaptionQueue {
   private readonly queue: Queue<MediaCaptionQueuePayload>;
 
-  constructor(config: RuntimeConfig) {
+  constructor(
+    config: RuntimeConfig,
+    private readonly queuePressureRecorder?: RuntimeQueuePressureRecorder,
+  ) {
     this.queue = new Queue<MediaCaptionQueuePayload>(mediaCaptionQueueName, {
       connection: {
         url: config.redis.url,
@@ -58,9 +65,23 @@ export class BullMqMediaCaptionQueue implements MediaCaptionQueue {
   async enqueueMediaCaptionJob(
     payload: MediaCaptionQueuePayload,
   ): Promise<EnqueuedMediaCaptionJob> {
-    await this.queue.add(mediaCaptionJobName, payload, {
-      jobId: `${payload.job_id}-caption-${payload.parsed_content_id}`,
-    });
+    try {
+      await this.queue.add(mediaCaptionJobName, payload, {
+        jobId: `${payload.job_id}-caption-${payload.parsed_content_id}`,
+      });
+      await recordQueuePressureQueued({
+        recorder: this.queuePressureRecorder,
+        scopeId: payload.knowledge_base_id,
+        workKind: "source-parse",
+      });
+    } catch (error) {
+      await recordQueuePressureBackpressure({
+        recorder: this.queuePressureRecorder,
+        scopeId: payload.knowledge_base_id,
+        workKind: "source-parse",
+      });
+      throw error;
+    }
 
     return {
       queue_name: mediaCaptionQueueName,
@@ -74,6 +95,9 @@ export class BullMqMediaCaptionQueue implements MediaCaptionQueue {
   }
 }
 
-export function createBullMqMediaCaptionQueue(config: RuntimeConfig): MediaCaptionQueue {
-  return new BullMqMediaCaptionQueue(config);
+export function createBullMqMediaCaptionQueue(
+  config: RuntimeConfig,
+  queuePressureRecorder?: RuntimeQueuePressureRecorder,
+): MediaCaptionQueue {
+  return new BullMqMediaCaptionQueue(config, queuePressureRecorder);
 }

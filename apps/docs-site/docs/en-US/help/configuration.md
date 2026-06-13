@@ -126,6 +126,25 @@ Open Settings and confirm:
 6. Prompt template previews save and validate inside Knowledge Base Settings.
 7. OpenAPI base URL and CORS match the deployment.
 
+## Step 8: Read Runtime Pressure
+
+Settings and `/health` expose deployment-safe pressure signals for large
+Knowledge Bases:
+
+| Signal                                          | Use it for                                         |
+| ----------------------------------------------- | -------------------------------------------------- |
+| `dependencies.migration`                        | Confirm migration startup mode and target schema   |
+| `dependencies.pressure.queue`                   | Detect queued work, active jobs, and retries       |
+| `dependencies.pressure.compile`                 | Detect compile backlog and stage-duration pressure |
+| `dependencies.pressure.objectStorageOperations` | Detect S3-compatible request pressure              |
+| `dependencies.metrics.api`                      | Inspect endpoint latency, list counts, warnings    |
+| `dependencies.metrics.cache`                    | Inspect runtime cache hit and miss behavior        |
+| `dependencies.metrics.retrievalQuality`         | Inspect Retrieve latency, warnings, and stage use  |
+
+Tune only the affected area first: Worker concurrency, parser limits, model
+provider concurrency, S3 multipart sizing, Source Watch cadence, or retrieval
+budgets.
+
 ## Production Notes
 
 - Keep `.env` on the server and out of Git.

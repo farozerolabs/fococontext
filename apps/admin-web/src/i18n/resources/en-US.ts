@@ -90,12 +90,47 @@ export const enUSMessages = {
     exportGraph: "Export graph",
     graphView: "Graph View",
     insights: "Graph Insights",
+    loadFailedDescription:
+      "Graph data could not be loaded. Retry after checking API connectivity and Knowledge Base access.",
     noGraph: "No graph yet",
     noInsights: "No insights",
     noSourceRefs: "No source refs",
     nodes: "Nodes",
     insightMembership: "Insight membership",
     reasonCodes: "Reason codes",
+    readiness: {
+      failed: {
+        description:
+          "Graph refresh failed. Existing graph data may still be visible, but insight freshness is not guaranteed.",
+        title: "Graph refresh failed",
+      },
+      loadFailedDescription:
+        "Graph insight status could not be loaded. Retry to refresh the readiness state.",
+      loadFailedTitle: "Graph readiness unavailable",
+      partial: {
+        description:
+          "Graph insights are partially available. Some signals may still be recomputing or missing.",
+        title: "Graph insights are partial",
+      },
+      queued: {
+        description:
+          "Graph refresh is queued. The graph remains usable while the worker catches up.",
+        title: "Graph refresh queued",
+      },
+      sourceJob: "Source job {{value}}",
+      stale: {
+        description:
+          "Graph data is stale compared with recent Knowledge Base changes. Refresh or wait for the worker to complete.",
+        title: "Graph data is stale",
+      },
+      state: "State {{state}}",
+      updatedAt: "Updated {{value}}",
+      updating: {
+        description:
+          "Graph refresh is running. Results may change while the worker updates graph signals.",
+        title: "Graph refresh running",
+      },
+    },
     relation: "Relation",
     resetFocus: "Reset focus",
     resetView: "Reset view",
@@ -460,20 +495,48 @@ export const enUSMessages = {
     },
     knowledgeBaseJob: "Knowledge Base",
     listTotal: "{{total}} jobs",
+    emptyDescription:
+      "Ingest, retry, OCR, compile, cleanup, and graph refresh jobs appear here after work starts.",
     metadata: "Metadata",
+    backgroundOperation: {
+      failed: "Failed",
+      kind: "Operation",
+      processedOnly: "{{processed}} processed",
+      processedTotal: "{{processed}}/{{total}}",
+      progress: "Progress",
+      stage: "Stage",
+      status: "Status",
+      updated: "Updated",
+    },
+    processing: {
+      empty: "No processing units recorded yet",
+      error: "Error",
+      stage: "Stage",
+      status: "Status",
+      unit: "Unit",
+      updated: "Updated",
+    },
     ingestProgressSummary:
-      "{{completed}}/{{total}} jobs completed · {{progress}}% overall",
+      "{{completed}}/{{total}} jobs completed · {{progress}}% stage-average progress",
+    loadFailedDescription:
+      "Jobs could not be loaded. Retry to request the current page again.",
     retrieveNotReady: "Retrieve is waiting for active ingest jobs",
     retrieveReady: "Retrieve ready",
+    runtimeStatusUnavailable: "Runtime status unavailable",
+    runtimeStatusUnavailableDescription:
+      "Job data is still usable, but queue pressure and degraded runtime warnings cannot be shown until system status loads.",
     retryFailed: "Retry failed",
+    stageAverageProgress: "Stage-average progress",
     viewDetails: "Details",
     section: {
       artifacts: "Artifacts",
       caption: "Caption",
+      backgroundOperations: "Background operations",
       error: "Error",
       logs: "Logs",
       ocr: "OCR",
       parser: "Parser",
+      processingUnits: "Processing units",
       summary: "Summary",
       timeline: "Timeline",
     },
@@ -1056,6 +1119,7 @@ export const enUSMessages = {
       },
       title: "Runtime concurrency",
     },
+    boundedRetrieval: "Bounded retrieval",
     databaseStatus: "Database",
     defaultContext: "Default context",
     embeddingApiKey: "Embedding API key",
@@ -1064,9 +1128,16 @@ export const enUSMessages = {
     embeddingProvider: "Embedding provider",
     envApiKey: "Env API key",
     envFirstBoundary: "Deployment configuration is managed through env.",
+    graphReadiness: "Graph readiness",
     lastSignIn: "Last sign-in",
     maskedKey: "Masked key",
     maskedSecret: "Masked secret",
+    migrationLastOutcome: "Last migration outcome",
+    migrationManagedByStartup:
+      "Database migrations are managed by the startup migration service before API and Worker containers begin serving traffic.",
+    migrationMode: "Migration mode",
+    migrationPendingCount: "Pending migrations",
+    migrationStatus: "Database migration status",
     noValue: "Not available",
     objectStorageOperationMetrics: "S3-compatible operation metrics",
     objectStorageOperationPressure: "S3-compatible operation pressure",
@@ -1089,6 +1160,9 @@ export const enUSMessages = {
     releaseSource: "Release source",
     rerankStatus: "Rerank",
     retrieveLimits: "Retrieve limits",
+    runtimeMetricsStore: "Runtime metrics store",
+    sessionStore: "Session store",
+    sourceEvidenceReadiness: "Source evidence readiness",
     uploadLimits: "Upload limits",
     uploadPressure: "Upload pressure",
     uploadPressureWarning:
@@ -1114,6 +1188,8 @@ export const enUSMessages = {
     webhookSecret: "Webhook secret",
     workerRelease: "Worker release metadata",
     workerStatus: "Worker",
+    loadFailedDescription:
+      "System settings could not be loaded. Retry to refresh runtime, storage, migration, and pressure status.",
   },
   outputLanguage: {
     auto: "Auto",
@@ -1193,10 +1269,12 @@ export const enUSMessages = {
     rolledBack: "Rolled back",
     running: "Running",
     resolved: "Resolved",
+    seeded: "Seeded",
     skipped: "Skipped",
     stale: "Stale",
     uploaded: "Uploaded",
     outdated: "Outdated",
+    updating: "Updating",
     unavailable: "Unavailable",
     limited: "Limited",
     unknown: "Unknown",
@@ -1212,12 +1290,18 @@ export const enUSMessages = {
   },
   apiError: {
     forbidden: "Forbidden.",
+    admission_limited: "The request was limited by admission control.",
+    export_limit_exceeded: "Export limit exceeded.",
+    evidence_limit_exceeded: "Source evidence limit exceeded.",
     internal_error: "Internal error.",
     invalid_api_key: "Invalid API key.",
     invalid_request: "Invalid request.",
     knowledge_base_not_found: "Knowledge base not found.",
+    rate_limited: "Too many requests. Try again later.",
+    request_size_limit_exceeded: "Request size limit exceeded.",
     resource_cleanup_pending: "Resource cleanup is pending.",
     resource_deleted: "Resource has been deleted.",
+    retrieve_limit_exceeded: "Retrieve limit exceeded.",
   },
   version: {
     addedPages: "Added pages",

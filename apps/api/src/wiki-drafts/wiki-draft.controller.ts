@@ -21,7 +21,7 @@ export class WikiDraftController {
   ) {
     const scope = requireApiKeyScope(request);
 
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.wikiDraftService.submit(knowledgeBaseId, request.body, scope),
       createRequestId(),

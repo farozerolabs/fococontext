@@ -1,0 +1,5050 @@
+import { sql, type Kysely } from "kysely";
+import { webhookEventTypes, type WebhookEventType } from "@fococontext/contracts";
+import type { DatabaseSchema } from "@fococontext/db";
+
+import type {
+  JobEventRecord,
+  JobRecord,
+  JobStage,
+  JobStatus,
+  BackgroundOperationRecord,
+  DocumentProcessingStage,
+  DocumentProcessingUnitRecord,
+  DocumentProcessingUnitStatus,
+  MediaAssetRecord,
+  ParsedContentRecord,
+  SourceDocumentRecord,
+  SourceDocumentStatus,
+  SourceVisibilityOrigin,
+  SourceType,
+  UploadSessionRecord,
+} from "../documents/document.types.js";
+import type {
+  DeletionCleanupItemRecord,
+  DeletionCleanupItemStatus,
+  DeletionCleanupOperationRecord,
+  DeletionCleanupPhase,
+  DeletionCleanupStatus,
+  DeletionCleanupTargetType,
+} from "../deletion-cleanup/deletion-cleanup.types.js";
+import type { BatchImportItemRecord, BatchImportRecord } from "../imports/batch-import.types.js";
+import type {
+  ScheduledImportJobRecord,
+  SourceWatchDiscoveredSource,
+  SourceWatchLatestScanResponse,
+  SourceWatchRuleRecord,
+  SourceWatchRuleSchedule,
+  SourceWatchRuleStatus,
+  SourceWatchScanItemKind,
+  SourceWatchScanResultResponse,
+  SourceWatchScanStatus,
+  SourceWatchScanStageItem,
+  SourceWatchScanTriggerType,
+  SourceWatchSchedulerStatus,
+  SourceWatchSourceKind,
+} from "../source-watch/source-watch.types.js";
+import { compareDiscoveredSources } from "../source-watch/source-watch-discovery-compare.js";
+import type {
+  WebhookDeliveryRecord,
+  WebhookDeliveryStatus,
+  WebhookRecord,
+  WebhookStatus,
+} from "../webhooks/webhook.types.js";
+import type { ApiResourceScope } from "../auth/api-key.guard.js";
+import type {
+  DatasetConfigurationResponse,
+  DatasetConfigurationStatus,
+  DatasetConfigurationValues,
+  ForkOwnerType,
+  KnowledgeBaseOutputLanguage,
+  KnowledgeBaseResponse,
+  KnowledgeBaseStatus,
+  KnowledgeBaseSyncStatus,
+  KnowledgeBaseTemplate,
+  KnowledgeBaseType,
+} from "../knowledge-bases/knowledge-base.types.js";
+import {
+  knowledgeCheckTypes,
+  type KnowledgeCheckRecord,
+  type KnowledgeCheckFinding,
+  type KnowledgeCheckSemanticRun,
+  type KnowledgeCheckStatus,
+  type KnowledgeCheckType,
+} from "../knowledge-checks/knowledge-check.types.js";
+
+export const operationalReadStoreToken = Symbol("operationalReadStore");
+
+export interface PaginatedReadInput {
+  knowledgeBaseId: string;
+  page: number;
+  pageSize: number;
+}
+
+export interface PaginatedJobReadResult {
+  items: JobRecord[];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface SourceDocumentReadInput extends PaginatedReadInput {
+  keyword?: string;
+  status?: SourceDocumentStatus;
+  sourceType?: SourceType;
+}
+
+export interface SourceWatchDocumentReadInput {
+  knowledgeBaseId: string;
+  sourceWatchRuleId: string;
+}
+
+export interface SourceWatchDiscoveryComparisonReadInput {
+  comparisonWindowSize?: number;
+  rule: SourceWatchRuleRecord;
+  scannedSources: readonly SourceWatchDiscoveredSource[];
+}
+
+export interface SourceWatchDiscoveryComparisonReadResult {
+  changedSources: SourceWatchDiscoveredSource[];
+  deleteCandidates: SourceWatchScanResultResponse["delete_candidates"];
+  newSources: SourceWatchDiscoveredSource[];
+}
+
+export interface SourceWatchDiscoveryWindowComparisonReadInput {
+  comparisonWindowSize?: number;
+  rule: SourceWatchRuleRecord;
+  scannedSources: readonly SourceWatchDiscoveredSource[];
+}
+
+export interface SourceWatchDiscoveryWindowComparisonReadResult {
+  changedSources: SourceWatchDiscoveredSource[];
+  newSources: SourceWatchDiscoveredSource[];
+}
+
+export interface SourceWatchMissingScanDeleteCandidateReadInput extends Omit<
+  PaginatedReadInput,
+  "knowledgeBaseId"
+> {
+  rule: SourceWatchRuleRecord;
+  scheduledImportJobId: string;
+}
+
+export interface PaginatedSourceWatchDeleteCandidateReadResult {
+  items: SourceWatchScanResultResponse["delete_candidates"];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface SourceWatchFingerprintReadInput {
+  knowledgeBaseId: string;
+  sourcePath: string;
+  sourceWatchRuleId: string;
+  fingerprint: string;
+}
+
+export interface PaginatedSourceDocumentReadResult {
+  items: SourceDocumentRecord[];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface PaginatedMediaAssetReadResult {
+  items: MediaAssetRecord[];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface DocumentProcessingUnitReadInput extends Omit<
+  PaginatedReadInput,
+  "knowledgeBaseId"
+> {
+  jobId?: string;
+  stage?: DocumentProcessingStage;
+  status?: DocumentProcessingUnitStatus;
+}
+
+export interface PaginatedDocumentProcessingUnitReadResult {
+  items: DocumentProcessingUnitRecord[];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface ReferencedObjectKeyReadInput {
+  knowledgeBaseId: string;
+  documentId: string;
+  objectKeys: readonly string[];
+}
+
+export interface PaginatedSourceWatchRuleReadResult {
+  items: SourceWatchRuleRecord[];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface PaginatedScheduledImportJobReadResult {
+  items: ScheduledImportJobRecord[];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface PaginatedBatchImportItemReadResult {
+  items: BatchImportItemRecord[];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface SourceWatchScanItemReadInput extends Omit<PaginatedReadInput, "knowledgeBaseId"> {
+  itemKind?: SourceWatchScanItemKind;
+  scheduledImportJobId: string;
+}
+
+export interface PaginatedSourceWatchScanItemReadResult {
+  items: SourceWatchScanStageItem[];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface PaginatedWebhookReadResult {
+  items: WebhookRecord[];
+  latestDeliveriesByWebhookId: Map<string, WebhookDeliveryRecord>;
+  total: number;
+  hasMore: boolean;
+}
+
+export interface PaginatedWebhookDeliveryReadResult {
+  items: WebhookDeliveryRecord[];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface WebhookDetailReadResult {
+  webhook: WebhookRecord;
+  latestDelivery: WebhookDeliveryRecord | null;
+}
+
+export interface KnowledgeBaseReadInput extends Omit<PaginatedReadInput, "knowledgeBaseId"> {
+  keyword?: string;
+  status?: string;
+}
+
+export interface KnowledgeBaseForkReadInput extends KnowledgeBaseReadInput {
+  upstreamKnowledgeBaseId: string;
+}
+
+export interface PaginatedKnowledgeBaseReadResult {
+  items: KnowledgeBaseResponse[];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface KnowledgeCheckReadInput extends PaginatedReadInput {
+  status?: KnowledgeCheckStatus;
+}
+
+export interface PaginatedKnowledgeCheckReadResult {
+  items: KnowledgeCheckRecord[];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface KnowledgeCheckFindingReadInput extends Omit<
+  PaginatedReadInput,
+  "knowledgeBaseId"
+> {
+  checkId: string;
+}
+
+export interface PaginatedKnowledgeCheckFindingReadResult {
+  items: KnowledgeCheckFinding[];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface DeletionCleanupReadInput extends Omit<PaginatedReadInput, "knowledgeBaseId"> {
+  knowledgeBaseId?: string;
+  status?: DeletionCleanupStatus;
+}
+
+export interface PaginatedDeletionCleanupReadResult {
+  items: DeletionCleanupOperationRecord[];
+  itemsByOperationId: Map<string, DeletionCleanupItemRecord[]>;
+  total: number;
+  hasMore: boolean;
+}
+
+export interface DeletionCleanupDetailReadResult {
+  operation: DeletionCleanupOperationRecord;
+  items: DeletionCleanupItemRecord[];
+  itemTotal: number;
+  itemHasMore: boolean;
+}
+
+export interface KnowledgeBaseIngestProgressReadResult {
+  counts: Record<JobStatus, number>;
+  stageCounts: Record<JobStage, number>;
+  latestJobCreatedAt: string | null;
+  latestJobUpdatedAt: string | null;
+  overallProgress: number;
+  representativeJobs: JobRecord[];
+}
+
+export interface RuntimeSourceJobDurationSummary {
+  count: number;
+  avgMs: number;
+  maxMs: number;
+  minMs: number;
+  latestMs: number;
+}
+
+export interface RuntimeSourceJobSummary {
+  activeJobs: number;
+  queueDepth: number;
+  retryCount: number;
+  stageCounts: Record<JobStage, number>;
+  stageDurations: Record<string, RuntimeSourceJobDurationSummary>;
+  statusCounts: Record<JobStatus, number>;
+  total: number;
+}
+
+export interface DeletionCleanupQueueSummary {
+  failed: number;
+  pending: number;
+}
+
+export interface OperationalReadStore {
+  readonly supportsOperationalReads: boolean;
+  getKnowledgeBaseById(
+    scope: ApiResourceScope,
+    knowledgeBaseId: string,
+  ): Promise<KnowledgeBaseResponse | null>;
+  getKnowledgeBaseResourceScope(knowledgeBaseId: string): Promise<ApiResourceScope | null>;
+  getDatasetConfigurationByKnowledgeBaseId(
+    scope: ApiResourceScope,
+    knowledgeBaseId: string,
+  ): Promise<DatasetConfigurationResponse | null>;
+  listKnowledgeBases(
+    scope: ApiResourceScope,
+    input: KnowledgeBaseReadInput,
+  ): Promise<PaginatedKnowledgeBaseReadResult | null>;
+  listKnowledgeBaseForks(
+    scope: ApiResourceScope,
+    input: KnowledgeBaseForkReadInput,
+  ): Promise<PaginatedKnowledgeBaseReadResult | null>;
+  listKnowledgeChecks(
+    input: KnowledgeCheckReadInput,
+  ): Promise<PaginatedKnowledgeCheckReadResult | null>;
+  getKnowledgeCheckById(checkId: string): Promise<KnowledgeCheckRecord | null>;
+  listKnowledgeCheckFindings(
+    input: KnowledgeCheckFindingReadInput,
+  ): Promise<PaginatedKnowledgeCheckFindingReadResult | null>;
+  listJobs(input: PaginatedReadInput): Promise<PaginatedJobReadResult | null>;
+  listSourceDocuments(
+    input: SourceDocumentReadInput,
+  ): Promise<PaginatedSourceDocumentReadResult | null>;
+  listSourceWatchDocuments(
+    input: SourceWatchDocumentReadInput,
+  ): Promise<SourceDocumentRecord[] | null>;
+  compareSourceWatchDiscoveredSources(
+    input: SourceWatchDiscoveryComparisonReadInput,
+  ): Promise<SourceWatchDiscoveryComparisonReadResult | null>;
+  compareSourceWatchDiscoveredSourceWindow(
+    input: SourceWatchDiscoveryWindowComparisonReadInput,
+  ): Promise<SourceWatchDiscoveryWindowComparisonReadResult | null>;
+  listSourceWatchDeleteCandidatesMissingFromScan(
+    input: SourceWatchMissingScanDeleteCandidateReadInput,
+  ): Promise<PaginatedSourceWatchDeleteCandidateReadResult | null>;
+  hasMatchingSourceWatchFingerprint(
+    input: SourceWatchFingerprintReadInput,
+  ): Promise<boolean | null>;
+  getSourceDocumentById(documentId: string): Promise<SourceDocumentRecord | null>;
+  getVisibleSourceDocumentById(
+    knowledgeBaseId: string,
+    documentId: string,
+  ): Promise<SourceDocumentRecord | null>;
+  getUploadSessionById(uploadSessionId: string): Promise<UploadSessionRecord | null>;
+  getUploadSessionByIdempotencyKey(input: {
+    actorId: string;
+    actorType: string;
+    idempotencyKey: string;
+    knowledgeBaseId: string;
+    projectId: string;
+    tenantId: string;
+  }): Promise<UploadSessionRecord | null>;
+  listExpiredCreatedUploadSessions(now: string, limit: number): Promise<UploadSessionRecord[]>;
+  getLatestJobByDocumentId(documentId: string): Promise<JobRecord | null>;
+  listJobsByDocumentId(documentId: string): Promise<JobRecord[]>;
+  getJobByIdempotencyKey(
+    knowledgeBaseId: string,
+    idempotencyKey: string,
+  ): Promise<JobRecord | null>;
+  getParsedContentByDocumentId(documentId: string): Promise<ParsedContentRecord | null>;
+  listMediaAssetsByDocumentId(
+    documentId: string,
+    input: Omit<PaginatedReadInput, "knowledgeBaseId">,
+  ): Promise<PaginatedMediaAssetReadResult | null>;
+  listDocumentProcessingUnitsByDocumentId(
+    documentId: string,
+    input: DocumentProcessingUnitReadInput,
+  ): Promise<PaginatedDocumentProcessingUnitReadResult | null>;
+  getMediaAssetById(mediaAssetId: string): Promise<MediaAssetRecord | null>;
+  findReferencedObjectKeys(input: ReferencedObjectKeyReadInput): Promise<Set<string>>;
+  listWikiPageRecordsBySourceDocumentId(
+    knowledgeBaseId: string,
+    documentId: string,
+    limit: number,
+  ): Promise<Record<string, unknown>[] | null>;
+  listWikiPageVersionRecordsByPageIds(
+    pageIds: readonly string[],
+    limit: number,
+  ): Promise<Record<string, unknown>[] | null>;
+  listSourceWatchRules(
+    input: PaginatedReadInput,
+  ): Promise<PaginatedSourceWatchRuleReadResult | null>;
+  getSourceWatchRuleById(ruleId: string): Promise<SourceWatchRuleRecord | null>;
+  listDueSourceWatchRules(now: string, limit: number): Promise<SourceWatchRuleRecord[]>;
+  getJobById(jobId: string): Promise<JobRecord | null>;
+  listJobsByIds(jobIds: readonly string[]): Promise<Map<string, JobRecord>>;
+  listBackgroundOperationsByJobIds(
+    jobIds: readonly string[],
+  ): Promise<Map<string, BackgroundOperationRecord[]>>;
+  listScheduledImportJobsByRuleId(
+    ruleId: string,
+    input: Omit<PaginatedReadInput, "knowledgeBaseId">,
+  ): Promise<PaginatedScheduledImportJobReadResult | null>;
+  getBatchImportById(batchId: string): Promise<BatchImportRecord | null>;
+  listBatchImportItems(
+    batchId: string,
+    input: Omit<PaginatedReadInput, "knowledgeBaseId">,
+  ): Promise<PaginatedBatchImportItemReadResult | null>;
+  getScheduledImportJobById(jobId: string): Promise<ScheduledImportJobRecord | null>;
+  listSourceWatchScanItems(
+    input: SourceWatchScanItemReadInput,
+  ): Promise<PaginatedSourceWatchScanItemReadResult | null>;
+  listWebhooks(
+    scope: ApiResourceScope,
+    input: Omit<PaginatedReadInput, "knowledgeBaseId">,
+  ): Promise<PaginatedWebhookReadResult | null>;
+  getWebhookById(
+    scope: ApiResourceScope,
+    webhookId: string,
+  ): Promise<WebhookDetailReadResult | null>;
+  listMatchingWebhooks(input: {
+    scope: ApiResourceScope;
+    eventType: WebhookEventType;
+    knowledgeBaseId: string | null;
+  }): Promise<WebhookRecord[]>;
+  listWebhookDeliveriesByWebhookId(
+    webhookId: string,
+    input: Omit<PaginatedReadInput, "knowledgeBaseId">,
+  ): Promise<PaginatedWebhookDeliveryReadResult | null>;
+  listDeletionCleanupOperations(
+    scope: ApiResourceScope,
+    input: DeletionCleanupReadInput,
+  ): Promise<PaginatedDeletionCleanupReadResult | null>;
+  getDeletionCleanupOperationById(
+    scope: ApiResourceScope,
+    operationId: string,
+    input: Omit<PaginatedReadInput, "knowledgeBaseId">,
+  ): Promise<DeletionCleanupDetailReadResult | null>;
+  listJobEventsByJobIds(jobIds: readonly string[]): Promise<Map<string, JobEventRecord[]>>;
+  getKnowledgeBaseIngestProgress(
+    knowledgeBaseId: string,
+    representativeJobLimit: number,
+  ): Promise<KnowledgeBaseIngestProgressReadResult | null>;
+  getRuntimeSourceJobSummary(): Promise<RuntimeSourceJobSummary>;
+  getDeletionCleanupQueueSummary(): Promise<DeletionCleanupQueueSummary>;
+}
+
+export function createNoopOperationalReadStore(): OperationalReadStore {
+  return {
+    supportsOperationalReads: false,
+    async listKnowledgeBases() {
+      return null;
+    },
+    async listKnowledgeBaseForks() {
+      return null;
+    },
+    async listKnowledgeChecks() {
+      return null;
+    },
+    async getKnowledgeCheckById() {
+      return null;
+    },
+    async listKnowledgeCheckFindings() {
+      return null;
+    },
+    async getKnowledgeBaseById() {
+      return null;
+    },
+    async getKnowledgeBaseResourceScope() {
+      return null;
+    },
+    async getDatasetConfigurationByKnowledgeBaseId() {
+      return null;
+    },
+    async listJobs() {
+      return null;
+    },
+    async listSourceDocuments() {
+      return null;
+    },
+    async listSourceWatchDocuments() {
+      return null;
+    },
+    async compareSourceWatchDiscoveredSources() {
+      return null;
+    },
+    async compareSourceWatchDiscoveredSourceWindow() {
+      return null;
+    },
+    async listSourceWatchDeleteCandidatesMissingFromScan() {
+      return null;
+    },
+    async hasMatchingSourceWatchFingerprint() {
+      return null;
+    },
+    async getSourceDocumentById() {
+      return null;
+    },
+    async getVisibleSourceDocumentById() {
+      return null;
+    },
+    async getUploadSessionById() {
+      return null;
+    },
+    async getUploadSessionByIdempotencyKey() {
+      return null;
+    },
+    async listExpiredCreatedUploadSessions() {
+      return [];
+    },
+    async getLatestJobByDocumentId() {
+      return null;
+    },
+    async listJobsByDocumentId() {
+      return [];
+    },
+    async getJobByIdempotencyKey() {
+      return null;
+    },
+    async getParsedContentByDocumentId() {
+      return null;
+    },
+    async listMediaAssetsByDocumentId() {
+      return null;
+    },
+    async listDocumentProcessingUnitsByDocumentId() {
+      return null;
+    },
+    async getMediaAssetById() {
+      return null;
+    },
+    async findReferencedObjectKeys() {
+      return new Set();
+    },
+    async listWikiPageRecordsBySourceDocumentId() {
+      return null;
+    },
+    async listWikiPageVersionRecordsByPageIds() {
+      return null;
+    },
+    async listSourceWatchRules() {
+      return null;
+    },
+    async getSourceWatchRuleById() {
+      return null;
+    },
+    async listDueSourceWatchRules() {
+      return [];
+    },
+    async getJobById() {
+      return null;
+    },
+    async listJobsByIds() {
+      return new Map();
+    },
+    async listBackgroundOperationsByJobIds() {
+      return new Map();
+    },
+    async listScheduledImportJobsByRuleId() {
+      return null;
+    },
+    async getBatchImportById() {
+      return null;
+    },
+    async listBatchImportItems() {
+      return null;
+    },
+    async getScheduledImportJobById() {
+      return null;
+    },
+    async listSourceWatchScanItems() {
+      return null;
+    },
+    async listWebhooks() {
+      return null;
+    },
+    async getWebhookById() {
+      return null;
+    },
+    async listMatchingWebhooks() {
+      return [];
+    },
+    async listWebhookDeliveriesByWebhookId() {
+      return null;
+    },
+    async listDeletionCleanupOperations() {
+      return null;
+    },
+    async getDeletionCleanupOperationById() {
+      return null;
+    },
+    async listJobEventsByJobIds() {
+      return new Map();
+    },
+    async getKnowledgeBaseIngestProgress() {
+      return null;
+    },
+    async getRuntimeSourceJobSummary() {
+      return createEmptyRuntimeSourceJobSummary();
+    },
+    async getDeletionCleanupQueueSummary() {
+      return {
+        failed: 0,
+        pending: 0,
+      };
+    },
+  };
+}
+
+export function createPostgresOperationalReadStore(
+  db: Kysely<DatabaseSchema>,
+): OperationalReadStore {
+  return new PostgresOperationalReadStore(db);
+}
+
+class PostgresOperationalReadStore implements OperationalReadStore {
+  readonly supportsOperationalReads = true;
+
+  constructor(private readonly db: Kysely<DatabaseSchema>) {}
+
+  async getKnowledgeBaseById(
+    scope: ApiResourceScope,
+    knowledgeBaseId: string,
+  ): Promise<KnowledgeBaseResponse | null> {
+    const result = await sql<KnowledgeBaseRow>`
+      select
+        knowledge_bases.id,
+        knowledge_bases.name,
+        knowledge_bases.slug,
+        knowledge_bases.description,
+        knowledge_bases.knowledge_base_type,
+        knowledge_bases.upstream_knowledge_base_id,
+        knowledge_bases.upstream_base_version_id,
+        knowledge_bases.upstream_synced_version_id,
+        knowledge_bases.fork_owner_type,
+        knowledge_bases.fork_owner_external_id,
+        knowledge_bases.fork_owner_display_name,
+        knowledge_bases.sync_status,
+        knowledge_bases.template,
+        knowledge_bases.output_language,
+        knowledge_bases.status,
+        knowledge_bases.current_version_id,
+        knowledge_bases.created_at,
+        knowledge_bases.updated_at,
+        knowledge_base_settings.purpose,
+        knowledge_base_settings.wiki_schema,
+        knowledge_base_settings.retrieval_settings
+      from knowledge_bases
+      left join knowledge_base_settings
+        on knowledge_base_settings.knowledge_base_id = knowledge_bases.id
+      where knowledge_bases.tenant_id = ${scope.tenantId}
+        and knowledge_bases.project_id = ${scope.projectId}
+        and knowledge_bases.id = ${knowledgeBaseId}
+        and knowledge_bases.deleted_at is null
+        and knowledge_bases.status <> 'deleted'
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toKnowledgeBaseResponse(row);
+  }
+
+  async getKnowledgeBaseResourceScope(knowledgeBaseId: string): Promise<ApiResourceScope | null> {
+    const result = await sql<{ tenant_id: string; project_id: string }>`
+      select tenant_id, project_id
+      from knowledge_bases
+      where id = ${knowledgeBaseId}
+        and deleted_at is null
+        and status <> 'deleted'
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined
+      ? null
+      : {
+          projectId: row.project_id,
+          tenantId: row.tenant_id,
+        };
+  }
+
+  async getDatasetConfigurationByKnowledgeBaseId(
+    scope: ApiResourceScope,
+    knowledgeBaseId: string,
+  ): Promise<DatasetConfigurationResponse | null> {
+    const result = await sql<DatasetConfigurationRow>`
+      select
+        knowledge_base_dataset_configurations.id,
+        knowledge_base_dataset_configurations.knowledge_base_id,
+        knowledge_base_dataset_configurations.preset_id,
+        knowledge_base_dataset_configurations.status,
+        knowledge_base_dataset_configurations.version,
+        knowledge_base_dataset_configurations.values,
+        knowledge_base_dataset_configurations.latest_snapshot_id,
+        knowledge_base_dataset_configurations.updated_by,
+        knowledge_base_dataset_configurations.metadata,
+        knowledge_base_dataset_configurations.created_at,
+        knowledge_base_dataset_configurations.updated_at
+      from knowledge_base_dataset_configurations
+      inner join knowledge_bases
+        on knowledge_bases.id = knowledge_base_dataset_configurations.knowledge_base_id
+      where knowledge_bases.tenant_id = ${scope.tenantId}
+        and knowledge_bases.project_id = ${scope.projectId}
+        and knowledge_bases.id = ${knowledgeBaseId}
+        and knowledge_bases.deleted_at is null
+        and knowledge_bases.status <> 'deleted'
+        and knowledge_base_dataset_configurations.status = 'active'
+      order by knowledge_base_dataset_configurations.version desc
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toDatasetConfigurationResponse(row);
+  }
+
+  async listKnowledgeBases(
+    scope: ApiResourceScope,
+    input: KnowledgeBaseReadInput,
+  ): Promise<PaginatedKnowledgeBaseReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const keyword = input.keyword?.trim().toLowerCase() || null;
+    const status = input.status?.trim() || null;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<KnowledgeBaseRow>`
+        select
+          knowledge_bases.id,
+          knowledge_bases.name,
+          knowledge_bases.slug,
+          knowledge_bases.description,
+          knowledge_bases.knowledge_base_type,
+          knowledge_bases.upstream_knowledge_base_id,
+          knowledge_bases.upstream_base_version_id,
+          knowledge_bases.upstream_synced_version_id,
+          knowledge_bases.fork_owner_type,
+          knowledge_bases.fork_owner_external_id,
+          knowledge_bases.fork_owner_display_name,
+          knowledge_bases.sync_status,
+          knowledge_bases.template,
+          knowledge_bases.output_language,
+          knowledge_bases.status,
+          knowledge_bases.current_version_id,
+          knowledge_bases.created_at,
+          knowledge_bases.updated_at,
+          knowledge_base_settings.purpose,
+          knowledge_base_settings.wiki_schema,
+          knowledge_base_settings.retrieval_settings
+        from knowledge_bases
+        left join knowledge_base_settings
+          on knowledge_base_settings.knowledge_base_id = knowledge_bases.id
+        where knowledge_bases.tenant_id = ${scope.tenantId}
+          and knowledge_bases.project_id = ${scope.projectId}
+          and knowledge_bases.deleted_at is null
+          and knowledge_bases.status <> 'deleted'
+          and (${status}::text is null or knowledge_bases.status = ${status})
+          and (
+            ${keyword}::text is null
+            or position(
+              ${keyword}::text in lower(concat_ws(
+                ' ',
+                knowledge_bases.id,
+                knowledge_bases.name,
+                knowledge_bases.slug
+              ))
+            ) > 0
+          )
+        order by knowledge_bases.updated_at desc, knowledge_bases.id desc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from knowledge_bases
+        where tenant_id = ${scope.tenantId}
+          and project_id = ${scope.projectId}
+          and deleted_at is null
+          and status <> 'deleted'
+          and (${status}::text is null or status = ${status})
+          and (
+            ${keyword}::text is null
+            or position(
+              ${keyword}::text in lower(concat_ws(' ', id, name, slug))
+            ) > 0
+          )
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items: itemsResult.rows.map(toKnowledgeBaseResponse),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
+  async listKnowledgeBaseForks(
+    scope: ApiResourceScope,
+    input: KnowledgeBaseForkReadInput,
+  ): Promise<PaginatedKnowledgeBaseReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const keyword = input.keyword?.trim().toLowerCase() || null;
+    const status = input.status?.trim() || null;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<KnowledgeBaseRow>`
+        select
+          knowledge_bases.id,
+          knowledge_bases.name,
+          knowledge_bases.slug,
+          knowledge_bases.description,
+          knowledge_bases.knowledge_base_type,
+          knowledge_bases.upstream_knowledge_base_id,
+          knowledge_bases.upstream_base_version_id,
+          knowledge_bases.upstream_synced_version_id,
+          knowledge_bases.fork_owner_type,
+          knowledge_bases.fork_owner_external_id,
+          knowledge_bases.fork_owner_display_name,
+          knowledge_bases.sync_status,
+          knowledge_bases.template,
+          knowledge_bases.output_language,
+          knowledge_bases.status,
+          knowledge_bases.current_version_id,
+          knowledge_bases.created_at,
+          knowledge_bases.updated_at,
+          knowledge_base_settings.purpose,
+          knowledge_base_settings.wiki_schema,
+          knowledge_base_settings.retrieval_settings
+        from knowledge_bases
+        left join knowledge_base_settings
+          on knowledge_base_settings.knowledge_base_id = knowledge_bases.id
+        where knowledge_bases.tenant_id = ${scope.tenantId}
+          and knowledge_bases.project_id = ${scope.projectId}
+          and knowledge_bases.deleted_at is null
+          and knowledge_bases.status <> 'deleted'
+          and knowledge_bases.knowledge_base_type = 'fork'
+          and knowledge_bases.upstream_knowledge_base_id = ${input.upstreamKnowledgeBaseId}
+          and (${status}::text is null or knowledge_bases.status = ${status})
+          and (
+            ${keyword}::text is null
+            or position(
+              ${keyword}::text in lower(concat_ws(
+                ' ',
+                knowledge_bases.id,
+                knowledge_bases.name,
+                knowledge_bases.slug,
+                knowledge_bases.fork_owner_external_id,
+                knowledge_bases.fork_owner_display_name
+              ))
+            ) > 0
+          )
+        order by knowledge_bases.updated_at desc, knowledge_bases.id desc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from knowledge_bases
+        where tenant_id = ${scope.tenantId}
+          and project_id = ${scope.projectId}
+          and deleted_at is null
+          and status <> 'deleted'
+          and knowledge_base_type = 'fork'
+          and upstream_knowledge_base_id = ${input.upstreamKnowledgeBaseId}
+          and (${status}::text is null or status = ${status})
+          and (
+            ${keyword}::text is null
+            or position(
+              ${keyword}::text in lower(concat_ws(
+                ' ',
+                id,
+                name,
+                slug,
+                fork_owner_external_id,
+                fork_owner_display_name
+              ))
+            ) > 0
+          )
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items: itemsResult.rows.map(toKnowledgeBaseResponse),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
+  async listKnowledgeChecks(
+    input: KnowledgeCheckReadInput,
+  ): Promise<PaginatedKnowledgeCheckReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const status = input.status ?? null;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<KnowledgeCheckRow>`
+        select
+          knowledge_checks.id,
+          knowledge_checks.knowledge_base_id,
+          knowledge_checks.status,
+          knowledge_checks.progress,
+          knowledge_checks.findings,
+          finding_preview.findings_preview,
+          finding_count.findings_count,
+          knowledge_checks.metadata,
+          knowledge_checks.created_at,
+          knowledge_checks.updated_at
+        from knowledge_checks
+        left join lateral (
+          select coalesce(jsonb_agg(ordered.finding order by ordered.created_at asc, ordered.id asc), '[]'::jsonb) as findings_preview
+          from (
+            select id, finding, created_at
+            from knowledge_check_findings
+            where check_id = knowledge_checks.id
+              and status = 'active'
+            order by created_at asc, id asc
+            limit 100
+          ) ordered
+        ) finding_preview on true
+        left join lateral (
+          select count(*) as findings_count
+          from knowledge_check_findings
+          where check_id = knowledge_checks.id
+            and status = 'active'
+        ) finding_count on true
+        where knowledge_checks.knowledge_base_id = ${input.knowledgeBaseId}
+          and (${status}::text is null or knowledge_checks.status = ${status})
+        order by knowledge_checks.updated_at desc, knowledge_checks.id desc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from knowledge_checks
+        where knowledge_base_id = ${input.knowledgeBaseId}
+          and (${status}::text is null or status = ${status})
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items: itemsResult.rows.map(toKnowledgeCheckRecord),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
+  async getKnowledgeCheckById(checkId: string): Promise<KnowledgeCheckRecord | null> {
+    const result = await sql<KnowledgeCheckRow>`
+      select
+        knowledge_checks.id,
+        knowledge_checks.knowledge_base_id,
+        knowledge_checks.status,
+        knowledge_checks.progress,
+        knowledge_checks.findings,
+        finding_preview.findings_preview,
+        finding_count.findings_count,
+        knowledge_checks.metadata,
+        knowledge_checks.created_at,
+        knowledge_checks.updated_at
+      from knowledge_checks
+      left join lateral (
+        select coalesce(jsonb_agg(ordered.finding order by ordered.created_at asc, ordered.id asc), '[]'::jsonb) as findings_preview
+        from (
+          select id, finding, created_at
+          from knowledge_check_findings
+          where check_id = knowledge_checks.id
+            and status = 'active'
+          order by created_at asc, id asc
+          limit 100
+        ) ordered
+      ) finding_preview on true
+      left join lateral (
+        select count(*) as findings_count
+        from knowledge_check_findings
+        where check_id = knowledge_checks.id
+          and status = 'active'
+      ) finding_count on true
+      where knowledge_checks.id = ${checkId}
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toKnowledgeCheckRecord(row);
+  }
+
+  async listKnowledgeCheckFindings(
+    input: KnowledgeCheckFindingReadInput,
+  ): Promise<PaginatedKnowledgeCheckFindingReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<{ finding: unknown }>`
+        select finding
+        from knowledge_check_findings
+        where check_id = ${input.checkId}
+          and status = 'active'
+        order by created_at asc, id asc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from knowledge_check_findings
+        where check_id = ${input.checkId}
+          and status = 'active'
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items: itemsResult.rows.map(
+        (row) => normalizeJsonObject(row.finding) as unknown as KnowledgeCheckFinding,
+      ),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
+  async listJobs(input: PaginatedReadInput): Promise<PaginatedJobReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<JobRow>`
+        select
+          id,
+          tenant_id,
+          project_id,
+          knowledge_base_id,
+          source_document_id,
+          job_type,
+          status,
+          stage,
+          progress,
+          progress_message,
+          idempotency_key,
+          dedupe_key,
+          result,
+          error,
+          metadata,
+          queued_at,
+          updated_at
+        from jobs
+        where knowledge_base_id = ${input.knowledgeBaseId}
+          and coalesce(job_type, '') <> 'graph.insights.refresh'
+        order by updated_at desc, id desc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from jobs
+        where knowledge_base_id = ${input.knowledgeBaseId}
+          and coalesce(job_type, '') <> 'graph.insights.refresh'
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items: itemsResult.rows.map(toJobRecord),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
+  async listSourceDocuments(
+    input: SourceDocumentReadInput,
+  ): Promise<PaginatedSourceDocumentReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const keyword = input.keyword?.trim().toLowerCase() || null;
+    const status = input.status ?? null;
+    const sourceType = input.sourceType ?? null;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<SourceDocumentRow>`
+        with target_kb as (
+          select id, tenant_id, project_id, knowledge_base_type, upstream_knowledge_base_id
+          from knowledge_bases
+          where id = ${input.knowledgeBaseId}
+            and deleted_at is null
+            and status <> 'deleted'
+          limit 1
+        ),
+        fork_tombstones as (
+          select upstream_resource_id
+          from source_documents
+          where owner_knowledge_base_id = ${input.knowledgeBaseId}
+            and upstream_resource_id is not null
+            and fork_tombstoned_at is not null
+        ),
+        visible_source_documents as (
+          select
+            source_documents.id,
+            source_documents.tenant_id,
+            source_documents.project_id,
+            source_documents.knowledge_base_id,
+            source_documents.source_type,
+            source_documents.name,
+            source_documents.status,
+            source_documents.content_hash,
+            source_documents.object_key,
+            source_documents.mime_type,
+            source_documents.size_bytes,
+            source_documents.metadata,
+            source_documents.ocr_status,
+            source_documents.ocr_summary,
+            source_documents.visibility_origin,
+            source_documents.owner_knowledge_base_id,
+            source_documents.upstream_resource_id,
+            source_documents.fork_tombstoned_at,
+            source_documents.created_at,
+            source_documents.updated_at,
+            source_documents.id as visible_key,
+            0 as visible_priority
+          from source_documents
+          inner join target_kb on target_kb.id = source_documents.knowledge_base_id
+          where target_kb.knowledge_base_type <> 'fork'
+            and source_documents.owner_knowledge_base_id is null
+            and source_documents.fork_tombstoned_at is null
+            and source_documents.deleted_at is null
+            and source_documents.status <> 'deleted'
+          union all
+          select
+            source_documents.id,
+            target_kb.tenant_id,
+            target_kb.project_id,
+            target_kb.id as knowledge_base_id,
+            source_documents.source_type,
+            source_documents.name,
+            source_documents.status,
+            source_documents.content_hash,
+            source_documents.object_key,
+            source_documents.mime_type,
+            source_documents.size_bytes,
+            source_documents.metadata,
+            source_documents.ocr_status,
+            source_documents.ocr_summary,
+            'upstream_inherited' as visibility_origin,
+            target_kb.id as owner_knowledge_base_id,
+            source_documents.id as upstream_resource_id,
+            null::timestamptz as fork_tombstoned_at,
+            source_documents.created_at,
+            source_documents.updated_at,
+            source_documents.id as visible_key,
+            1 as visible_priority
+          from source_documents
+          inner join target_kb on target_kb.upstream_knowledge_base_id = source_documents.knowledge_base_id
+          where target_kb.knowledge_base_type = 'fork'
+            and source_documents.owner_knowledge_base_id is null
+            and source_documents.fork_tombstoned_at is null
+            and source_documents.deleted_at is null
+            and source_documents.status <> 'deleted'
+            and not exists (
+              select 1
+              from fork_tombstones
+              where fork_tombstones.upstream_resource_id = source_documents.id
+            )
+          union all
+          select
+            source_documents.id,
+            source_documents.tenant_id,
+            source_documents.project_id,
+            target_kb.id as knowledge_base_id,
+            source_documents.source_type,
+            source_documents.name,
+            source_documents.status,
+            source_documents.content_hash,
+            source_documents.object_key,
+            source_documents.mime_type,
+            source_documents.size_bytes,
+            source_documents.metadata,
+            source_documents.ocr_status,
+            source_documents.ocr_summary,
+            'fork_owned' as visibility_origin,
+            target_kb.id as owner_knowledge_base_id,
+            source_documents.upstream_resource_id,
+            source_documents.fork_tombstoned_at,
+            source_documents.created_at,
+            source_documents.updated_at,
+            coalesce(source_documents.upstream_resource_id, source_documents.id) as visible_key,
+            0 as visible_priority
+          from source_documents
+          inner join target_kb on target_kb.id = source_documents.owner_knowledge_base_id
+          where target_kb.knowledge_base_type = 'fork'
+            and source_documents.fork_tombstoned_at is null
+            and source_documents.deleted_at is null
+            and source_documents.status <> 'deleted'
+        ),
+        ranked_visible_documents as (
+          select
+            *,
+            row_number() over (
+              partition by visible_key
+              order by visible_priority asc, updated_at desc, id desc
+            ) as visible_rank
+          from visible_source_documents
+        )
+        select
+          id,
+          tenant_id,
+          project_id,
+          knowledge_base_id,
+          source_type,
+          name,
+          status,
+          content_hash,
+          object_key,
+          mime_type,
+          size_bytes::bigint as size_bytes,
+          metadata,
+          ocr_status,
+          ocr_summary,
+          visibility_origin,
+          owner_knowledge_base_id,
+          upstream_resource_id,
+          fork_tombstoned_at,
+          created_at,
+          updated_at
+        from ranked_visible_documents
+        where visible_rank = 1
+          and (${status}::text is null or status = ${status})
+          and (${sourceType}::text is null or source_type = ${sourceType})
+          and (
+            ${keyword}::text is null
+            or position(
+              ${keyword}::text in lower(concat_ws(
+                ' ',
+                name,
+                metadata->>'display_name',
+                metadata->>'source_path',
+                metadata->>'source_url'
+              ))
+            ) > 0
+          )
+        order by updated_at desc, id desc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        with target_kb as (
+          select id, knowledge_base_type, upstream_knowledge_base_id
+          from knowledge_bases
+          where id = ${input.knowledgeBaseId}
+            and deleted_at is null
+            and status <> 'deleted'
+          limit 1
+        ),
+        fork_tombstones as (
+          select upstream_resource_id
+          from source_documents
+          where owner_knowledge_base_id = ${input.knowledgeBaseId}
+            and upstream_resource_id is not null
+            and fork_tombstoned_at is not null
+        ),
+        visible_source_documents as (
+          select
+            source_documents.id,
+            source_documents.source_type,
+            source_documents.name,
+            source_documents.status,
+            source_documents.metadata,
+            source_documents.updated_at,
+            source_documents.id as visible_key,
+            0 as visible_priority
+          from source_documents
+          inner join target_kb on target_kb.id = source_documents.knowledge_base_id
+          where target_kb.knowledge_base_type <> 'fork'
+            and source_documents.owner_knowledge_base_id is null
+            and source_documents.fork_tombstoned_at is null
+            and source_documents.deleted_at is null
+            and source_documents.status <> 'deleted'
+          union all
+          select
+            source_documents.id,
+            source_documents.source_type,
+            source_documents.name,
+            source_documents.status,
+            source_documents.metadata,
+            source_documents.updated_at,
+            source_documents.id as visible_key,
+            1 as visible_priority
+          from source_documents
+          inner join target_kb on target_kb.upstream_knowledge_base_id = source_documents.knowledge_base_id
+          where target_kb.knowledge_base_type = 'fork'
+            and source_documents.owner_knowledge_base_id is null
+            and source_documents.fork_tombstoned_at is null
+            and source_documents.deleted_at is null
+            and source_documents.status <> 'deleted'
+            and not exists (
+              select 1
+              from fork_tombstones
+              where fork_tombstones.upstream_resource_id = source_documents.id
+            )
+          union all
+          select
+            source_documents.id,
+            source_documents.source_type,
+            source_documents.name,
+            source_documents.status,
+            source_documents.metadata,
+            source_documents.updated_at,
+            coalesce(source_documents.upstream_resource_id, source_documents.id) as visible_key,
+            0 as visible_priority
+          from source_documents
+          inner join target_kb on target_kb.id = source_documents.owner_knowledge_base_id
+          where target_kb.knowledge_base_type = 'fork'
+            and source_documents.fork_tombstoned_at is null
+            and source_documents.deleted_at is null
+            and source_documents.status <> 'deleted'
+        ),
+        ranked_visible_documents as (
+          select
+            *,
+            row_number() over (
+              partition by visible_key
+              order by visible_priority asc, updated_at desc, id desc
+            ) as visible_rank
+          from visible_source_documents
+        )
+        select count(*) as total
+        from ranked_visible_documents
+        where visible_rank = 1
+          and (${status}::text is null or status = ${status})
+          and (${sourceType}::text is null or source_type = ${sourceType})
+          and (
+            ${keyword}::text is null
+            or position(
+              ${keyword}::text in lower(concat_ws(
+                ' ',
+                name,
+                metadata->>'display_name',
+                metadata->>'source_path',
+                metadata->>'source_url'
+              ))
+            ) > 0
+          )
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items: itemsResult.rows.map(toSourceDocumentRecord),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
+  async listSourceWatchDocuments(
+    input: SourceWatchDocumentReadInput,
+  ): Promise<SourceDocumentRecord[]> {
+    const result = await sql<SourceDocumentRow>`
+      select
+        id,
+        tenant_id,
+        project_id,
+        knowledge_base_id,
+        source_type,
+        name,
+        status,
+        content_hash,
+        object_key,
+        mime_type,
+        size_bytes::bigint as size_bytes,
+        metadata,
+        ocr_status,
+        ocr_summary,
+        visibility_origin,
+        owner_knowledge_base_id,
+        upstream_resource_id,
+        fork_tombstoned_at,
+        created_at,
+        updated_at
+      from source_documents
+      where knowledge_base_id = ${input.knowledgeBaseId}
+        and owner_knowledge_base_id is null
+        and fork_tombstoned_at is null
+        and deleted_at is null
+        and status <> 'deleted'
+        and metadata->>'source_path' is not null
+        and metadata->>'source_watch_rule_id' = ${input.sourceWatchRuleId}
+      order by lower(metadata->>'source_path') asc, updated_at desc, id desc
+    `.execute(this.db);
+
+    return result.rows.map(toSourceDocumentRecord);
+  }
+
+  async compareSourceWatchDiscoveredSources(
+    input: SourceWatchDiscoveryComparisonReadInput,
+  ): Promise<SourceWatchDiscoveryComparisonReadResult> {
+    const comparisonWindowSize = Math.max(1, Math.floor(input.comparisonWindowSize ?? 100));
+    const sourcePaths = input.scannedSources
+      .map((source) => source.source_path ?? source.name)
+      .filter((sourcePath, index, values) => values.indexOf(sourcePath) === index);
+    const existingForScanned: SourceDocumentRecord[] = [];
+
+    for (const sourcePathWindow of chunkArray(sourcePaths, comparisonWindowSize)) {
+      if (sourcePathWindow.length === 0) {
+        continue;
+      }
+
+      const result = await sql<SourceDocumentRow>`
+              select
+                id,
+                tenant_id,
+                project_id,
+                knowledge_base_id,
+                source_type,
+                name,
+                status,
+                content_hash,
+                object_key,
+                mime_type,
+                size_bytes::bigint as size_bytes,
+                metadata,
+                ocr_status,
+                ocr_summary,
+                visibility_origin,
+                owner_knowledge_base_id,
+                upstream_resource_id,
+                fork_tombstoned_at,
+                created_at,
+                updated_at
+              from source_documents
+              where knowledge_base_id = ${input.rule.knowledgeBaseId}
+                and owner_knowledge_base_id is null
+                and fork_tombstoned_at is null
+                and deleted_at is null
+                and status <> 'deleted'
+                and metadata->>'source_path' in (${sql.join(sourcePathWindow)})
+                and metadata->>'source_watch_rule_id' = ${input.rule.id}
+              order by lower(metadata->>'source_path') asc, updated_at desc, id desc
+            `.execute(this.db);
+
+      existingForScanned.push(...result.rows.map(toSourceDocumentRecord));
+    }
+
+    const comparison = compareDiscoveredSources(
+      input.rule,
+      existingForScanned,
+      input.scannedSources,
+    );
+    const deleteRows =
+      sourcePaths.length === 0
+        ? await this.listLatestSourceWatchDocumentsMissingFromPaths(input.rule, [])
+        : await this.listLatestSourceWatchDocumentsMissingFromPaths(input.rule, sourcePaths);
+
+    return {
+      ...comparison,
+      deleteCandidates: deleteRows.map((document) => ({
+        document_id: document.id,
+        source_path: document.sourcePath ?? document.name,
+        reason: "missing_from_source",
+        metadata: {
+          source_watch_rule_id: input.rule.id,
+          source_watch_source_kind: input.rule.sourceKind,
+        },
+      })),
+    };
+  }
+
+  async compareSourceWatchDiscoveredSourceWindow(
+    input: SourceWatchDiscoveryWindowComparisonReadInput,
+  ): Promise<SourceWatchDiscoveryWindowComparisonReadResult> {
+    const comparisonWindowSize = Math.max(1, Math.floor(input.comparisonWindowSize ?? 100));
+    const sourcePaths = input.scannedSources
+      .map((source) => source.source_path ?? source.name)
+      .filter((sourcePath, index, values) => values.indexOf(sourcePath) === index);
+    const existingForScanned: SourceDocumentRecord[] = [];
+
+    for (const sourcePathWindow of chunkArray(sourcePaths, comparisonWindowSize)) {
+      if (sourcePathWindow.length === 0) {
+        continue;
+      }
+
+      const result = await sql<SourceDocumentRow>`
+        select
+          id,
+          tenant_id,
+          project_id,
+          knowledge_base_id,
+          source_type,
+          name,
+          status,
+          content_hash,
+          object_key,
+          mime_type,
+          size_bytes::bigint as size_bytes,
+          metadata,
+          ocr_status,
+          ocr_summary,
+          visibility_origin,
+          owner_knowledge_base_id,
+          upstream_resource_id,
+          fork_tombstoned_at,
+          created_at,
+          updated_at
+        from source_documents
+        where knowledge_base_id = ${input.rule.knowledgeBaseId}
+          and owner_knowledge_base_id is null
+          and fork_tombstoned_at is null
+          and deleted_at is null
+          and status <> 'deleted'
+          and metadata->>'source_path' in (${sql.join(sourcePathWindow)})
+          and metadata->>'source_watch_rule_id' = ${input.rule.id}
+        order by lower(metadata->>'source_path') asc, updated_at desc, id desc
+      `.execute(this.db);
+
+      existingForScanned.push(...result.rows.map(toSourceDocumentRecord));
+    }
+
+    const comparison = compareDiscoveredSources(
+      input.rule,
+      existingForScanned,
+      input.scannedSources,
+    );
+
+    return {
+      changedSources: comparison.changedSources,
+      newSources: comparison.newSources,
+    };
+  }
+
+  async listSourceWatchDeleteCandidatesMissingFromScan(
+    input: SourceWatchMissingScanDeleteCandidateReadInput,
+  ): Promise<PaginatedSourceWatchDeleteCandidateReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<SourceDocumentRow>`
+        select
+          source_documents.id,
+          source_documents.tenant_id,
+          source_documents.project_id,
+          source_documents.knowledge_base_id,
+          source_documents.source_type,
+          source_documents.name,
+          source_documents.status,
+          source_documents.content_hash,
+          source_documents.object_key,
+          source_documents.mime_type,
+          source_documents.size_bytes::bigint as size_bytes,
+          source_documents.metadata,
+          source_documents.ocr_status,
+          source_documents.ocr_summary,
+          source_documents.visibility_origin,
+          source_documents.owner_knowledge_base_id,
+          source_documents.upstream_resource_id,
+          source_documents.fork_tombstoned_at,
+          source_documents.created_at,
+          source_documents.updated_at
+        from source_documents
+        where source_documents.knowledge_base_id = ${input.rule.knowledgeBaseId}
+          and source_documents.owner_knowledge_base_id is null
+          and source_documents.fork_tombstoned_at is null
+          and source_documents.deleted_at is null
+          and source_documents.status <> 'deleted'
+          and source_documents.metadata->>'source_path' is not null
+          and source_documents.metadata->>'source_watch_rule_id' = ${input.rule.id}
+          and not exists (
+            select 1
+            from source_watch_scan_items
+            where source_watch_scan_items.scheduled_import_job_id = ${input.scheduledImportJobId}
+              and source_watch_scan_items.item_kind = 'discovered'
+              and source_watch_scan_items.source_path = source_documents.metadata->>'source_path'
+          )
+        order by lower(source_documents.metadata->>'source_path') asc, source_documents.updated_at desc, source_documents.id desc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from source_documents
+        where source_documents.knowledge_base_id = ${input.rule.knowledgeBaseId}
+          and source_documents.owner_knowledge_base_id is null
+          and source_documents.fork_tombstoned_at is null
+          and source_documents.deleted_at is null
+          and source_documents.status <> 'deleted'
+          and source_documents.metadata->>'source_path' is not null
+          and source_documents.metadata->>'source_watch_rule_id' = ${input.rule.id}
+          and not exists (
+            select 1
+            from source_watch_scan_items
+            where source_watch_scan_items.scheduled_import_job_id = ${input.scheduledImportJobId}
+              and source_watch_scan_items.item_kind = 'discovered'
+              and source_watch_scan_items.source_path = source_documents.metadata->>'source_path'
+          )
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+    const items = itemsResult.rows.map((row) => {
+      const document = toSourceDocumentRecord(row);
+
+      return {
+        document_id: document.id,
+        source_path: document.sourcePath ?? document.name,
+        reason: "missing_from_source",
+        metadata: {
+          source_watch_rule_id: input.rule.id,
+          source_watch_source_kind: input.rule.sourceKind,
+        },
+      };
+    });
+
+    return {
+      items,
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
+  async hasMatchingSourceWatchFingerprint(
+    input: SourceWatchFingerprintReadInput,
+  ): Promise<boolean> {
+    const result = await sql<{ matched: number }>`
+      select 1 as matched
+      from source_documents
+      where knowledge_base_id = ${input.knowledgeBaseId}
+        and owner_knowledge_base_id is null
+        and fork_tombstoned_at is null
+        and deleted_at is null
+        and status <> 'deleted'
+        and metadata->>'source_path' = ${input.sourcePath}
+        and metadata->>'source_watch_rule_id' = ${input.sourceWatchRuleId}
+        and metadata->>'source_watch_fingerprint' = ${input.fingerprint}
+      limit 1
+    `.execute(this.db);
+
+    return result.rows.length > 0;
+  }
+
+  private async listLatestSourceWatchDocumentsMissingFromPaths(
+    rule: SourceWatchRuleRecord,
+    scannedSourcePaths: readonly string[],
+  ): Promise<SourceDocumentRecord[]> {
+    const result =
+      scannedSourcePaths.length === 0
+        ? await sql<SourceDocumentRow>`
+            select distinct on (metadata->>'source_path')
+              id,
+              tenant_id,
+              project_id,
+              knowledge_base_id,
+              source_type,
+              name,
+              status,
+              content_hash,
+              object_key,
+              mime_type,
+              size_bytes::bigint as size_bytes,
+              metadata,
+              ocr_status,
+              ocr_summary,
+              visibility_origin,
+              owner_knowledge_base_id,
+              upstream_resource_id,
+              fork_tombstoned_at,
+              created_at,
+              updated_at
+            from source_documents
+            where knowledge_base_id = ${rule.knowledgeBaseId}
+              and owner_knowledge_base_id is null
+              and fork_tombstoned_at is null
+              and deleted_at is null
+              and status <> 'deleted'
+              and metadata->>'source_path' is not null
+              and metadata->>'source_watch_rule_id' = ${rule.id}
+            order by metadata->>'source_path', updated_at desc, id desc
+          `.execute(this.db)
+        : await sql<SourceDocumentRow>`
+            select distinct on (metadata->>'source_path')
+              id,
+              tenant_id,
+              project_id,
+              knowledge_base_id,
+              source_type,
+              name,
+              status,
+              content_hash,
+              object_key,
+              mime_type,
+              size_bytes::bigint as size_bytes,
+              metadata,
+              ocr_status,
+              ocr_summary,
+              visibility_origin,
+              owner_knowledge_base_id,
+              upstream_resource_id,
+              fork_tombstoned_at,
+              created_at,
+              updated_at
+            from source_documents
+            where knowledge_base_id = ${rule.knowledgeBaseId}
+              and owner_knowledge_base_id is null
+              and fork_tombstoned_at is null
+              and deleted_at is null
+              and status <> 'deleted'
+              and metadata->>'source_path' is not null
+              and metadata->>'source_watch_rule_id' = ${rule.id}
+              and not (metadata->>'source_path' in (${sql.join(scannedSourcePaths)}))
+            order by metadata->>'source_path', updated_at desc, id desc
+          `.execute(this.db);
+
+    return result.rows.map(toSourceDocumentRecord);
+  }
+
+  async getSourceDocumentById(documentId: string): Promise<SourceDocumentRecord | null> {
+    const result = await sql<SourceDocumentRow>`
+      select
+        id,
+        tenant_id,
+        project_id,
+        knowledge_base_id,
+        source_type,
+        name,
+        status,
+        content_hash,
+        object_key,
+        mime_type,
+        size_bytes::bigint as size_bytes,
+        metadata,
+        ocr_status,
+        ocr_summary,
+        visibility_origin,
+        owner_knowledge_base_id,
+        upstream_resource_id,
+        fork_tombstoned_at,
+        created_at,
+        updated_at
+      from source_documents
+      where id = ${documentId}
+        and deleted_at is null
+        and fork_tombstoned_at is null
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toSourceDocumentRecord(row);
+  }
+
+  async getVisibleSourceDocumentById(
+    knowledgeBaseId: string,
+    documentId: string,
+  ): Promise<SourceDocumentRecord | null> {
+    const result = await sql<SourceDocumentRow>`
+      with target_kb as (
+        select id, tenant_id, project_id, knowledge_base_type, upstream_knowledge_base_id
+        from knowledge_bases
+        where id = ${knowledgeBaseId}
+          and deleted_at is null
+          and status <> 'deleted'
+        limit 1
+      )
+      select
+        source_documents.id,
+        case
+          when source_documents.knowledge_base_id = target_kb.upstream_knowledge_base_id
+            then target_kb.tenant_id
+          else source_documents.tenant_id
+        end as tenant_id,
+        case
+          when source_documents.knowledge_base_id = target_kb.upstream_knowledge_base_id
+            then target_kb.project_id
+          else source_documents.project_id
+        end as project_id,
+        case
+          when source_documents.knowledge_base_id = target_kb.upstream_knowledge_base_id
+            then target_kb.id
+          else source_documents.knowledge_base_id
+        end as knowledge_base_id,
+        source_documents.source_type,
+        source_documents.name,
+        source_documents.status,
+        source_documents.content_hash,
+        source_documents.object_key,
+        source_documents.mime_type,
+        source_documents.size_bytes::bigint as size_bytes,
+        source_documents.metadata,
+        source_documents.ocr_status,
+        source_documents.ocr_summary,
+        case
+          when source_documents.knowledge_base_id = target_kb.upstream_knowledge_base_id
+            then 'upstream_inherited'
+          else source_documents.visibility_origin
+        end as visibility_origin,
+        case
+          when source_documents.knowledge_base_id = target_kb.upstream_knowledge_base_id
+            then target_kb.id
+          else source_documents.owner_knowledge_base_id
+        end as owner_knowledge_base_id,
+        case
+          when source_documents.knowledge_base_id = target_kb.upstream_knowledge_base_id
+            then source_documents.id
+          else source_documents.upstream_resource_id
+        end as upstream_resource_id,
+        source_documents.fork_tombstoned_at,
+        source_documents.created_at,
+        source_documents.updated_at
+      from source_documents
+      inner join target_kb on true
+      where source_documents.deleted_at is null
+        and source_documents.status <> 'deleted'
+        and source_documents.fork_tombstoned_at is null
+        and (
+          (
+            source_documents.id = ${documentId}
+            and source_documents.knowledge_base_id = target_kb.id
+          )
+          or (
+            source_documents.upstream_resource_id = ${documentId}
+            and source_documents.owner_knowledge_base_id = target_kb.id
+          )
+          or (
+            target_kb.knowledge_base_type = 'fork'
+            and source_documents.id = ${documentId}
+            and source_documents.knowledge_base_id = target_kb.upstream_knowledge_base_id
+            and not exists (
+              select 1
+              from source_documents tombstone
+              where tombstone.owner_knowledge_base_id = target_kb.id
+                and tombstone.upstream_resource_id = source_documents.id
+                and tombstone.fork_tombstoned_at is not null
+            )
+          )
+        )
+      order by
+        case
+          when source_documents.owner_knowledge_base_id = target_kb.id then 0
+          when source_documents.knowledge_base_id = target_kb.id then 1
+          else 2
+        end asc,
+        source_documents.updated_at desc,
+        source_documents.id desc
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toSourceDocumentRecord(row);
+  }
+
+  async getUploadSessionById(uploadSessionId: string): Promise<UploadSessionRecord | null> {
+    const result = await sql<UploadSessionRow>`
+      select
+        id,
+        tenant_id,
+        project_id,
+        actor_type,
+        actor_id,
+        actor_source,
+        actor_account_id,
+        knowledge_base_id,
+        document_id,
+        object_key,
+        file_name,
+        display_name,
+        mime_type,
+        size_bytes::bigint as size_bytes,
+        content_hash,
+        source_path,
+        metadata,
+        status,
+        idempotency_key,
+        finalize_idempotency_key,
+        finalized_document_id,
+        finalized_job_id,
+        cleanup_operation_id,
+        expires_at,
+        created_at,
+        updated_at
+      from upload_sessions
+      where id = ${uploadSessionId}
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toUploadSessionRecord(row);
+  }
+
+  async getUploadSessionByIdempotencyKey(input: {
+    actorId: string;
+    actorType: string;
+    idempotencyKey: string;
+    knowledgeBaseId: string;
+    projectId: string;
+    tenantId: string;
+  }): Promise<UploadSessionRecord | null> {
+    const result = await sql<UploadSessionRow>`
+      select
+        id,
+        tenant_id,
+        project_id,
+        actor_type,
+        actor_id,
+        actor_source,
+        actor_account_id,
+        knowledge_base_id,
+        document_id,
+        object_key,
+        file_name,
+        display_name,
+        mime_type,
+        size_bytes::bigint as size_bytes,
+        content_hash,
+        source_path,
+        metadata,
+        status,
+        idempotency_key,
+        finalize_idempotency_key,
+        finalized_document_id,
+        finalized_job_id,
+        cleanup_operation_id,
+        expires_at,
+        created_at,
+        updated_at
+      from upload_sessions
+      where knowledge_base_id = ${input.knowledgeBaseId}
+        and tenant_id = ${input.tenantId}
+        and project_id = ${input.projectId}
+        and actor_type = ${input.actorType}
+        and actor_id = ${input.actorId}
+        and idempotency_key = ${input.idempotencyKey}
+      order by created_at desc, id desc
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toUploadSessionRecord(row);
+  }
+
+  async listExpiredCreatedUploadSessions(
+    now: string,
+    limit: number,
+  ): Promise<UploadSessionRecord[]> {
+    const result = await sql<UploadSessionRow>`
+      select
+        id,
+        tenant_id,
+        project_id,
+        actor_type,
+        actor_id,
+        actor_source,
+        actor_account_id,
+        knowledge_base_id,
+        document_id,
+        object_key,
+        file_name,
+        display_name,
+        mime_type,
+        size_bytes::bigint as size_bytes,
+        content_hash,
+        source_path,
+        metadata,
+        status,
+        idempotency_key,
+        finalize_idempotency_key,
+        finalized_document_id,
+        finalized_job_id,
+        cleanup_operation_id,
+        expires_at,
+        created_at,
+        updated_at
+      from upload_sessions
+      where status = 'created'
+        and expires_at <= ${now}
+      order by expires_at asc, id asc
+      limit ${limit}
+    `.execute(this.db);
+
+    return result.rows.map(toUploadSessionRecord);
+  }
+
+  async getLatestJobByDocumentId(documentId: string): Promise<JobRecord | null> {
+    const result = await sql<JobRow>`
+      select
+        id,
+        knowledge_base_id,
+        source_document_id,
+        job_type,
+        status,
+        stage,
+        progress,
+        progress_message,
+        idempotency_key,
+        dedupe_key,
+        result,
+        error,
+        metadata,
+        queued_at,
+        updated_at
+      from jobs
+      where source_document_id = ${documentId}
+      order by queued_at desc, id desc
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toJobRecord(row);
+  }
+
+  async listJobsByDocumentId(documentId: string): Promise<JobRecord[]> {
+    const result = await sql<JobRow>`
+      select
+        id,
+        knowledge_base_id,
+        source_document_id,
+        job_type,
+        status,
+        stage,
+        progress,
+        progress_message,
+        idempotency_key,
+        dedupe_key,
+        result,
+        error,
+        metadata,
+        queued_at,
+        updated_at
+      from jobs
+      where source_document_id = ${documentId}
+      order by updated_at desc, id desc
+    `.execute(this.db);
+
+    return result.rows.map(toJobRecord);
+  }
+
+  async getJobByIdempotencyKey(
+    knowledgeBaseId: string,
+    idempotencyKey: string,
+  ): Promise<JobRecord | null> {
+    const result = await sql<JobRow>`
+      select
+        id,
+        knowledge_base_id,
+        source_document_id,
+        job_type,
+        status,
+        stage,
+        progress,
+        progress_message,
+        idempotency_key,
+        dedupe_key,
+        result,
+        error,
+        metadata,
+        queued_at,
+        updated_at
+      from jobs
+      where knowledge_base_id = ${knowledgeBaseId}
+        and idempotency_key = ${idempotencyKey}
+      order by queued_at desc, id desc
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toJobRecord(row);
+  }
+
+  async getParsedContentByDocumentId(documentId: string): Promise<ParsedContentRecord | null> {
+    const result = await sql<ParsedContentRow>`
+      select
+        id,
+        source_document_id,
+        parser_name,
+        parser_version,
+        normalized_markdown_object_key,
+        captioned_markdown_object_key,
+        markdown_preview,
+        markdown_preview_object_key,
+        markdown_preview_truncated,
+        plain_text_object_key,
+        locators,
+        tables,
+        warnings,
+        ocr_status,
+        ocr_summary,
+        ocr_warnings,
+        ocr_provider_metadata,
+        ocr_page_count,
+        ocr_block_count,
+        ocr_derived_segment_count,
+        ocr_completed_at,
+        coalesce((
+          select jsonb_agg(
+            jsonb_build_object(
+              'id', ocr_blocks.id,
+              'page_number', ocr_blocks.page_number,
+              'block_index', ocr_blocks.block_index,
+              'text', ocr_blocks.text,
+              'confidence', ocr_blocks.confidence,
+              'bbox', ocr_blocks.bbox,
+              'language', ocr_blocks.language,
+              'provider', ocr_blocks.provider_name,
+              'engine', ocr_blocks.engine,
+              'model_version', ocr_blocks.model_version,
+              'locator', ocr_blocks.locator,
+              'source_artifact_id', ocr_blocks.source_artifact_id,
+              'created_at', ocr_blocks.created_at
+            )
+            order by ocr_blocks.page_number asc, ocr_blocks.block_index asc
+          )
+          from ocr_blocks
+          where ocr_blocks.parsed_content_id = parsed_contents.id
+        ), '[]'::jsonb) as ocr_blocks,
+        error,
+        created_at
+      from parsed_contents
+      where source_document_id = ${documentId}
+        and fork_tombstoned_at is null
+      order by created_at desc, id desc
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toParsedContentRecord(row);
+  }
+
+  async listMediaAssetsByDocumentId(
+    documentId: string,
+    input: Omit<PaginatedReadInput, "knowledgeBaseId">,
+  ): Promise<PaginatedMediaAssetReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<MediaAssetRow>`
+        select
+          id,
+          source_document_id,
+          parsed_content_id,
+          mime_type,
+          object_key,
+          hash,
+          locator,
+          width,
+          height,
+          caption_status,
+          caption,
+          caption_provider_name,
+          caption_model,
+          caption_prompt_version,
+          caption_model_call_id,
+          caption_cache_hit,
+          caption_attempt_count,
+          caption_error,
+          caption_generated_at,
+          updated_at,
+          created_at
+        from media_assets
+        where source_document_id = ${documentId}
+          and fork_tombstoned_at is null
+        order by created_at asc, id asc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from media_assets
+        where source_document_id = ${documentId}
+          and fork_tombstoned_at is null
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items: itemsResult.rows.map(toMediaAssetRecord),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
+  async listDocumentProcessingUnitsByDocumentId(
+    documentId: string,
+    input: DocumentProcessingUnitReadInput,
+  ): Promise<PaginatedDocumentProcessingUnitReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<DocumentProcessingUnitRow>`
+        select
+          id,
+          source_document_id,
+          job_id,
+          parsed_content_id,
+          stage,
+          unit_type,
+          unit_key,
+          unit_index,
+          attempt_scope,
+          status,
+          content_hash,
+          dedupe_key,
+          object_key,
+          object_refs,
+          locator,
+          counters,
+          warnings,
+          safe_error,
+          metadata,
+          retry_eligible,
+          completed_at,
+          updated_at
+        from document_processing_units
+        where source_document_id = ${documentId}
+          and (${input.jobId === undefined} or job_id = ${input.jobId ?? "__none__"})
+          and (${input.stage === undefined} or stage = ${input.stage ?? "parsing"})
+          and (${input.status === undefined} or status = ${input.status ?? "pending"})
+        order by updated_at desc, id desc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from document_processing_units
+        where source_document_id = ${documentId}
+          and (${input.jobId === undefined} or job_id = ${input.jobId ?? "__none__"})
+          and (${input.stage === undefined} or stage = ${input.stage ?? "parsing"})
+          and (${input.status === undefined} or status = ${input.status ?? "pending"})
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items: itemsResult.rows.map(toDocumentProcessingUnitRecord),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
+  async getMediaAssetById(mediaAssetId: string): Promise<MediaAssetRecord | null> {
+    const result = await sql<MediaAssetRow>`
+      select
+        id,
+        source_document_id,
+        parsed_content_id,
+        mime_type,
+        object_key,
+        hash,
+        locator,
+        width,
+        height,
+        caption_status,
+        caption,
+        caption_provider_name,
+        caption_model,
+        caption_prompt_version,
+        caption_model_call_id,
+        caption_cache_hit,
+        caption_attempt_count,
+        caption_error,
+        caption_generated_at,
+        updated_at,
+        created_at
+      from media_assets
+      where id = ${mediaAssetId}
+        and fork_tombstoned_at is null
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toMediaAssetRecord(row);
+  }
+
+  async findReferencedObjectKeys(input: ReferencedObjectKeyReadInput): Promise<Set<string>> {
+    const objectKeys = [...new Set(input.objectKeys.filter((key) => key.trim().length > 0))];
+
+    if (objectKeys.length === 0) {
+      return new Set();
+    }
+
+    const [sourceDocumentResult, parsedContentResult, mediaAssetResult] = await Promise.all([
+      sql<{ object_key: string }>`
+        select distinct object_key
+        from source_documents
+        where knowledge_base_id = ${input.knowledgeBaseId}
+          and id <> ${input.documentId}
+          and deleted_at is null
+          and status <> 'deleted'
+          and fork_tombstoned_at is null
+          and object_key in (${sql.join(objectKeys)})
+      `.execute(this.db),
+      sql<{ object_key: string }>`
+        select distinct refs.object_key
+        from (
+          select source_document_id, normalized_markdown_object_key as object_key
+          from parsed_contents
+          union all
+          select source_document_id, plain_text_object_key as object_key
+          from parsed_contents
+          where plain_text_object_key is not null
+          union all
+          select source_document_id, captioned_markdown_object_key as object_key
+          from parsed_contents
+          where captioned_markdown_object_key is not null
+        ) refs
+        inner join source_documents on source_documents.id = refs.source_document_id
+        where source_documents.knowledge_base_id = ${input.knowledgeBaseId}
+          and source_documents.id <> ${input.documentId}
+          and source_documents.deleted_at is null
+          and source_documents.status <> 'deleted'
+          and source_documents.fork_tombstoned_at is null
+          and refs.object_key in (${sql.join(objectKeys)})
+      `.execute(this.db),
+      sql<{ object_key: string }>`
+        select distinct media_assets.object_key
+        from media_assets
+        inner join source_documents on source_documents.id = media_assets.source_document_id
+        where source_documents.knowledge_base_id = ${input.knowledgeBaseId}
+          and source_documents.id <> ${input.documentId}
+          and source_documents.deleted_at is null
+          and source_documents.status <> 'deleted'
+          and source_documents.fork_tombstoned_at is null
+          and media_assets.fork_tombstoned_at is null
+          and media_assets.object_key in (${sql.join(objectKeys)})
+      `.execute(this.db),
+    ]);
+
+    return new Set([
+      ...sourceDocumentResult.rows.map((row) => row.object_key),
+      ...parsedContentResult.rows.map((row) => row.object_key),
+      ...mediaAssetResult.rows.map((row) => row.object_key),
+    ]);
+  }
+
+  async listWikiPageRecordsBySourceDocumentId(
+    knowledgeBaseId: string,
+    documentId: string,
+    limit: number,
+  ): Promise<Record<string, unknown>[]> {
+    const result = await sql<WikiPageRecordRow>`
+      select
+        id,
+        knowledge_base_id,
+        slug,
+        title,
+        page_type,
+        status,
+        current_version_id,
+        frontmatter,
+        source_document_ids,
+        metadata,
+        created_at,
+        updated_at
+      from wiki_pages
+      where knowledge_base_id = ${knowledgeBaseId}
+        and source_document_ids @> array[${documentId}]::text[]
+        and deleted_at is null
+        and fork_tombstoned_at is null
+      order by updated_at desc, id desc
+      limit ${limit}
+    `.execute(this.db);
+
+    return result.rows.map(toWikiPageRecordResponse);
+  }
+
+  async listWikiPageVersionRecordsByPageIds(
+    pageIds: readonly string[],
+    limit: number,
+  ): Promise<Record<string, unknown>[]> {
+    if (pageIds.length === 0) {
+      return [];
+    }
+
+    const result = await sql<WikiPageVersionRecordRow>`
+      select
+        id,
+        page_id,
+        knowledge_version_id,
+        version_number,
+        title,
+        frontmatter,
+        source_snapshot,
+        prompt_version,
+        created_by,
+        created_at
+      from wiki_page_versions
+      where page_id in (${sql.join(pageIds)})
+        and fork_tombstoned_at is null
+      order by created_at desc, id desc
+      limit ${limit}
+    `.execute(this.db);
+
+    return result.rows.map(toWikiPageVersionRecordResponse);
+  }
+
+  async listSourceWatchRules(
+    input: PaginatedReadInput,
+  ): Promise<PaginatedSourceWatchRuleReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<SourceWatchRuleRow>`
+        select
+          id,
+          knowledge_base_id,
+          name,
+          source_type,
+          location,
+          auto_ingest_enabled,
+          include_patterns,
+          exclude_patterns,
+          status,
+          schedule,
+          metadata,
+          created_at,
+          updated_at
+        from source_watch_rules
+        where knowledge_base_id = ${input.knowledgeBaseId}
+        order by updated_at desc, id desc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from source_watch_rules
+        where knowledge_base_id = ${input.knowledgeBaseId}
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items: itemsResult.rows.map(toSourceWatchRuleRecord),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
+  async getSourceWatchRuleById(ruleId: string): Promise<SourceWatchRuleRecord | null> {
+    const result = await sql<SourceWatchRuleRow>`
+      select
+        id,
+        knowledge_base_id,
+        name,
+        source_type,
+        location,
+        auto_ingest_enabled,
+        include_patterns,
+        exclude_patterns,
+        status,
+        schedule,
+        metadata,
+        created_at,
+        updated_at
+      from source_watch_rules
+      where id = ${ruleId}
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toSourceWatchRuleRecord(row);
+  }
+
+  async listDueSourceWatchRules(now: string, limit: number): Promise<SourceWatchRuleRecord[]> {
+    const result = await sql<SourceWatchRuleRow>`
+      select
+        id,
+        knowledge_base_id,
+        name,
+        source_type,
+        location,
+        auto_ingest_enabled,
+        include_patterns,
+        exclude_patterns,
+        status,
+        schedule,
+        metadata,
+        created_at,
+        updated_at
+      from source_watch_rules
+      where status = 'enabled'
+        and coalesce((schedule->>'enabled')::boolean, false) = true
+        and schedule->>'next_run_at' is not null
+        and (schedule->>'next_run_at')::timestamptz <= ${now}::timestamptz
+      order by (schedule->>'next_run_at')::timestamptz asc, updated_at asc, id asc
+      limit ${limit}
+    `.execute(this.db);
+
+    return result.rows.map(toSourceWatchRuleRecord);
+  }
+
+  async getJobById(jobId: string): Promise<JobRecord | null> {
+    const jobs = await this.listJobsByIds([jobId]);
+
+    return jobs.get(jobId) ?? null;
+  }
+
+  async listJobsByIds(jobIds: readonly string[]): Promise<Map<string, JobRecord>> {
+    const jobs = new Map<string, JobRecord>();
+
+    if (jobIds.length === 0) {
+      return jobs;
+    }
+
+    const result = await sql<JobRow>`
+      select
+        id,
+        knowledge_base_id,
+        source_document_id,
+        job_type,
+        status,
+        stage,
+        progress,
+        progress_message,
+        idempotency_key,
+        dedupe_key,
+        result,
+        error,
+        metadata,
+        queued_at,
+        updated_at
+      from jobs
+      where id in (${sql.join(jobIds)})
+    `.execute(this.db);
+
+    for (const row of result.rows) {
+      const job = toJobRecord(row);
+      jobs.set(job.id, job);
+    }
+
+    return jobs;
+  }
+
+  async listBackgroundOperationsByJobIds(
+    jobIds: readonly string[],
+  ): Promise<Map<string, BackgroundOperationRecord[]>> {
+    const grouped = new Map<string, BackgroundOperationRecord[]>();
+
+    if (jobIds.length === 0) {
+      return grouped;
+    }
+
+    const result = await sql<BackgroundOperationRow>`
+      select
+        id,
+        job_id,
+        knowledge_base_id,
+        operation_kind,
+        stage,
+        status,
+        cursor,
+        processed_count,
+        failed_count,
+        total_count,
+        last_item_id,
+        safe_error,
+        metadata,
+        created_at,
+        updated_at
+      from background_operations
+      where job_id in (${sql.join(jobIds)})
+      order by updated_at desc, id desc
+    `.execute(this.db);
+
+    for (const row of result.rows) {
+      if (row.job_id === null) {
+        continue;
+      }
+
+      const operations = grouped.get(row.job_id) ?? [];
+
+      operations.push(toBackgroundOperationRecord(row));
+      grouped.set(row.job_id, operations);
+    }
+
+    return grouped;
+  }
+
+  async listScheduledImportJobsByRuleId(
+    ruleId: string,
+    input: Omit<PaginatedReadInput, "knowledgeBaseId">,
+  ): Promise<PaginatedScheduledImportJobReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<ScheduledImportJobRow>`
+        select
+          scheduled_import_jobs.id,
+          scheduled_import_jobs.source_watch_rule_id,
+          scheduled_import_jobs.knowledge_base_id,
+          scheduled_import_jobs.status,
+          scheduled_import_jobs.trigger_type,
+          scheduled_import_jobs.scan_result,
+          staged_scan.scan_result_preview,
+          staged_scan.staged_item_count,
+          scheduled_import_jobs.started_at,
+          scheduled_import_jobs.finished_at,
+          scheduled_import_jobs.duration_ms,
+          scheduled_import_jobs.retry_count,
+          scheduled_import_jobs.retryable,
+          scheduled_import_jobs.next_retry_at,
+          scheduled_import_jobs.error,
+          scheduled_import_jobs.scheduled_for,
+          scheduled_import_jobs.created_at,
+          scheduled_import_jobs.updated_at
+        from scheduled_import_jobs
+        left join lateral (
+          select
+            jsonb_build_object(
+              'new_sources', coalesce(jsonb_agg(payload order by updated_at desc, id desc) filter (where item_kind = 'new'), '[]'::jsonb),
+              'changed_sources', coalesce(jsonb_agg(payload order by updated_at desc, id desc) filter (where item_kind = 'changed'), '[]'::jsonb),
+              'delete_candidates', coalesce(jsonb_agg(payload order by updated_at desc, id desc) filter (where item_kind = 'delete_candidate'), '[]'::jsonb),
+              'skipped', coalesce(jsonb_agg(payload order by updated_at desc, id desc) filter (where item_kind in ('skipped', 'failed')), '[]'::jsonb)
+            ) as scan_result_preview,
+            count(*) as staged_item_count
+          from (
+            select id, item_kind, payload, updated_at
+            from source_watch_scan_items
+            where scheduled_import_job_id = scheduled_import_jobs.id
+              and item_kind in ('new', 'changed', 'delete_candidate', 'skipped', 'failed')
+            order by updated_at desc, id desc
+            limit 400
+          ) staged_items
+        ) staged_scan on true
+        where scheduled_import_jobs.source_watch_rule_id = ${ruleId}
+        order by scheduled_import_jobs.updated_at desc, scheduled_import_jobs.id desc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from scheduled_import_jobs
+        where source_watch_rule_id = ${ruleId}
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items: itemsResult.rows.map(toScheduledImportJobRecord),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
+  async getBatchImportById(batchId: string): Promise<BatchImportRecord | null> {
+    const result = await sql<BatchImportRow>`
+      select
+        id,
+        tenant_id,
+        project_id,
+        knowledge_base_id,
+        source_type,
+        status,
+        total_items,
+        accepted_items,
+        skipped_items,
+        validation_error_count,
+        completed_items,
+        failed_items,
+        enqueue_cursor,
+        retry_cursor,
+        metadata,
+        created_at,
+        updated_at
+      from upload_batches
+      where id = ${batchId}
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toBatchImportRecord(row);
+  }
+
+  async listBatchImportItems(
+    batchId: string,
+    input: Omit<PaginatedReadInput, "knowledgeBaseId">,
+  ): Promise<PaginatedBatchImportItemReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<BatchImportItemRow>`
+        select
+          id,
+          tenant_id,
+          project_id,
+          knowledge_base_id,
+          batch_id,
+          item_index,
+          source_type,
+          external_id,
+          idempotency_key,
+          status,
+          source_document_id,
+          ingest_job_id,
+          safe_error,
+          metadata,
+          created_at,
+          updated_at
+        from upload_batch_items
+        where batch_id = ${batchId}
+        order by item_index asc, id asc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from upload_batch_items
+        where batch_id = ${batchId}
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items: itemsResult.rows.map(toBatchImportItemRecord),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
+  async getScheduledImportJobById(jobId: string): Promise<ScheduledImportJobRecord | null> {
+    const result = await sql<ScheduledImportJobRow>`
+      select
+        scheduled_import_jobs.id,
+        scheduled_import_jobs.source_watch_rule_id,
+        scheduled_import_jobs.knowledge_base_id,
+        scheduled_import_jobs.status,
+        scheduled_import_jobs.trigger_type,
+        scheduled_import_jobs.scan_result,
+        staged_scan.scan_result_preview,
+        staged_scan.staged_item_count,
+        scheduled_import_jobs.started_at,
+        scheduled_import_jobs.finished_at,
+        scheduled_import_jobs.duration_ms,
+        scheduled_import_jobs.retry_count,
+        scheduled_import_jobs.retryable,
+        scheduled_import_jobs.next_retry_at,
+        scheduled_import_jobs.error,
+        scheduled_import_jobs.scheduled_for,
+        scheduled_import_jobs.created_at,
+        scheduled_import_jobs.updated_at
+      from scheduled_import_jobs
+      left join lateral (
+        select
+          jsonb_build_object(
+            'new_sources', coalesce(jsonb_agg(payload order by updated_at desc, id desc) filter (where item_kind = 'new'), '[]'::jsonb),
+            'changed_sources', coalesce(jsonb_agg(payload order by updated_at desc, id desc) filter (where item_kind = 'changed'), '[]'::jsonb),
+            'delete_candidates', coalesce(jsonb_agg(payload order by updated_at desc, id desc) filter (where item_kind = 'delete_candidate'), '[]'::jsonb),
+            'skipped', coalesce(jsonb_agg(payload order by updated_at desc, id desc) filter (where item_kind in ('skipped', 'failed')), '[]'::jsonb)
+          ) as scan_result_preview,
+          count(*) as staged_item_count
+        from (
+          select id, item_kind, payload, updated_at
+          from source_watch_scan_items
+          where scheduled_import_job_id = scheduled_import_jobs.id
+            and item_kind in ('new', 'changed', 'delete_candidate', 'skipped', 'failed')
+          order by updated_at desc, id desc
+          limit 400
+        ) staged_items
+      ) staged_scan on true
+      where scheduled_import_jobs.id = ${jobId}
+      limit 1
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return row === undefined ? null : toScheduledImportJobRecord(row);
+  }
+
+  async listSourceWatchScanItems(
+    input: SourceWatchScanItemReadInput,
+  ): Promise<PaginatedSourceWatchScanItemReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const itemKindPredicate =
+      input.itemKind === undefined ? sql`true` : sql`item_kind = ${input.itemKind}`;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<SourceWatchScanItemRow>`
+        select
+          item_kind,
+          comparison_status,
+          content_hash,
+          cursor,
+          payload,
+          safe_error,
+          source_identity,
+          source_path,
+          source_url
+        from source_watch_scan_items
+        where scheduled_import_job_id = ${input.scheduledImportJobId}
+          and ${itemKindPredicate}
+        order by updated_at desc, id desc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from source_watch_scan_items
+        where scheduled_import_job_id = ${input.scheduledImportJobId}
+          and ${itemKindPredicate}
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items: itemsResult.rows.map(toSourceWatchScanStageItem),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
+  async listWebhooks(
+    scope: ApiResourceScope,
+    input: Omit<PaginatedReadInput, "knowledgeBaseId">,
+  ): Promise<PaginatedWebhookReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<WebhookRow>`
+        select
+          id,
+          tenant_id,
+          project_id,
+          knowledge_base_id,
+          target_url,
+          event_types,
+          status,
+          secret_configured,
+          secret_ciphertext,
+          created_at,
+          updated_at
+        from webhooks
+        where tenant_id = ${scope.tenantId}
+          and project_id = ${scope.projectId}
+        order by updated_at desc, id desc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from webhooks
+        where tenant_id = ${scope.tenantId}
+          and project_id = ${scope.projectId}
+      `.execute(this.db),
+    ]);
+    const items = itemsResult.rows.map(toWebhookRecord);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items,
+      latestDeliveriesByWebhookId: await this.listLatestWebhookDeliveriesByWebhookIds(
+        items.map((item) => item.id),
+      ),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
+  async getWebhookById(
+    scope: ApiResourceScope,
+    webhookId: string,
+  ): Promise<WebhookDetailReadResult | null> {
+    const result = await sql<WebhookRow>`
+      select
+        id,
+        tenant_id,
+        project_id,
+        knowledge_base_id,
+        target_url,
+        event_types,
+        status,
+        secret_configured,
+        secret_ciphertext,
+        created_at,
+        updated_at
+      from webhooks
+      where id = ${webhookId}
+        and tenant_id = ${scope.tenantId}
+        and project_id = ${scope.projectId}
+      limit 1
+    `.execute(this.db);
+    const webhook = result.rows[0] === undefined ? null : toWebhookRecord(result.rows[0]);
+
+    if (webhook === null) {
+      return null;
+    }
+
+    const latestDeliveries = await this.listLatestWebhookDeliveriesByWebhookIds([webhook.id]);
+
+    return {
+      webhook,
+      latestDelivery: latestDeliveries.get(webhook.id) ?? null,
+    };
+  }
+
+  async listMatchingWebhooks(input: {
+    scope: ApiResourceScope;
+    eventType: WebhookEventType;
+    knowledgeBaseId: string | null;
+  }): Promise<WebhookRecord[]> {
+    const result = await sql<WebhookRow>`
+      select
+        id,
+        tenant_id,
+        project_id,
+        knowledge_base_id,
+        target_url,
+        event_types,
+        status,
+        secret_configured,
+        secret_ciphertext,
+        created_at,
+        updated_at
+      from webhooks
+      where tenant_id = ${input.scope.tenantId}
+        and project_id = ${input.scope.projectId}
+        and status = 'enabled'
+        and ${input.eventType} = any(event_types)
+        and (
+          knowledge_base_id is null
+          or knowledge_base_id = ${input.knowledgeBaseId}
+        )
+      order by updated_at desc, id desc
+    `.execute(this.db);
+
+    return result.rows.map(toWebhookRecord);
+  }
+
+  async listWebhookDeliveriesByWebhookId(
+    webhookId: string,
+    input: Omit<PaginatedReadInput, "knowledgeBaseId">,
+  ): Promise<PaginatedWebhookDeliveryReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<WebhookDeliveryRow>`
+        select
+          id,
+          webhook_id,
+          knowledge_base_id,
+          event_type,
+          payload,
+          status,
+          request_trace,
+          response_status,
+          response_body,
+          attempt_count,
+          max_attempts,
+          next_attempt_at,
+          last_attempt_at,
+          signing,
+          created_at,
+          delivered_at
+        from webhook_deliveries
+        where webhook_id = ${webhookId}
+        order by created_at desc, id desc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from webhook_deliveries
+        where webhook_id = ${webhookId}
+      `.execute(this.db),
+    ]);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items: itemsResult.rows.map(toWebhookDeliveryRecord),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
+  async listDeletionCleanupOperations(
+    scope: ApiResourceScope,
+    input: DeletionCleanupReadInput,
+  ): Promise<PaginatedDeletionCleanupReadResult> {
+    const offset = (input.page - 1) * input.pageSize;
+    const knowledgeBaseId = input.knowledgeBaseId ?? null;
+    const status = input.status ?? null;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<DeletionCleanupOperationRow>`
+        select
+          id,
+          target_type,
+          target_id,
+          knowledge_base_id,
+          status,
+          phase,
+          requested_by,
+          request_id,
+          queue_job_id,
+          manifest,
+          total_item_count,
+          pending_item_count,
+          deleted_item_count,
+          skipped_item_count,
+          failed_item_count,
+          object_key_count,
+          database_row_count,
+          attempt_count,
+          max_attempts,
+          retry_after,
+          retryable,
+          last_error,
+          retention_expires_at,
+          item_retention_expires_at,
+          started_at,
+          completed_at,
+          failed_at,
+          canceled_at,
+          created_at,
+          updated_at
+        from deletion_cleanup_operations
+        where tenant_id = ${scope.tenantId}
+          and project_id = ${scope.projectId}
+          and (${knowledgeBaseId}::text is null or knowledge_base_id = ${knowledgeBaseId})
+          and (${status}::text is null or status = ${status})
+        order by updated_at desc, id desc
+        limit ${input.pageSize}
+        offset ${offset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from deletion_cleanup_operations
+        where tenant_id = ${scope.tenantId}
+          and project_id = ${scope.projectId}
+          and (${knowledgeBaseId}::text is null or knowledge_base_id = ${knowledgeBaseId})
+          and (${status}::text is null or status = ${status})
+      `.execute(this.db),
+    ]);
+    const items = itemsResult.rows.map(toDeletionCleanupOperationRecord);
+    const total = readCount(totalResult.rows[0]?.total);
+
+    return {
+      items,
+      itemsByOperationId: new Map(),
+      total,
+      hasMore: offset + input.pageSize < total,
+    };
+  }
+
+  async getDeletionCleanupOperationById(
+    scope: ApiResourceScope,
+    operationId: string,
+    input: Omit<PaginatedReadInput, "knowledgeBaseId">,
+  ): Promise<DeletionCleanupDetailReadResult | null> {
+    const result = await sql<DeletionCleanupOperationRow>`
+      select
+        id,
+        target_type,
+        target_id,
+        knowledge_base_id,
+        status,
+        phase,
+        requested_by,
+        request_id,
+        queue_job_id,
+        manifest,
+        total_item_count,
+        pending_item_count,
+        deleted_item_count,
+        skipped_item_count,
+        failed_item_count,
+        object_key_count,
+        database_row_count,
+        attempt_count,
+        max_attempts,
+        retry_after,
+        retryable,
+        last_error,
+        retention_expires_at,
+        item_retention_expires_at,
+        started_at,
+        completed_at,
+        failed_at,
+        canceled_at,
+        created_at,
+        updated_at
+      from deletion_cleanup_operations
+      where id = ${operationId}
+        and tenant_id = ${scope.tenantId}
+        and project_id = ${scope.projectId}
+      limit 1
+    `.execute(this.db);
+    const operation =
+      result.rows[0] === undefined ? null : toDeletionCleanupOperationRecord(result.rows[0]);
+
+    if (operation === null) {
+      return null;
+    }
+
+    const itemOffset = (input.page - 1) * input.pageSize;
+    const [itemsResult, totalResult] = await Promise.all([
+      sql<DeletionCleanupItemRow>`
+        select
+          id,
+          operation_id,
+          item_type,
+          resource_type,
+          resource_id,
+          object_key,
+          table_name,
+          knowledge_base_id,
+          source_document_id,
+          status,
+          phase,
+          attempt_count,
+          max_attempts,
+          last_error,
+          skip_reason,
+          retry_after,
+          retained_until,
+          created_at,
+          updated_at,
+          completed_at
+        from deletion_cleanup_items
+        where operation_id = ${operation.id}
+        order by created_at asc, id asc
+        limit ${input.pageSize}
+        offset ${itemOffset}
+      `.execute(this.db),
+      sql<{ total: string | number | bigint }>`
+        select count(*) as total
+        from deletion_cleanup_items
+        where operation_id = ${operation.id}
+      `.execute(this.db),
+    ]);
+    const itemTotal = readCount(totalResult.rows[0]?.total);
+
+    return {
+      operation,
+      items: itemsResult.rows.map(toDeletionCleanupItemRecord),
+      itemTotal,
+      itemHasMore: itemOffset + input.pageSize < itemTotal,
+    };
+  }
+
+  async listJobEventsByJobIds(jobIds: readonly string[]): Promise<Map<string, JobEventRecord[]>> {
+    const grouped = new Map<string, JobEventRecord[]>();
+
+    if (jobIds.length === 0) {
+      return grouped;
+    }
+
+    const result = await sql<JobEventRow>`
+      select job_id, event_type, message, metadata, created_at
+      from job_events
+      where job_id in (${sql.join(jobIds)})
+      order by job_id asc, created_at asc, id asc
+    `.execute(this.db);
+
+    for (const row of result.rows) {
+      const event = toJobEventRecord(row);
+      const events = grouped.get(event.jobId) ?? [];
+      events.push(event);
+      grouped.set(event.jobId, events);
+    }
+
+    return grouped;
+  }
+
+  async getKnowledgeBaseIngestProgress(
+    knowledgeBaseId: string,
+    representativeJobLimit: number,
+  ): Promise<KnowledgeBaseIngestProgressReadResult> {
+    const [countsResult, stageResult, jobsResult] = await Promise.all([
+      sql<ProgressCountsRow>`
+        select
+          count(*)::bigint as total,
+          count(*) filter (where status = 'queued')::bigint as queued,
+          count(*) filter (where status = 'running')::bigint as running,
+          count(*) filter (where status = 'completed')::bigint as completed,
+          count(*) filter (where status = 'failed')::bigint as failed,
+          count(*) filter (where status = 'canceled')::bigint as canceled,
+          coalesce(sum(
+            case
+              when status = 'completed' then 100
+              when status in ('failed', 'canceled') then least(greatest(progress, 0), 99)
+              else least(greatest(progress, 0), 99)
+            end
+          ), 0)::bigint as progress_sum,
+          to_char(max(queued_at) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+            as latest_job_created_at,
+          to_char(max(updated_at) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+            as latest_job_updated_at
+        from jobs
+        where knowledge_base_id = ${knowledgeBaseId}
+          and coalesce(job_type, '') <> 'graph.insights.refresh'
+      `.execute(this.db),
+      sql<StageCountRow>`
+        select coalesce(stage, 'parsing') as stage, count(*)::bigint as total
+        from jobs
+        where knowledge_base_id = ${knowledgeBaseId}
+          and coalesce(job_type, '') <> 'graph.insights.refresh'
+        group by coalesce(stage, 'parsing')
+      `.execute(this.db),
+      sql<JobRow>`
+        select
+          id,
+          knowledge_base_id,
+          source_document_id,
+          job_type,
+          status,
+          stage,
+          progress,
+          progress_message,
+          idempotency_key,
+          dedupe_key,
+          result,
+          error,
+          metadata,
+          queued_at,
+          updated_at
+        from jobs
+        where knowledge_base_id = ${knowledgeBaseId}
+          and coalesce(job_type, '') <> 'graph.insights.refresh'
+        order by updated_at desc, id desc
+        limit ${representativeJobLimit}
+      `.execute(this.db),
+    ]);
+    const countsRow = countsResult.rows[0];
+    const counts: Record<JobStatus, number> = {
+      canceled: readCount(countsRow?.canceled),
+      completed: readCount(countsRow?.completed),
+      failed: readCount(countsRow?.failed),
+      queued: readCount(countsRow?.queued),
+      running: readCount(countsRow?.running),
+    };
+    const total = readCount(countsRow?.total);
+    const stageCounts = createEmptyStageCounts();
+
+    for (const row of stageResult.rows) {
+      const stage = readJobStage(row.stage);
+      stageCounts[stage] = readCount(row.total);
+    }
+
+    return {
+      counts,
+      stageCounts,
+      latestJobCreatedAt: countsRow?.latest_job_created_at ?? null,
+      latestJobUpdatedAt: countsRow?.latest_job_updated_at ?? null,
+      overallProgress:
+        total === 0
+          ? 100
+          : Math.min(100, Math.max(0, Math.round(readCount(countsRow?.progress_sum) / total))),
+      representativeJobs: jobsResult.rows.map(toJobRecord),
+    };
+  }
+
+  async getRuntimeSourceJobSummary(): Promise<RuntimeSourceJobSummary> {
+    const durationSampleLimit = 50_000;
+    const [countsResult, stageResult, durationResult] = await Promise.all([
+      sql<RuntimeSourceJobCountsRow>`
+        select
+          count(*)::bigint as total,
+          count(*) filter (where status = 'queued')::bigint as queued,
+          count(*) filter (where status = 'running')::bigint as running,
+          count(*) filter (where status = 'completed')::bigint as completed,
+          count(*) filter (where status = 'failed')::bigint as failed,
+          count(*) filter (where status = 'canceled')::bigint as canceled,
+          count(*) filter (
+            where nullif(metadata->>'retry_of_job_id', '') is not null
+          )::bigint as retry_count
+        from jobs
+        where coalesce(job_type, '') <> 'graph.insights.refresh'
+      `.execute(this.db),
+      sql<StageCountRow>`
+        select coalesce(stage, 'parsing') as stage, count(*)::bigint as total
+        from jobs
+        where coalesce(job_type, '') <> 'graph.insights.refresh'
+        group by coalesce(stage, 'parsing')
+      `.execute(this.db),
+      sql<RuntimeSourceJobDurationRow>`
+        with duration_events as (
+          select
+            coalesce(metadata->>'stage', 'parsing') as stage,
+            (metadata->>'stage_duration_ms')::double precision as duration_ms,
+            created_at
+          from job_events
+          where jsonb_typeof(metadata) = 'object'
+            and metadata ? 'stage_duration_ms'
+            and (metadata->>'stage_duration_ms') ~ '^[0-9]+(\\.[0-9]+)?$'
+          order by created_at desc
+          limit ${durationSampleLimit}
+        )
+        select
+          stage,
+          count(*)::bigint as count,
+          round(avg(duration_ms))::bigint as avg_ms,
+          round(max(duration_ms))::bigint as max_ms,
+          round(min(duration_ms))::bigint as min_ms,
+          round((array_agg(duration_ms order by created_at desc))[1])::bigint as latest_ms
+        from duration_events
+        group by stage
+      `.execute(this.db),
+    ]);
+    const countsRow = countsResult.rows[0];
+    const statusCounts: Record<JobStatus, number> = {
+      canceled: readCount(countsRow?.canceled),
+      completed: readCount(countsRow?.completed),
+      failed: readCount(countsRow?.failed),
+      queued: readCount(countsRow?.queued),
+      running: readCount(countsRow?.running),
+    };
+    const stageCounts = createEmptyStageCounts();
+    const stageDurations: Record<string, RuntimeSourceJobDurationSummary> = {};
+
+    for (const row of stageResult.rows) {
+      stageCounts[readJobStage(row.stage)] = readCount(row.total);
+    }
+
+    for (const row of durationResult.rows) {
+      stageDurations[readJobStage(row.stage)] = {
+        avgMs: readCount(row.avg_ms),
+        count: readCount(row.count),
+        latestMs: readCount(row.latest_ms),
+        maxMs: readCount(row.max_ms),
+        minMs: readCount(row.min_ms),
+      };
+    }
+
+    return {
+      activeJobs: statusCounts.running,
+      queueDepth: statusCounts.queued,
+      retryCount: readCount(countsRow?.retry_count),
+      stageCounts,
+      stageDurations,
+      statusCounts,
+      total: readCount(countsRow?.total),
+    };
+  }
+
+  async getDeletionCleanupQueueSummary(): Promise<DeletionCleanupQueueSummary> {
+    const result = await sql<DeletionCleanupQueueSummaryRow>`
+      select
+        count(*) filter (where status in ('queued', 'running'))::bigint as pending,
+        count(*) filter (where status = 'failed')::bigint as failed
+      from deletion_cleanup_operations
+    `.execute(this.db);
+    const row = result.rows[0];
+
+    return {
+      failed: readCount(row?.failed),
+      pending: readCount(row?.pending),
+    };
+  }
+
+  private async listLatestWebhookDeliveriesByWebhookIds(
+    webhookIds: readonly string[],
+  ): Promise<Map<string, WebhookDeliveryRecord>> {
+    const grouped = new Map<string, WebhookDeliveryRecord>();
+
+    if (webhookIds.length === 0) {
+      return grouped;
+    }
+
+    const result = await sql<WebhookDeliveryRow>`
+      select distinct on (webhook_id)
+        id,
+        webhook_id,
+        knowledge_base_id,
+        event_type,
+        payload,
+        status,
+        request_trace,
+        response_status,
+        response_body,
+        attempt_count,
+        max_attempts,
+        next_attempt_at,
+        last_attempt_at,
+        signing,
+        created_at,
+        delivered_at
+      from webhook_deliveries
+      where webhook_id in (${sql.join(webhookIds)})
+      order by webhook_id asc, created_at desc, id desc
+    `.execute(this.db);
+
+    for (const row of result.rows) {
+      const record = toWebhookDeliveryRecord(row);
+      grouped.set(record.webhookId, record);
+    }
+
+    return grouped;
+  }
+
+  private async listDeletionCleanupItemsByOperationIds(
+    operationIds: readonly string[],
+  ): Promise<Map<string, DeletionCleanupItemRecord[]>> {
+    const grouped = new Map<string, DeletionCleanupItemRecord[]>();
+
+    if (operationIds.length === 0) {
+      return grouped;
+    }
+
+    const result = await sql<DeletionCleanupItemRow>`
+      select
+        id,
+        operation_id,
+        item_type,
+        resource_type,
+        resource_id,
+        object_key,
+        table_name,
+        knowledge_base_id,
+        source_document_id,
+        status,
+        phase,
+        attempt_count,
+        max_attempts,
+        last_error,
+        skip_reason,
+        retry_after,
+        retained_until,
+        created_at,
+        updated_at,
+        completed_at
+      from deletion_cleanup_items
+      where operation_id in (${sql.join(operationIds)})
+      order by operation_id asc, created_at asc, id asc
+    `.execute(this.db);
+
+    for (const row of result.rows) {
+      const record = toDeletionCleanupItemRecord(row);
+      const current = grouped.get(record.operationId) ?? [];
+      current.push(record);
+      grouped.set(record.operationId, current);
+    }
+
+    return grouped;
+  }
+}
+
+interface JobRow {
+  id: string;
+  knowledge_base_id: string | null;
+  source_document_id: string | null;
+  job_type: string | null;
+  status: string;
+  stage: string | null;
+  progress: number;
+  progress_message: string | null;
+  idempotency_key: string | null;
+  dedupe_key: string | null;
+  result: unknown;
+  error: unknown;
+  metadata: unknown;
+  queued_at: unknown;
+  updated_at: unknown;
+}
+
+interface BackgroundOperationRow {
+  id: string;
+  job_id: string | null;
+  knowledge_base_id: string | null;
+  operation_kind: string;
+  stage: string;
+  status: string;
+  cursor: unknown;
+  processed_count: string | number | bigint;
+  failed_count: string | number | bigint;
+  total_count: string | number | bigint | null;
+  last_item_id: string | null;
+  safe_error: unknown;
+  metadata: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
+interface KnowledgeBaseRow {
+  id: string;
+  name: string;
+  slug: string;
+  description: string | null;
+  knowledge_base_type: string | null;
+  upstream_knowledge_base_id: string | null;
+  upstream_base_version_id: string | null;
+  upstream_synced_version_id: string | null;
+  fork_owner_type: string | null;
+  fork_owner_external_id: string | null;
+  fork_owner_display_name: string | null;
+  sync_status: string | null;
+  template: string;
+  output_language: string;
+  status: string;
+  current_version_id: string | null;
+  created_at: unknown;
+  updated_at: unknown;
+  purpose: unknown;
+  wiki_schema: unknown;
+  retrieval_settings: unknown;
+}
+
+interface DatasetConfigurationRow {
+  id: string;
+  knowledge_base_id: string;
+  preset_id: string;
+  status: string;
+  version: number;
+  values: unknown;
+  latest_snapshot_id: string;
+  updated_by: string | null;
+  metadata: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
+interface KnowledgeCheckRow {
+  id: string;
+  knowledge_base_id: string;
+  status: string;
+  progress: number;
+  findings: unknown;
+  findings_count?: string | number | bigint | null;
+  findings_preview?: unknown;
+  metadata: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
+interface SourceDocumentRow {
+  id: string;
+  tenant_id: string;
+  project_id: string;
+  knowledge_base_id: string;
+  source_type: string;
+  name: string;
+  status: string;
+  content_hash: string | null;
+  object_key: string | null;
+  mime_type: string | null;
+  size_bytes: string | number | bigint | null;
+  metadata: unknown;
+  ocr_status: string | null;
+  ocr_summary: unknown;
+  visibility_origin: string | null;
+  owner_knowledge_base_id: string | null;
+  upstream_resource_id: string | null;
+  fork_tombstoned_at: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
+interface UploadSessionRow {
+  id: string;
+  tenant_id: string;
+  project_id: string;
+  actor_type: string;
+  actor_id: string;
+  actor_source: string;
+  actor_account_id: string | null;
+  knowledge_base_id: string;
+  document_id: string;
+  object_key: string;
+  file_name: string;
+  display_name: string;
+  mime_type: string;
+  size_bytes: string | number | bigint;
+  content_hash: string | null;
+  source_path: string | null;
+  metadata: unknown;
+  status: string;
+  idempotency_key: string | null;
+  finalize_idempotency_key: string | null;
+  finalized_document_id: string | null;
+  finalized_job_id: string | null;
+  cleanup_operation_id: string | null;
+  expires_at: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
+interface ParsedContentRow {
+  id: string;
+  source_document_id: string;
+  parser_name: string;
+  parser_version: string;
+  normalized_markdown_object_key: string;
+  captioned_markdown_object_key: string | null;
+  markdown_preview: string | null;
+  markdown_preview_object_key: string | null;
+  markdown_preview_truncated: boolean;
+  plain_text_object_key: string | null;
+  locators: unknown;
+  tables: unknown;
+  warnings: unknown;
+  ocr_status: string | null;
+  ocr_summary: unknown;
+  ocr_warnings: unknown;
+  ocr_provider_metadata: unknown;
+  ocr_page_count: number;
+  ocr_block_count: number;
+  ocr_derived_segment_count: number;
+  ocr_completed_at: unknown;
+  ocr_blocks: unknown;
+  error: unknown;
+  created_at: unknown;
+}
+
+interface MediaAssetRow {
+  id: string;
+  source_document_id: string;
+  parsed_content_id: string | null;
+  mime_type: string;
+  object_key: string;
+  hash: string | null;
+  locator: unknown;
+  width: number | null;
+  height: number | null;
+  caption_status: string;
+  caption: string | null;
+  caption_provider_name: string | null;
+  caption_model: string | null;
+  caption_prompt_version: string | null;
+  caption_model_call_id: string | null;
+  caption_cache_hit: boolean;
+  caption_attempt_count: number;
+  caption_error: unknown;
+  caption_generated_at: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
+interface DocumentProcessingUnitRow {
+  id: string;
+  source_document_id: string;
+  job_id: string;
+  parsed_content_id: string | null;
+  stage: string;
+  unit_type: string;
+  unit_key: string;
+  unit_index: number | null;
+  attempt_scope: string;
+  status: string;
+  content_hash: string | null;
+  dedupe_key: string;
+  object_key: string | null;
+  object_refs: unknown;
+  locator: unknown;
+  counters: unknown;
+  warnings: unknown;
+  safe_error: unknown;
+  metadata: unknown;
+  retry_eligible: boolean;
+  completed_at: unknown;
+  updated_at: unknown;
+}
+
+interface WikiPageRecordRow {
+  id: string;
+  knowledge_base_id: string;
+  slug: string;
+  title: string;
+  page_type: string;
+  status: string;
+  current_version_id: string | null;
+  frontmatter: unknown;
+  source_document_ids: string[] | null;
+  metadata: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
+interface WikiPageVersionRecordRow {
+  id: string;
+  page_id: string;
+  knowledge_version_id: string | null;
+  version_number: number;
+  title: string;
+  frontmatter: unknown;
+  source_snapshot: unknown;
+  prompt_version: string | null;
+  created_by: string | null;
+  created_at: unknown;
+}
+
+interface SourceWatchRuleRow {
+  id: string;
+  knowledge_base_id: string;
+  name: string;
+  source_type: string;
+  location: string;
+  auto_ingest_enabled: boolean;
+  include_patterns: string[] | null;
+  exclude_patterns: string[] | null;
+  status: string;
+  schedule: unknown;
+  metadata: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
+interface BatchImportRow {
+  id: string;
+  tenant_id: string;
+  project_id: string;
+  knowledge_base_id: string;
+  source_type: string;
+  status: string;
+  total_items: number;
+  accepted_items: number;
+  skipped_items: number;
+  validation_error_count: number;
+  completed_items: number;
+  failed_items: number;
+  enqueue_cursor: number;
+  retry_cursor: number;
+  metadata: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
+interface BatchImportItemRow {
+  id: string;
+  tenant_id: string;
+  project_id: string;
+  knowledge_base_id: string;
+  batch_id: string;
+  item_index: number;
+  source_type: string;
+  external_id: string | null;
+  idempotency_key: string | null;
+  status: string;
+  source_document_id: string | null;
+  ingest_job_id: string | null;
+  safe_error: unknown;
+  metadata: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
+interface ScheduledImportJobRow {
+  id: string;
+  source_watch_rule_id: string | null;
+  knowledge_base_id: string;
+  status: string;
+  trigger_type: string;
+  scan_result: unknown;
+  scan_result_preview?: unknown;
+  staged_item_count?: string | number | bigint | null;
+  started_at: unknown;
+  finished_at: unknown;
+  duration_ms: number | null;
+  retry_count: number | null;
+  retryable: boolean | null;
+  next_retry_at: unknown;
+  error: unknown;
+  scheduled_for: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
+interface SourceWatchScanItemRow {
+  item_kind: string;
+  comparison_status: string | null;
+  content_hash: string | null;
+  cursor: unknown;
+  payload: unknown;
+  safe_error: unknown;
+  source_identity: string;
+  source_path: string | null;
+  source_url: string | null;
+}
+
+interface WebhookRow {
+  id: string;
+  tenant_id: string;
+  project_id: string;
+  knowledge_base_id: string | null;
+  target_url: string;
+  event_types: string[] | null;
+  status: string;
+  secret_configured: boolean;
+  secret_ciphertext: string | null;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
+interface WebhookDeliveryRow {
+  id: string;
+  webhook_id: string | null;
+  knowledge_base_id: string | null;
+  event_type: string;
+  payload: unknown;
+  status: string;
+  request_trace: unknown;
+  response_status: number | null;
+  response_body: string | null;
+  attempt_count: number;
+  max_attempts: number;
+  next_attempt_at: unknown;
+  last_attempt_at: unknown;
+  signing: unknown;
+  created_at: unknown;
+  delivered_at: unknown;
+}
+
+interface DeletionCleanupOperationRow {
+  id: string;
+  target_type: string;
+  target_id: string;
+  knowledge_base_id: string | null;
+  status: string;
+  phase: string;
+  requested_by: string | null;
+  request_id: string | null;
+  queue_job_id: string | null;
+  manifest: unknown;
+  total_item_count: number;
+  pending_item_count: number;
+  deleted_item_count: number;
+  skipped_item_count: number;
+  failed_item_count: number;
+  object_key_count: number;
+  database_row_count: number;
+  attempt_count: number;
+  max_attempts: number;
+  retry_after: unknown;
+  retryable: boolean;
+  last_error: unknown;
+  retention_expires_at: unknown;
+  item_retention_expires_at: unknown;
+  started_at: unknown;
+  completed_at: unknown;
+  failed_at: unknown;
+  canceled_at: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
+interface DeletionCleanupItemRow {
+  id: string;
+  operation_id: string;
+  item_type: string;
+  resource_type: string | null;
+  resource_id: string | null;
+  object_key: string | null;
+  table_name: string | null;
+  knowledge_base_id: string | null;
+  source_document_id: string | null;
+  status: string;
+  phase: string;
+  attempt_count: number;
+  max_attempts: number;
+  last_error: unknown;
+  skip_reason: string | null;
+  retry_after: unknown;
+  retained_until: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+  completed_at: unknown;
+}
+
+interface JobEventRow {
+  job_id: string;
+  event_type: string;
+  message: string | null;
+  metadata: unknown;
+  created_at: unknown;
+}
+
+interface ProgressCountsRow {
+  total: string | number | bigint;
+  queued: string | number | bigint;
+  running: string | number | bigint;
+  completed: string | number | bigint;
+  failed: string | number | bigint;
+  canceled: string | number | bigint;
+  progress_sum: string | number | bigint;
+  latest_job_created_at: string | null;
+  latest_job_updated_at: string | null;
+}
+
+interface RuntimeSourceJobCountsRow {
+  total: string | number | bigint;
+  queued: string | number | bigint;
+  running: string | number | bigint;
+  completed: string | number | bigint;
+  failed: string | number | bigint;
+  canceled: string | number | bigint;
+  retry_count: string | number | bigint;
+}
+
+interface StageCountRow {
+  stage: string;
+  total: string | number | bigint;
+}
+
+interface RuntimeSourceJobDurationRow {
+  stage: string;
+  count: string | number | bigint;
+  avg_ms: string | number | bigint;
+  max_ms: string | number | bigint;
+  min_ms: string | number | bigint;
+  latest_ms: string | number | bigint;
+}
+
+interface DeletionCleanupQueueSummaryRow {
+  failed: string | number | bigint;
+  pending: string | number | bigint;
+}
+
+const jobStages: readonly JobStage[] = [
+  "uploading",
+  "parsing",
+  "ocr",
+  "captioning",
+  "analyzing",
+  "generating",
+  "merging",
+  "indexing",
+];
+
+function toKnowledgeBaseResponse(row: KnowledgeBaseRow): KnowledgeBaseResponse {
+  const response: KnowledgeBaseResponse = {
+    id: row.id,
+    name: row.name,
+    slug: row.slug,
+    knowledge_base_type: readKnowledgeBaseType(row.knowledge_base_type),
+    upstream_knowledge_base_id: row.upstream_knowledge_base_id,
+    upstream_base_version_id: row.upstream_base_version_id,
+    upstream_synced_version_id: row.upstream_synced_version_id,
+    fork_owner: readKnowledgeBaseForkOwner(row),
+    sync_status: readKnowledgeBaseSyncStatus(row.sync_status),
+    template: readKnowledgeBaseTemplate(row.template),
+    output_language: readKnowledgeBaseOutputLanguage(row.output_language),
+    status: readKnowledgeBaseStatus(row.status),
+    current_version_id: row.current_version_id ?? "",
+    purpose: readPurposeText(row.purpose),
+    schema: normalizeJsonObject(row.wiki_schema),
+    retrieval: normalizeJsonObject(row.retrieval_settings),
+    created_at: normalizeTimestamp(row.created_at),
+    updated_at: normalizeTimestamp(row.updated_at),
+  };
+
+  if (row.description !== null) {
+    response.description = row.description;
+  }
+
+  return response;
+}
+
+function toDatasetConfigurationResponse(
+  row: DatasetConfigurationRow,
+): DatasetConfigurationResponse {
+  return {
+    id: row.id,
+    knowledge_base_id: row.knowledge_base_id,
+    preset_id: readKnowledgeBaseTemplate(row.preset_id),
+    status: readDatasetConfigurationStatus(row.status),
+    version: row.version,
+    values: normalizeJsonObject(row.values) as DatasetConfigurationValues,
+    latest_snapshot_id: row.latest_snapshot_id,
+    created_at: normalizeTimestamp(row.created_at),
+    updated_at: normalizeTimestamp(row.updated_at),
+    updated_by: row.updated_by,
+    metadata: normalizeJsonObject(row.metadata),
+  };
+}
+
+function createEmptyRuntimeSourceJobSummary(): RuntimeSourceJobSummary {
+  const statusCounts: Record<JobStatus, number> = {
+    canceled: 0,
+    completed: 0,
+    failed: 0,
+    queued: 0,
+    running: 0,
+  };
+
+  return {
+    activeJobs: 0,
+    queueDepth: 0,
+    retryCount: 0,
+    stageCounts: createEmptyStageCounts(),
+    stageDurations: {},
+    statusCounts,
+    total: 0,
+  };
+}
+
+function toKnowledgeCheckRecord(row: KnowledgeCheckRow): KnowledgeCheckRecord {
+  const metadata = normalizeJsonObject(row.metadata);
+  const persistedFindings = readJsonArray(row.findings_preview);
+  const fallbackFindings = readJsonArray(row.findings);
+  const findings = persistedFindings.length > 0 ? persistedFindings : fallbackFindings;
+  const semanticRun = readKnowledgeCheckSemanticRun(metadata.semantic_run);
+  const persistedFindingsCount = readCount(row.findings_count ?? undefined);
+
+  return {
+    id: row.id,
+    knowledgeBaseId: row.knowledge_base_id,
+    status: readKnowledgeCheckStatus(row.status),
+    progress: row.progress,
+    checks: readKnowledgeCheckArray(metadata.checks),
+    pageIds: readStringArray(metadata.page_ids),
+    sourceDocumentIds: readStringArray(metadata.source_document_ids),
+    findings: findings as KnowledgeCheckRecord["findings"],
+    semanticRun: {
+      ...semanticRun,
+      findings_count:
+        persistedFindingsCount > 0 ? persistedFindingsCount : semanticRun.findings_count,
+    },
+    configurationSnapshot: normalizeJsonObject(metadata.configuration_snapshot),
+    createdAt: normalizeTimestamp(row.created_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toJobRecord(row: JobRow): JobRecord {
+  const metadata = normalizeJsonObject(row.metadata);
+  const result = normalizeJsonObject(row.result);
+
+  return {
+    id: row.id,
+    knowledgeBaseId: row.knowledge_base_id ?? "",
+    documentId: row.source_document_id,
+    ...(row.job_type === null ? {} : { jobType: row.job_type }),
+    stage: readJobStage(row.stage),
+    status: readJobStatus(row.status),
+    progress: row.progress,
+    progressMessage: row.progress_message ?? "",
+    contentHash: row.dedupe_key ?? readString(metadata.content_hash) ?? "",
+    idempotencyKey: row.idempotency_key,
+    deduped: readBoolean(metadata.deduped) ?? false,
+    lockedByKnowledgeBaseId: readString(metadata.locked_by_knowledge_base_id),
+    inputSnapshotId: readString(metadata.input_snapshot_id) ?? row.id,
+    retryOfJobId: readString(metadata.retry_of_job_id),
+    parsedContentId: readString(result.parsed_content_id),
+    changeSetId: readString(result.change_set_id),
+    error: row.error === null ? null : normalizeJsonObject(row.error),
+    createdAt: normalizeTimestamp(row.queued_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toBackgroundOperationRecord(row: BackgroundOperationRow): BackgroundOperationRecord {
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    knowledgeBaseId: row.knowledge_base_id,
+    operationKind: row.operation_kind,
+    stage: row.stage,
+    status: row.status,
+    cursor: normalizeJsonObject(row.cursor),
+    processedCount: readCount(row.processed_count),
+    failedCount: readCount(row.failed_count),
+    totalCount: row.total_count === null ? null : readCount(row.total_count),
+    lastItemId: row.last_item_id,
+    safeError: row.safe_error === null ? null : normalizeJsonObject(row.safe_error),
+    metadata: normalizeJsonObject(row.metadata),
+    createdAt: normalizeTimestamp(row.created_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toJobEventRecord(row: JobEventRow): JobEventRecord {
+  const metadata = normalizeJsonObject(row.metadata);
+
+  return {
+    jobId: row.job_id,
+    type: readJobEventType(row.event_type),
+    stage: readJobStage(readString(metadata.stage)),
+    status: readJobStatus(readString(metadata.status)),
+    message: row.message ?? "",
+    metadata,
+    createdAt: normalizeTimestamp(row.created_at),
+  };
+}
+
+function toSourceDocumentRecord(row: SourceDocumentRow): SourceDocumentRecord {
+  const metadata = normalizeJsonObject(row.metadata);
+  const sourcePath = readString(metadata.source_path);
+  const sourceUrl = readString(metadata.source_url);
+
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    projectId: row.project_id,
+    knowledgeBaseId: row.knowledge_base_id,
+    name: row.name,
+    displayName: readString(metadata.display_name) ?? row.name,
+    sourceType: readSourceType(row.source_type),
+    mimeType: row.mime_type ?? "application/octet-stream",
+    size: readCount(row.size_bytes ?? undefined),
+    contentHash: row.content_hash ?? "",
+    objectKey: row.object_key ?? "",
+    status: readSourceDocumentStatus(row.status),
+    ...(sourcePath === null ? {} : { sourcePath }),
+    ...(sourceUrl === null ? {} : { sourceUrl }),
+    ...(row.ocr_status === null ? {} : { ocrStatus: row.ocr_status }),
+    ocrSummary: normalizeJsonObject(row.ocr_summary),
+    metadata,
+    visibilityOrigin: readSourceVisibilityOrigin(row.visibility_origin),
+    ownerKnowledgeBaseId: row.owner_knowledge_base_id,
+    upstreamResourceId: row.upstream_resource_id,
+    forkTombstonedAt: normalizeNullableTimestamp(row.fork_tombstoned_at),
+    createdAt: normalizeTimestamp(row.created_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toUploadSessionRecord(row: UploadSessionRow): UploadSessionRecord {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    projectId: row.project_id,
+    actorType: readUploadSessionActorType(row.actor_type),
+    actorId: row.actor_id,
+    actorSource: row.actor_source,
+    actorAccountId: row.actor_account_id,
+    knowledgeBaseId: row.knowledge_base_id,
+    documentId: row.document_id,
+    objectKey: row.object_key,
+    fileName: row.file_name,
+    displayName: row.display_name,
+    mimeType: row.mime_type,
+    size: readCount(row.size_bytes),
+    contentHash: row.content_hash,
+    ...(row.source_path === null ? {} : { sourcePath: row.source_path }),
+    metadata: normalizeJsonObject(row.metadata),
+    status: readUploadSessionStatus(row.status),
+    idempotencyKey: row.idempotency_key,
+    finalizeIdempotencyKey: row.finalize_idempotency_key,
+    finalizedDocumentId: row.finalized_document_id,
+    finalizedJobId: row.finalized_job_id,
+    cleanupOperationId: row.cleanup_operation_id,
+    expiresAt: normalizeTimestamp(row.expires_at),
+    createdAt: normalizeTimestamp(row.created_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toParsedContentRecord(row: ParsedContentRow): ParsedContentRecord {
+  return {
+    id: row.id,
+    documentId: row.source_document_id,
+    parserName: row.parser_name,
+    parserVersion: row.parser_version,
+    normalizedMarkdownObjectKey: row.normalized_markdown_object_key,
+    ...(row.captioned_markdown_object_key === null
+      ? {}
+      : { captionedMarkdownObjectKey: row.captioned_markdown_object_key }),
+    ...(row.markdown_preview === null ? {} : { markdownPreview: row.markdown_preview }),
+    ...(row.markdown_preview_object_key === null
+      ? {}
+      : { markdownPreviewObjectKey: row.markdown_preview_object_key }),
+    markdownPreviewTruncated: row.markdown_preview_truncated,
+    ...(row.plain_text_object_key === null
+      ? {}
+      : { plainTextObjectKey: row.plain_text_object_key }),
+    locators: readJsonObjectArray(row.locators),
+    tables: readJsonObjectArray(row.tables),
+    warnings: readJsonObjectArray(row.warnings),
+    ocrStatus: row.ocr_status ?? "not_required",
+    ocrSummary: normalizeJsonObject(row.ocr_summary),
+    ocrWarnings: readJsonObjectArray(row.ocr_warnings),
+    ocrProviderMetadata: normalizeJsonObject(row.ocr_provider_metadata),
+    ocrPageCount: row.ocr_page_count,
+    ocrBlockCount: row.ocr_block_count,
+    ocrDerivedSegmentCount: row.ocr_derived_segment_count,
+    ocrCompletedAt: normalizeNullableTimestamp(row.ocr_completed_at),
+    ocrBlocks: readJsonObjectArray(row.ocr_blocks),
+    error: normalizeNullableJsonObject(row.error),
+    createdAt: normalizeTimestamp(row.created_at),
+  };
+}
+
+function toMediaAssetRecord(row: MediaAssetRow): MediaAssetRecord {
+  return {
+    id: row.id,
+    documentId: row.source_document_id,
+    parsedContentId: row.parsed_content_id,
+    mimeType: row.mime_type,
+    locator: normalizeJsonObject(row.locator),
+    width: row.width,
+    height: row.height,
+    objectKey: row.object_key,
+    sha256: row.hash ?? "",
+    captionStatus: readMediaCaptionStatus(row.caption_status),
+    caption: row.caption,
+    captionProviderName: row.caption_provider_name,
+    captionModel: row.caption_model,
+    captionPromptVersion: row.caption_prompt_version,
+    captionModelCallId: row.caption_model_call_id,
+    captionCacheHit: row.caption_cache_hit,
+    captionAttemptCount: row.caption_attempt_count,
+    captionError: normalizeNullableJsonObject(row.caption_error),
+    captionGeneratedAt: normalizeNullableTimestamp(row.caption_generated_at),
+    createdAt: normalizeTimestamp(row.created_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toDocumentProcessingUnitRecord(
+  row: DocumentProcessingUnitRow,
+): DocumentProcessingUnitRecord {
+  return {
+    id: row.id,
+    sourceDocumentId: row.source_document_id,
+    jobId: row.job_id,
+    parsedContentId: row.parsed_content_id,
+    stage: readDocumentProcessingStage(row.stage),
+    unitType: row.unit_type,
+    unitKey: row.unit_key,
+    unitIndex: row.unit_index,
+    attemptScope: row.attempt_scope,
+    status: readDocumentProcessingUnitStatus(row.status),
+    contentHash: row.content_hash,
+    dedupeKey: row.dedupe_key,
+    objectKey: row.object_key,
+    objectRefs: readJsonObjectArray(row.object_refs),
+    locator: normalizeJsonObject(row.locator),
+    counters: normalizeJsonObject(row.counters),
+    warnings: readJsonObjectArray(row.warnings),
+    safeError: normalizeNullableJsonObject(row.safe_error),
+    metadata: normalizeJsonObject(row.metadata),
+    retryEligible: row.retry_eligible,
+    completedAt: normalizeNullableTimestamp(row.completed_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toWikiPageRecordResponse(row: WikiPageRecordRow): Record<string, unknown> {
+  return {
+    id: row.id,
+    knowledge_base_id: row.knowledge_base_id,
+    slug: row.slug,
+    title: row.title,
+    page_type: row.page_type,
+    status: row.status,
+    current_version_id: row.current_version_id,
+    frontmatter: normalizeJsonObject(row.frontmatter),
+    source_document_ids: readStringArray(row.source_document_ids),
+    metadata: normalizeJsonObject(row.metadata),
+    created_at: normalizeTimestamp(row.created_at),
+    updated_at: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toWikiPageVersionRecordResponse(row: WikiPageVersionRecordRow): Record<string, unknown> {
+  return {
+    id: row.id,
+    page_id: row.page_id,
+    knowledge_version_id: row.knowledge_version_id,
+    version_number: row.version_number,
+    title: row.title,
+    frontmatter: normalizeJsonObject(row.frontmatter),
+    source_snapshot: readJsonArray(row.source_snapshot),
+    prompt_version: row.prompt_version,
+    created_by: row.created_by,
+    created_at: normalizeTimestamp(row.created_at),
+  };
+}
+
+function toSourceWatchRuleRecord(row: SourceWatchRuleRow): SourceWatchRuleRecord {
+  const metadata = normalizeJsonObject(row.metadata);
+
+  return {
+    id: row.id,
+    knowledgeBaseId: row.knowledge_base_id,
+    name: row.name,
+    sourceKind: readSourceWatchSourceKind(row.source_type),
+    location: row.location,
+    credentialProfile: readString(metadata.credential_profile),
+    adapterOptions: normalizeJsonObject(metadata.adapter_options),
+    includeExtensions: readStringArray(row.include_patterns),
+    excludeDirs: readStringArray(metadata.exclude_dirs),
+    excludeGlobs: readStringArray(row.exclude_patterns),
+    maxFileSizeMb: readNumber(metadata.max_file_size_mb),
+    autoIngest: row.auto_ingest_enabled,
+    status: readSourceWatchRuleStatus(row.status),
+    schedule: readSourceWatchSchedule(row.schedule),
+    latestScan: readSourceWatchLatestScan(metadata.latest_scan),
+    createdAt: normalizeTimestamp(row.created_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toBatchImportRecord(row: BatchImportRow): BatchImportRecord {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    projectId: row.project_id,
+    knowledgeBaseId: row.knowledge_base_id,
+    sourceType: readSourceType(row.source_type),
+    status: readBatchImportStatus(row.status),
+    totalItems: row.total_items,
+    acceptedItems: row.accepted_items,
+    skippedItems: row.skipped_items,
+    validationErrorCount: row.validation_error_count,
+    completedItems: row.completed_items,
+    failedItems: row.failed_items,
+    enqueueCursor: row.enqueue_cursor,
+    retryCursor: row.retry_cursor,
+    metadata: normalizeJsonObject(row.metadata),
+    createdAt: normalizeTimestamp(row.created_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toBatchImportItemRecord(row: BatchImportItemRow): BatchImportItemRecord {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    projectId: row.project_id,
+    knowledgeBaseId: row.knowledge_base_id,
+    batchId: row.batch_id,
+    itemIndex: row.item_index,
+    sourceType: readSourceType(row.source_type),
+    externalId: row.external_id,
+    idempotencyKey: row.idempotency_key,
+    status: readBatchImportItemStatus(row.status),
+    sourceDocumentId: row.source_document_id,
+    ingestJobId: row.ingest_job_id,
+    safeError: normalizeNullableJsonObject(row.safe_error),
+    metadata: normalizeJsonObject(row.metadata),
+    createdAt: normalizeTimestamp(row.created_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toScheduledImportJobRecord(row: ScheduledImportJobRow): ScheduledImportJobRecord {
+  const stagedItemCount = readCount(row.staged_item_count ?? undefined);
+
+  return {
+    id: row.id,
+    sourceWatchRuleId: row.source_watch_rule_id ?? "",
+    knowledgeBaseId: row.knowledge_base_id,
+    status: readSourceWatchScanStatus(row.status),
+    triggerType: readSourceWatchScanTriggerType(row.trigger_type),
+    scanResult: readSourceWatchScanResult(
+      stagedItemCount > 0 ? row.scan_result_preview : row.scan_result,
+    ),
+    startedAt: normalizeTimestamp(row.started_at ?? row.created_at),
+    finishedAt: normalizeNullableTimestamp(row.finished_at),
+    durationMs: row.duration_ms,
+    retryCount: row.retry_count ?? 0,
+    retryable: row.retryable ?? false,
+    nextRetryAt: normalizeNullableTimestamp(row.next_retry_at),
+    error: normalizeNullableJsonObject(row.error),
+    scheduledFor: normalizeNullableTimestamp(row.scheduled_for),
+    createdAt: normalizeTimestamp(row.created_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toSourceWatchScanStageItem(row: SourceWatchScanItemRow): SourceWatchScanStageItem {
+  return {
+    item_kind: readSourceWatchScanItemKind(row.item_kind),
+    payload: normalizeJsonObject(row.payload),
+    source_identity: row.source_identity,
+    ...(row.comparison_status === null ? {} : { comparison_status: row.comparison_status }),
+    ...(row.content_hash === null ? {} : { content_hash: row.content_hash }),
+    ...(row.source_path === null ? {} : { source_path: row.source_path }),
+    ...(row.source_url === null ? {} : { source_url: row.source_url }),
+    cursor: normalizeJsonObject(row.cursor),
+    safe_error: normalizeNullableJsonObject(row.safe_error),
+  };
+}
+
+function toWebhookRecord(row: WebhookRow): WebhookRecord {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    projectId: row.project_id,
+    knowledgeBaseId: row.knowledge_base_id,
+    url: row.target_url,
+    events: readWebhookEventArray(row.event_types),
+    status: readWebhookStatus(row.status),
+    secretConfigured: row.secret_configured,
+    secret: row.secret_ciphertext,
+    createdAt: normalizeTimestamp(row.created_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toWebhookDeliveryRecord(row: WebhookDeliveryRow): WebhookDeliveryRecord {
+  return {
+    id: row.id,
+    webhookId: row.webhook_id ?? "",
+    knowledgeBaseId: row.knowledge_base_id,
+    eventType: readWebhookEventType(row.event_type),
+    payload: normalizeJsonObject(row.payload),
+    status: readWebhookDeliveryStatus(row.status),
+    requestTrace: normalizeJsonObject(row.request_trace),
+    responseStatus: row.response_status,
+    responseBody: row.response_body,
+    attemptCount: row.attempt_count,
+    maxAttempts: row.max_attempts,
+    nextAttemptAt: normalizeNullableTimestamp(row.next_attempt_at),
+    lastAttemptAt: normalizeNullableTimestamp(row.last_attempt_at),
+    signing: readWebhookDeliverySigning(row.signing),
+    createdAt: normalizeTimestamp(row.created_at),
+    deliveredAt: normalizeNullableTimestamp(row.delivered_at),
+  };
+}
+
+function toDeletionCleanupOperationRecord(
+  row: DeletionCleanupOperationRow,
+): DeletionCleanupOperationRecord {
+  return {
+    id: row.id,
+    targetType: readDeletionCleanupTargetType(row.target_type),
+    targetId: row.target_id,
+    knowledgeBaseId: row.knowledge_base_id,
+    status: readDeletionCleanupStatus(row.status),
+    phase: readDeletionCleanupPhase(row.phase),
+    requestedBy: row.requested_by,
+    requestId: row.request_id,
+    queueJobId: row.queue_job_id,
+    manifest: normalizeJsonObject(row.manifest),
+    totalItemCount: row.total_item_count,
+    pendingItemCount: row.pending_item_count,
+    deletedItemCount: row.deleted_item_count,
+    skippedItemCount: row.skipped_item_count,
+    failedItemCount: row.failed_item_count,
+    objectKeyCount: row.object_key_count,
+    databaseRowCount: row.database_row_count,
+    attemptCount: row.attempt_count,
+    maxAttempts: row.max_attempts,
+    retryAfter: normalizeNullableTimestamp(row.retry_after),
+    retryable: row.retryable,
+    lastError: normalizeNullableJsonObject(row.last_error),
+    retentionExpiresAt: normalizeNullableTimestamp(row.retention_expires_at),
+    itemRetentionExpiresAt: normalizeNullableTimestamp(row.item_retention_expires_at),
+    startedAt: normalizeNullableTimestamp(row.started_at),
+    completedAt: normalizeNullableTimestamp(row.completed_at),
+    failedAt: normalizeNullableTimestamp(row.failed_at),
+    canceledAt: normalizeNullableTimestamp(row.canceled_at),
+    createdAt: normalizeTimestamp(row.created_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function toDeletionCleanupItemRecord(row: DeletionCleanupItemRow): DeletionCleanupItemRecord {
+  return {
+    id: row.id,
+    operationId: row.operation_id,
+    itemType: readDeletionCleanupItemType(row.item_type),
+    resourceType: row.resource_type,
+    resourceId: row.resource_id,
+    objectKey: row.object_key,
+    tableName: row.table_name,
+    knowledgeBaseId: row.knowledge_base_id,
+    sourceDocumentId: row.source_document_id,
+    status: readDeletionCleanupItemStatus(row.status),
+    phase: readDeletionCleanupPhase(row.phase),
+    attemptCount: row.attempt_count,
+    maxAttempts: row.max_attempts,
+    lastError: normalizeNullableJsonObject(row.last_error),
+    skipReason: row.skip_reason,
+    retryAfter: normalizeNullableTimestamp(row.retry_after),
+    retainedUntil: normalizeNullableTimestamp(row.retained_until),
+    createdAt: normalizeTimestamp(row.created_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+    completedAt: normalizeNullableTimestamp(row.completed_at),
+  };
+}
+
+function createEmptyStageCounts(): Record<JobStage, number> {
+  return Object.fromEntries(jobStages.map((stage) => [stage, 0])) as Record<JobStage, number>;
+}
+
+function readDeletionCleanupTargetType(value: unknown): DeletionCleanupTargetType {
+  if (
+    value === "knowledge_base" ||
+    value === "source_document" ||
+    value === "source_watch_rule" ||
+    value === "webhook" ||
+    value === "import_preview" ||
+    value === "retrieval_trace"
+  ) {
+    return value;
+  }
+
+  return "knowledge_base";
+}
+
+function readDeletionCleanupStatus(value: unknown): DeletionCleanupStatus {
+  if (value === "running" || value === "completed" || value === "failed" || value === "canceled") {
+    return value;
+  }
+
+  return "queued";
+}
+
+function readDeletionCleanupPhase(value: unknown): DeletionCleanupPhase {
+  if (
+    value === "manifest" ||
+    value === "fencing" ||
+    value === "object_cleanup" ||
+    value === "database_cleanup" ||
+    value === "retention" ||
+    value === "completed" ||
+    value === "failed" ||
+    value === "canceled"
+  ) {
+    return value;
+  }
+
+  return "queued";
+}
+
+function readDeletionCleanupItemType(value: unknown): DeletionCleanupItemRecord["itemType"] {
+  if (value === "database_row" || value === "reference" || value === "audit") {
+    return value;
+  }
+
+  return "object";
+}
+
+function readDeletionCleanupItemStatus(value: unknown): DeletionCleanupItemStatus {
+  if (value === "running" || value === "deleted" || value === "skipped" || value === "failed") {
+    return value;
+  }
+
+  return "pending";
+}
+
+function readWebhookStatus(value: unknown): WebhookStatus {
+  return value === "enabled" ? "enabled" : "disabled";
+}
+
+function readWebhookDeliveryStatus(value: unknown): WebhookDeliveryStatus {
+  if (value === "delivered" || value === "failed") {
+    return value;
+  }
+
+  return "queued";
+}
+
+function readWebhookEventType(value: unknown): WebhookEventType {
+  return typeof value === "string" && webhookEventTypes.includes(value as WebhookEventType)
+    ? (value as WebhookEventType)
+    : "webhook.test";
+}
+
+function readWebhookEventArray(value: unknown): WebhookEventType[] {
+  return readStringArray(value).filter((item): item is WebhookEventType =>
+    webhookEventTypes.includes(item as WebhookEventType),
+  );
+}
+
+function readWebhookDeliverySigning(value: unknown): WebhookDeliveryRecord["signing"] {
+  const record = normalizeJsonObject(value);
+  const algorithm = readString(record.algorithm);
+
+  return {
+    algorithm: algorithm === "hmac-sha256" ? "hmac-sha256" : null,
+    contentDigest: readString(record.content_digest),
+    secretConfigured: readBoolean(record.secret_configured) ?? false,
+  };
+}
+
+function readSourceWatchSourceKind(value: unknown): SourceWatchSourceKind {
+  if (
+    value === "s3_prefix" ||
+    value === "url_list" ||
+    value === "git_repo" ||
+    value === "mounted_directory"
+  ) {
+    return value;
+  }
+
+  return "mounted_directory";
+}
+
+function readSourceWatchRuleStatus(value: unknown): SourceWatchRuleStatus {
+  return value === "disabled" ? "disabled" : "enabled";
+}
+
+function readSourceWatchScanStatus(value: unknown): SourceWatchScanStatus {
+  if (value === "disabled" || value === "failed") {
+    return value;
+  }
+
+  return "completed";
+}
+
+function readSourceWatchScanTriggerType(value: unknown): SourceWatchScanTriggerType {
+  if (value === "scheduled" || value === "retry") {
+    return value;
+  }
+
+  return "manual";
+}
+
+function readSourceWatchScanItemKind(value: unknown): SourceWatchScanItemKind {
+  if (
+    value === "skipped" ||
+    value === "new" ||
+    value === "changed" ||
+    value === "unchanged" ||
+    value === "delete_candidate" ||
+    value === "failed"
+  ) {
+    return value;
+  }
+
+  return "discovered";
+}
+
+function readSourceWatchLatestScan(value: unknown): SourceWatchLatestScanResponse | null {
+  const record = normalizeJsonObject(value);
+  const scheduledImportJobId = readString(record.scheduled_import_job_id);
+  const status = readString(record.status);
+  const scannedAt = readString(record.scanned_at);
+
+  if (scheduledImportJobId === null || status === null || scannedAt === null) {
+    return null;
+  }
+
+  return {
+    scheduled_import_job_id: scheduledImportJobId,
+    status: readSourceWatchScanStatus(status),
+    scanned_at: scannedAt,
+    new_source_count: readNumber(record.new_source_count) ?? 0,
+    changed_source_count: readNumber(record.changed_source_count) ?? 0,
+    delete_candidate_count: readNumber(record.delete_candidate_count) ?? 0,
+    skipped_count: readNumber(record.skipped_count) ?? 0,
+  };
+}
+
+function readSourceWatchSchedule(value: unknown): SourceWatchRuleSchedule {
+  const record = normalizeJsonObject(value);
+  const enabled = readBoolean(record.enabled) ?? false;
+  const schedulerStatus = readString(record.scheduler_status);
+  const lastStatus = readString(record.last_status);
+
+  return {
+    enabled,
+    intervalSeconds: readNumber(record.interval_seconds),
+    cron: readString(record.cron),
+    timezone: readString(record.timezone),
+    nextRunAt: readString(record.next_run_at),
+    lastRunAt: readString(record.last_run_at),
+    lastStatus:
+      lastStatus === null || !["completed", "disabled", "failed"].includes(lastStatus)
+        ? null
+        : readSourceWatchScanStatus(lastStatus),
+    lastError: normalizeNullableJsonObject(record.last_error),
+    schedulerStatus:
+      schedulerStatus === null ||
+      !["disabled", "paused", "scheduled", "running"].includes(schedulerStatus)
+        ? enabled
+          ? "scheduled"
+          : "disabled"
+        : (schedulerStatus as SourceWatchSchedulerStatus),
+  };
+}
+
+function readSourceWatchScanResult(value: unknown): SourceWatchScanResultResponse {
+  const record = normalizeJsonObject(value);
+
+  return {
+    new_sources: readJsonArray(record.new_sources) as SourceWatchScanResultResponse["new_sources"],
+    changed_sources: readJsonArray(
+      record.changed_sources,
+    ) as SourceWatchScanResultResponse["changed_sources"],
+    delete_candidates: readJsonArray(
+      record.delete_candidates,
+    ) as SourceWatchScanResultResponse["delete_candidates"],
+    skipped: readJsonArray(record.skipped) as SourceWatchScanResultResponse["skipped"],
+  };
+}
+
+function readPurposeText(value: unknown): string {
+  const record = normalizeJsonObject(value);
+
+  return readString(record.text) ?? "";
+}
+
+function readKnowledgeBaseType(value: unknown): KnowledgeBaseType {
+  return value === "fork" ? "fork" : "canonical";
+}
+
+function readKnowledgeBaseSyncStatus(value: unknown): KnowledgeBaseSyncStatus {
+  if (value === "synced" || value === "outdated" || value === "syncing" || value === "failed") {
+    return value;
+  }
+
+  return "not_applicable";
+}
+
+function readKnowledgeBaseTemplate(value: unknown): KnowledgeBaseTemplate {
+  if (value === "research" || value === "team_knowledge") {
+    return value;
+  }
+
+  return "general";
+}
+
+function readKnowledgeBaseOutputLanguage(value: unknown): KnowledgeBaseOutputLanguage {
+  if (value === "zh-CN" || value === "en-US") {
+    return value;
+  }
+
+  return "auto";
+}
+
+function readDatasetConfigurationStatus(value: unknown): DatasetConfigurationStatus {
+  return value === "active" ? "active" : "active";
+}
+
+function readKnowledgeBaseStatus(value: unknown): Exclude<KnowledgeBaseStatus, "deleted"> {
+  if (value === "indexing" || value === "outdated" || value === "failed") {
+    return value;
+  }
+
+  return "ready";
+}
+
+function readKnowledgeBaseForkOwner(row: KnowledgeBaseRow): KnowledgeBaseResponse["fork_owner"] {
+  if (row.fork_owner_type === null || row.fork_owner_external_id === null) {
+    return null;
+  }
+
+  return {
+    owner_type: readForkOwnerType(row.fork_owner_type),
+    external_owner_id: row.fork_owner_external_id,
+    display_name: row.fork_owner_display_name,
+  };
+}
+
+function readForkOwnerType(value: unknown): ForkOwnerType {
+  if (value === "workspace" || value === "customer" || value === "session" || value === "custom") {
+    return value;
+  }
+
+  return "user";
+}
+
+function readKnowledgeCheckStatus(value: unknown): KnowledgeCheckStatus {
+  if (value === "running" || value === "completed" || value === "failed") {
+    return value;
+  }
+
+  return "queued";
+}
+
+function readKnowledgeCheckArray(value: unknown): KnowledgeCheckType[] {
+  const checks = readStringArray(value).filter((check): check is KnowledgeCheckType =>
+    knowledgeCheckTypes.includes(check as KnowledgeCheckType),
+  );
+
+  return checks.length === 0 ? ["missing_sources"] : checks;
+}
+
+function readKnowledgeCheckSemanticRun(value: unknown): KnowledgeCheckSemanticRun {
+  const record = normalizeJsonObject(value);
+  const status = readString(record.status);
+  const outputStatus = readString(record.output_status);
+  const finalStatus = readString(record.structured_output_final_status);
+  const semanticRun: KnowledgeCheckSemanticRun = {
+    status:
+      status === "completed" || status === "partial" || status === "failed" ? status : "skipped",
+    findings_count: readNumber(record.findings_count) ?? 0,
+    repair_attempts: readNumber(record.repair_attempts) ?? 0,
+    structured_output_validation_issues: readStringArray(
+      record.structured_output_validation_issues,
+    ),
+    trace: normalizeJsonObject(record.trace),
+  };
+  const failureReason = readString(record.failure_reason);
+  const model = readString(record.model);
+  const modelCallId = readString(record.model_call_id);
+  const promptVersionId = readString(record.prompt_version_id);
+  const providerName = readString(record.provider_name);
+  const attemptCount = readNumber(record.structured_output_attempt_count);
+  const structuredOutputMode = readStructuredOutputMode(record.structured_output_mode);
+  const usage = normalizeJsonObject(record.usage);
+
+  if (failureReason !== null) {
+    semanticRun.failure_reason = failureReason;
+  }
+  if (model !== null) {
+    semanticRun.model = model;
+  }
+  if (modelCallId !== null) {
+    semanticRun.model_call_id = modelCallId;
+  }
+  if (outputStatus === "succeeded" || outputStatus === "failed") {
+    semanticRun.output_status = outputStatus;
+  }
+  if (promptVersionId !== null) {
+    semanticRun.prompt_version_id = promptVersionId;
+  }
+  if (providerName !== null) {
+    semanticRun.provider_name = providerName;
+  }
+  if (attemptCount !== null) {
+    semanticRun.structured_output_attempt_count = attemptCount;
+  }
+  if (finalStatus === "succeeded" || finalStatus === "failed") {
+    semanticRun.structured_output_final_status = finalStatus;
+  }
+  if (structuredOutputMode !== null) {
+    semanticRun.structured_output_mode = structuredOutputMode;
+  }
+  if (Object.keys(usage).length > 0) {
+    semanticRun.usage = usage as NonNullable<KnowledgeCheckSemanticRun["usage"]>;
+  }
+
+  return semanticRun;
+}
+
+function readStructuredOutputMode(
+  value: unknown,
+): "strict_json_schema" | "json_object_fallback" | null {
+  if (value === "strict_json_schema" || value === "json_object_fallback") {
+    return value;
+  }
+
+  return null;
+}
+
+function readSourceType(value: unknown): SourceType {
+  if (value === "file" || value === "text" || value === "url" || value === "wiki_draft") {
+    return value;
+  }
+
+  return "file";
+}
+
+function readBatchImportStatus(value: unknown): BatchImportRecord["status"] {
+  if (
+    value === "queued" ||
+    value === "running" ||
+    value === "completed" ||
+    value === "failed" ||
+    value === "canceled"
+  ) {
+    return value;
+  }
+
+  return "failed";
+}
+
+function readBatchImportItemStatus(value: unknown): BatchImportItemRecord["status"] {
+  if (
+    value === "accepted" ||
+    value === "validation_failed" ||
+    value === "skipped" ||
+    value === "created" ||
+    value === "failed"
+  ) {
+    return value;
+  }
+
+  return "failed";
+}
+
+function readSourceDocumentStatus(value: unknown): SourceDocumentStatus {
+  if (
+    value === "uploaded" ||
+    value === "queued" ||
+    value === "processing" ||
+    value === "ready" ||
+    value === "failed" ||
+    value === "deleted"
+  ) {
+    return value;
+  }
+
+  return "uploaded";
+}
+
+function readUploadSessionStatus(value: unknown): UploadSessionRecord["status"] {
+  if (value === "created" || value === "finalized" || value === "expired" || value === "canceled") {
+    return value;
+  }
+
+  return "created";
+}
+
+function readUploadSessionActorType(value: unknown): UploadSessionRecord["actorType"] {
+  if (
+    value === "api_key" ||
+    value === "admin_session" ||
+    value === "system" ||
+    value === "unknown"
+  ) {
+    return value;
+  }
+
+  return "unknown";
+}
+
+function readSourceVisibilityOrigin(value: unknown): SourceVisibilityOrigin {
+  if (value === "canonical" || value === "upstream_inherited" || value === "fork_owned") {
+    return value;
+  }
+
+  return "canonical";
+}
+
+function readMediaCaptionStatus(value: unknown): MediaAssetRecord["captionStatus"] {
+  if (
+    value === "not_configured" ||
+    value === "pending" ||
+    value === "generated" ||
+    value === "skipped" ||
+    value === "failed"
+  ) {
+    return value;
+  }
+
+  return "not_configured";
+}
+
+function readDocumentProcessingStage(value: unknown): DocumentProcessingStage {
+  if (
+    value === "parsing" ||
+    value === "ocr" ||
+    value === "media_extraction" ||
+    value === "captioning" ||
+    value === "parsed_artifact"
+  ) {
+    return value;
+  }
+
+  return "parsing";
+}
+
+function readDocumentProcessingUnitStatus(value: unknown): DocumentProcessingUnitStatus {
+  if (
+    value === "pending" ||
+    value === "running" ||
+    value === "succeeded" ||
+    value === "failed" ||
+    value === "skipped" ||
+    value === "canceled"
+  ) {
+    return value;
+  }
+
+  return "pending";
+}
+
+function readJobStage(value: unknown): JobStage {
+  return typeof value === "string" && jobStages.includes(value as JobStage)
+    ? (value as JobStage)
+    : "parsing";
+}
+
+function readJobStatus(value: unknown): JobStatus {
+  if (
+    value === "queued" ||
+    value === "running" ||
+    value === "completed" ||
+    value === "failed" ||
+    value === "canceled"
+  ) {
+    return value;
+  }
+
+  return "queued";
+}
+
+function readJobEventType(value: unknown): JobEventRecord["type"] {
+  if (
+    value === "job.queued" ||
+    value === "job.running" ||
+    value === "job.completed" ||
+    value === "job.failed" ||
+    value === "job.canceled"
+  ) {
+    return value;
+  }
+
+  return "job.queued";
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function readBoolean(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+function readNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function readCount(value: string | number | bigint | undefined): number {
+  if (typeof value === "bigint") {
+    return Number(value);
+  }
+  if (typeof value === "number") {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  return 0;
+}
+
+function readStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+function readJsonArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? (JSON.parse(JSON.stringify(value)) as unknown[]) : [];
+}
+
+function readJsonObjectArray(value: unknown): Record<string, unknown>[] {
+  return readJsonArray(value).filter(
+    (item): item is Record<string, unknown> =>
+      item !== null && typeof item === "object" && !Array.isArray(item),
+  );
+}
+
+function chunkArray<T>(items: readonly T[], size: number): T[][] {
+  const safeSize = Math.max(1, Math.floor(size));
+  const chunks: T[][] = [];
+
+  for (let index = 0; index < items.length; index += safeSize) {
+    chunks.push(items.slice(index, index + safeSize));
+  }
+
+  return chunks;
+}
+
+function normalizeJsonObject(value: unknown): Record<string, unknown> {
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      return normalizeJsonObject(parsed);
+    } catch {
+      return {};
+    }
+  }
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    return JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
+  }
+
+  return {};
+}
+
+function normalizeNullableJsonObject(value: unknown): Record<string, unknown> | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  return normalizeJsonObject(value);
+}
+
+function normalizeTimestamp(value: unknown): string {
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  if (typeof value === "string" && value.length > 0) {
+    return new Date(value).toISOString();
+  }
+
+  return new Date(0).toISOString();
+}
+
+function normalizeNullableTimestamp(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  return normalizeTimestamp(value);
+}

@@ -11,6 +11,12 @@ import type {
 import { resolveDatasetPromptTemplateFromSnapshot } from "@fococontext/llm";
 import type { ObjectStorageAdapter } from "@fococontext/storage";
 import { createMarkdownPreview, defaultParsedMarkdownPreviewMaxChars } from "./parsed-preview.js";
+import {
+  createDocumentProcessingDedupeKey,
+  createShortConfigHash,
+  type DocumentProcessingStateStore,
+  type DocumentProcessingUnitInput,
+} from "./document-processing-state.js";
 
 import type {
   WorkerJobProgressWriter,
@@ -33,6 +39,8 @@ export const visionCaptionPromptVersion = {
 
 export interface MediaCaptionPayload {
   job_id: string;
+  tenant_id: string;
+  project_id: string;
   knowledge_base_id: string;
   document_id: string;
   parsed_content_id: string;
@@ -140,9 +148,12 @@ export interface VisionCaptionProvider {
 }
 
 export interface MediaCaptionProcessorConfig {
+  checkpointInterval: number;
   concurrency: number;
   contextChars: number;
+  maxImageBytes: number;
   maxImagesPerDocument: number;
+  maxMarkdownBytes: number;
   maxOutputTokens: number;
   model: string;
   previewMaxChars?: number;
@@ -150,6 +161,7 @@ export interface MediaCaptionProcessorConfig {
   requestMaxRetries: number;
   retryBaseDelayMs: number;
   timeoutSeconds: number;
+  windowSize: number;
 }
 
 export interface MediaCaptionProcessorOptions {
@@ -159,6 +171,7 @@ export interface MediaCaptionProcessorOptions {
   jobProgress?: WorkerJobProgressWriter;
   modelCallRecorder?: ModelCallRecorder;
   objectStorage: ObjectStorageAdapter;
+  processingState?: DocumentProcessingStateStore;
   repository: MediaCaptionRepository;
   sleep?: (milliseconds: number) => Promise<void>;
   visionProvider: VisionCaptionProvider;
@@ -238,7 +251,7 @@ export class BullMqMediaCaptionWorker {
 
 export function createMediaCaptionWorkerOptions(config: RuntimeConfig) {
   return {
-    concurrency: config.limits.visionCaption.concurrency,
+    concurrency: config.limits.backgroundJobs.mediaCaption.concurrency,
     connection: {
       url: config.redis.url,
     },
@@ -253,6 +266,7 @@ export class MediaCaptionProcessor {
   private readonly jobProgress: WorkerJobProgressWriter | undefined;
   private readonly modelCallRecorder: ModelCallRecorder | undefined;
   private readonly objectStorage: ObjectStorageAdapter;
+  private readonly processingState: DocumentProcessingStateStore | undefined;
   private readonly repository: MediaCaptionRepository;
   private readonly sleep: (milliseconds: number) => Promise<void>;
   private readonly visionProvider: VisionCaptionProvider;
@@ -265,6 +279,7 @@ export class MediaCaptionProcessor {
     this.jobProgress = options.jobProgress;
     this.modelCallRecorder = options.modelCallRecorder;
     this.objectStorage = options.objectStorage;
+    this.processingState = options.processingState;
     this.repository = options.repository;
     this.sleep = options.sleep ?? sleepFor;
     this.visionProvider = options.visionProvider;
@@ -275,6 +290,8 @@ export class MediaCaptionProcessor {
       jobId: payload.job_id,
       knowledgeBaseId: payload.knowledge_base_id,
       inputSnapshotId: payload.input_snapshot_id,
+      tenantId: payload.tenant_id,
+      projectId: payload.project_id,
       sourceDocumentId: payload.document_id,
     });
 
@@ -293,23 +310,103 @@ export class MediaCaptionProcessor {
       };
     }
 
-    const normalizedMarkdown = await this.readObjectText(payload.normalized_markdown_object_key);
+    const normalizedMarkdownRead = await this.readObjectTextWithinLimit(
+      payload.normalized_markdown_object_key,
+      this.config.maxMarkdownBytes,
+    );
+
+    if (normalizedMarkdownRead.kind === "fatal") {
+      await this.markCaptioningFailed(payload, normalizedMarkdownRead.error);
+
+      return this.createFailedResult(payload);
+    }
+
+    const normalizedMarkdown = normalizedMarkdownRead.text;
     const resolvedPrompt = resolveDatasetPromptTemplateFromSnapshot({
       purpose: "vision_caption",
       datasetConfigurationSnapshot: payload.dataset_configuration_snapshot,
     });
+    const captionConfigHash = createCaptionConfigHash(this.config, resolvedPrompt.prompt.id);
     const requestedAssets = await this.repository.listMediaAssetsByIds(payload.media_asset_ids);
-    const eligibleAssets = requestedAssets.filter(isCaptionEligibleImage);
-    const assets = eligibleAssets.slice(0, this.config.maxImagesPerDocument);
+    const candidateAssets = requestedAssets.filter(isCaptionWorkCandidateImage);
+    const assets = candidateAssets.slice(0, this.config.maxImagesPerDocument);
     const selectedAssetIds = new Set(assets.map((asset) => asset.id));
-    const skippedAssets = requestedAssets.filter((asset) => !selectedAssetIds.has(asset.id));
+    const skippedAssets = candidateAssets.filter((asset) => !selectedAssetIds.has(asset.id));
+    const unsupportedPendingAssets = requestedAssets.filter(
+      (asset) =>
+        (asset.caption_status === "pending" || asset.caption_status === "failed") &&
+        !isCaptionEligibleImage(asset),
+    );
+    const terminalAssets = requestedAssets.filter(
+      (asset) => asset.caption_status === "generated" || asset.caption_status === "skipped",
+    );
     const beforeWriteGuard = await this.canContinue(payload);
 
     if (!beforeWriteGuard.canContinue) {
       return this.createStoppedResult(payload);
     }
 
-    await this.markAssetsSkipped(skippedAssets);
+    await this.processingState?.upsertUnits([
+      ...assets.map(
+        (asset, index): DocumentProcessingUnitInput =>
+          toCaptionProcessingUnit(payload, asset, {
+            configHash: captionConfigHash,
+            model: this.config.model,
+            promptVersion: resolvedPrompt.prompt.id,
+            providerName: this.config.providerName,
+            status: "pending",
+            unitIndex: index,
+          }),
+      ),
+      ...skippedAssets.map(
+        (asset, index): DocumentProcessingUnitInput =>
+          toCaptionProcessingUnit(payload, asset, {
+            configHash: captionConfigHash,
+            metadata: {
+              reason: "not_selected",
+            },
+            model: this.config.model,
+            promptVersion: resolvedPrompt.prompt.id,
+            providerName: this.config.providerName,
+            status: "skipped",
+            unitIndex: assets.length + index,
+          }),
+      ),
+      ...unsupportedPendingAssets.map(
+        (asset, index): DocumentProcessingUnitInput =>
+          toCaptionProcessingUnit(payload, asset, {
+            configHash: captionConfigHash,
+            metadata: {
+              reason: "unsupported_media",
+            },
+            model: this.config.model,
+            promptVersion: resolvedPrompt.prompt.id,
+            providerName: this.config.providerName,
+            status: "skipped",
+            unitIndex: assets.length + skippedAssets.length + index,
+          }),
+      ),
+      ...terminalAssets.map(
+        (asset, index): DocumentProcessingUnitInput =>
+          toCaptionProcessingUnit(payload, asset, {
+            configHash: captionConfigHash,
+            metadata: {
+              reason: "terminal_status",
+            },
+            model: this.config.model,
+            promptVersion: resolvedPrompt.prompt.id,
+            providerName: this.config.providerName,
+            status: asset.caption_status === "generated" ? "succeeded" : "skipped",
+            unitIndex:
+              assets.length + skippedAssets.length + unsupportedPendingAssets.length + index,
+          }),
+      ),
+    ]);
+    await this.markAssetsSkipped(
+      payload,
+      [...skippedAssets, ...unsupportedPendingAssets],
+      captionConfigHash,
+    );
 
     if (assets.length === 0) {
       await this.enqueueAnalyze(payload, payload.normalized_markdown_object_key, {
@@ -345,19 +442,96 @@ export class MediaCaptionProcessor {
     let failedCount = 0;
     let generatedCount = 0;
     let providerCallCount = 0;
-    const captionGroups = this.groupAssetsByCaptionCacheKey(assets, resolvedPrompt.prompt.id);
-    const groupResults = await mapWithConcurrency(captionGroups, this.config.concurrency, (group) =>
-      this.captionWorkLimiter(() =>
-        this.processCaptionGroup(payload, group, normalizedMarkdown, resolvedPrompt),
-      ),
-    );
+    const assetWindows = chunkArray(assets, this.config.windowSize);
 
-    for (const result of groupResults) {
-      cacheHitCount += result.cacheHitCount;
-      failedCount += result.failedCount;
-      generatedCount += result.generatedCount;
-      providerCallCount += result.providerCallCount;
-      captions.push(...result.captions);
+    for (const [windowIndex, assetWindow] of assetWindows.entries()) {
+      await this.processingState?.upsertCheckpoint({
+        checkpointKey: "caption-assets",
+        configHash: captionConfigHash,
+        cursor: {
+          next_window_index: windowIndex,
+          processed_asset_count: captions.length + failedCount,
+          total_window_count: assetWindows.length,
+        },
+        jobId: payload.job_id,
+        parsedContentId: payload.parsed_content_id,
+        sourceDocumentId: payload.document_id,
+        stage: "captioning",
+        status: "running",
+      });
+      await this.processingState?.upsertUnits(
+        assetWindow.map(
+          (asset, index): DocumentProcessingUnitInput =>
+            toCaptionProcessingUnit(payload, asset, {
+              configHash: captionConfigHash,
+              model: this.config.model,
+              promptVersion: resolvedPrompt.prompt.id,
+              providerName: this.config.providerName,
+              status: "running",
+              unitIndex: windowIndex * this.config.windowSize + index,
+            }),
+        ),
+      );
+      const captionGroups = this.groupAssetsByCaptionCacheKey(
+        assetWindow,
+        resolvedPrompt.prompt.id,
+      );
+      const groupResults = await mapWithConcurrency(
+        captionGroups,
+        this.config.concurrency,
+        (group) =>
+          this.captionWorkLimiter(() =>
+            this.processCaptionGroup(payload, group, normalizedMarkdown, resolvedPrompt),
+          ),
+      );
+
+      for (const result of groupResults) {
+        cacheHitCount += result.cacheHitCount;
+        failedCount += result.failedCount;
+        generatedCount += result.generatedCount;
+        providerCallCount += result.providerCallCount;
+        captions.push(...result.captions);
+      }
+      await this.processingState?.upsertCheckpoint({
+        checkpointKey: "caption-assets",
+        configHash: captionConfigHash,
+        cursor: {
+          completed_window_index: windowIndex,
+          processed_asset_count: cacheHitCount + generatedCount + failedCount,
+          total_window_count: assetWindows.length,
+        },
+        jobId: payload.job_id,
+        parsedContentId: payload.parsed_content_id,
+        sourceDocumentId: payload.document_id,
+        stage: "captioning",
+        status: "running",
+        summary: {
+          cache_hit_count: cacheHitCount,
+          failed_count: failedCount,
+          generated_count: generatedCount,
+        },
+      });
+
+      if ((windowIndex + 1) % this.config.checkpointInterval === 0) {
+        await this.jobProgress?.updateJobProgress({
+          jobId: payload.job_id,
+          knowledgeBaseId: payload.knowledge_base_id,
+          inputSnapshotId: payload.input_snapshot_id,
+          stage: "captioning",
+          status: "running",
+          progress: 40,
+          message: "Captioning media assets...",
+          parsedContentId: payload.parsed_content_id,
+          metadata: {
+            caption_completed_windows: windowIndex + 1,
+            caption_processed_asset_count: assetWindows
+              .slice(0, windowIndex + 1)
+              .reduce((sum, window) => sum + window.length, 0),
+            caption_total_windows: assetWindows.length,
+            caption_window_size: this.config.windowSize,
+          },
+        });
+      }
     }
 
     const afterCaptionGuard = await this.canContinue(payload);
@@ -405,6 +579,26 @@ export class MediaCaptionProcessor {
         provider_call_count: providerCallCount,
       },
     );
+    await this.processingState?.upsertCheckpoint({
+      checkpointKey: "caption-assets",
+      configHash: captionConfigHash,
+      cursor: {
+        completed_asset_count: cacheHitCount + generatedCount + failedCount,
+        total_asset_count: assets.length,
+      },
+      jobId: payload.job_id,
+      parsedContentId: payload.parsed_content_id,
+      sourceDocumentId: payload.document_id,
+      stage: "captioning",
+      status: "completed",
+      summary: {
+        cache_hit_count: cacheHitCount,
+        captioned_markdown_object_key: captionedObjectKey,
+        failed_count: failedCount,
+        generated_count: generatedCount,
+        provider_call_count: providerCallCount,
+      },
+    });
 
     return this.createCompletedResult(payload, {
       cacheHitCount,
@@ -456,7 +650,7 @@ export class MediaCaptionProcessor {
 
       await Promise.all(
         group.assets.map((asset) =>
-          this.markAssetGenerated(asset, cacheRecord.caption, {
+          this.markAssetGenerated(payload, asset, cacheRecord.caption, {
             attemptCount: 0,
             cacheHit: true,
             modelCallId: null,
@@ -508,7 +702,7 @@ export class MediaCaptionProcessor {
       }
 
       await this.repository.upsertCaptionCache(cacheWrite);
-      await this.markAssetGenerated(primaryAsset, result.caption, {
+      await this.markAssetGenerated(payload, primaryAsset, result.caption, {
         attemptCount: result.attemptCount,
         cacheHit: false,
         modelCallId: result.modelCallId,
@@ -516,7 +710,7 @@ export class MediaCaptionProcessor {
       });
       await Promise.all(
         duplicateAssets.map((asset) =>
-          this.markAssetGenerated(asset, result.caption, {
+          this.markAssetGenerated(payload, asset, result.caption, {
             attemptCount: 0,
             cacheHit: true,
             modelCallId: null,
@@ -545,7 +739,7 @@ export class MediaCaptionProcessor {
 
       await Promise.all(
         group.assets.map((asset) =>
-          this.markAssetFailed(asset, error, modelCallId, resolvedPrompt.prompt.id),
+          this.markAssetFailed(payload, asset, error, modelCallId, resolvedPrompt.prompt.id),
         ),
       );
 
@@ -571,7 +765,20 @@ export class MediaCaptionProcessor {
     usage?: ModelCallUsage;
   }> {
     const image = await this.objectStorage.getObject({ key: asset.object_key });
-    const imageBytes = await readBody(image.body);
+    const imageRead = await readBodyWithinLimit(
+      image.body,
+      image.contentLength,
+      this.config.maxImageBytes,
+      asset.object_key,
+    );
+
+    if (imageRead.kind === "fatal") {
+      throw new Error(
+        `Vision caption image read limit exceeded: ${imageRead.actualBytes}/${imageRead.limitBytes}.`,
+      );
+    }
+
+    const imageBytes = imageRead.content;
     const context = sliceMarkdownImageContext(normalizedMarkdown, {
       contextChars: this.config.contextChars,
       objectKey: asset.object_key,
@@ -679,6 +886,7 @@ export class MediaCaptionProcessor {
   }
 
   private async markAssetGenerated(
+    payload: MediaCaptionPayload,
     asset: MediaCaptionAssetRecord,
     caption: string,
     options: {
@@ -699,9 +907,26 @@ export class MediaCaptionProcessor {
       caption_provider_name: this.config.providerName,
       caption_status: "generated",
     });
+    await this.processingState?.upsertUnit(
+      toCaptionProcessingUnit(payload, asset, {
+        configHash: createCaptionConfigHash(this.config, options.promptVersion),
+        counters: {
+          attempt_count: options.attemptCount,
+        },
+        metadata: {
+          cache_hit: options.cacheHit,
+          model_call_id: options.modelCallId,
+        },
+        model: this.config.model,
+        promptVersion: options.promptVersion,
+        providerName: this.config.providerName,
+        status: "succeeded",
+      }),
+    );
   }
 
   private async markAssetFailed(
+    payload: MediaCaptionPayload,
     asset: MediaCaptionAssetRecord,
     error: unknown,
     modelCallId: string | null,
@@ -721,9 +946,33 @@ export class MediaCaptionProcessor {
       caption_provider_name: this.config.providerName,
       caption_status: "failed",
     });
+    await this.processingState?.upsertUnit(
+      toCaptionProcessingUnit(payload, asset, {
+        configHash: createCaptionConfigHash(this.config, promptVersion),
+        counters: {
+          attempt_count: this.config.requestMaxRetries + 1,
+        },
+        metadata: {
+          model_call_id: modelCallId,
+        },
+        model: this.config.model,
+        promptVersion,
+        providerName: this.config.providerName,
+        retryEligible: true,
+        safeError: {
+          code: "vision_caption_failed",
+          message: error instanceof Error ? error.message : "Vision caption failed.",
+        },
+        status: "failed",
+      }),
+    );
   }
 
-  private async markAssetsSkipped(assets: readonly MediaCaptionAssetRecord[]): Promise<void> {
+  private async markAssetsSkipped(
+    payload: MediaCaptionPayload,
+    assets: readonly MediaCaptionAssetRecord[],
+    configHash: string,
+  ): Promise<void> {
     await Promise.all(
       assets
         .filter((asset) => asset.caption_status === "pending")
@@ -741,6 +990,22 @@ export class MediaCaptionProcessor {
           }),
         ),
     );
+    await this.processingState?.upsertUnits(
+      assets
+        .filter((asset) => asset.caption_status === "pending")
+        .map(
+          (asset): DocumentProcessingUnitInput =>
+            toCaptionProcessingUnit(payload, asset, {
+              configHash,
+              metadata: {
+                reason: "not_selected",
+              },
+              model: this.config.model,
+              providerName: this.config.providerName,
+              status: "skipped",
+            }),
+        ),
+    );
   }
 
   private async enqueueAnalyze(
@@ -756,6 +1021,8 @@ export class MediaCaptionProcessor {
 
     await this.compileQueue.enqueueWikiAnalyzeJob({
       job_id: payload.job_id,
+      tenant_id: payload.tenant_id,
+      project_id: payload.project_id,
       knowledge_base_id: payload.knowledge_base_id,
       document_id: payload.document_id,
       parsed_content_id: payload.parsed_content_id,
@@ -787,6 +1054,8 @@ export class MediaCaptionProcessor {
       jobId: payload.job_id,
       knowledgeBaseId: payload.knowledge_base_id,
       inputSnapshotId: payload.input_snapshot_id,
+      tenantId: payload.tenant_id,
+      projectId: payload.project_id,
       sourceDocumentId: payload.document_id,
     });
 
@@ -799,11 +1068,31 @@ export class MediaCaptionProcessor {
     return guard;
   }
 
-  private async readObjectText(key: string): Promise<string> {
+  private async readObjectTextWithinLimit(
+    key: string,
+    maxBytes: number,
+  ): Promise<
+    { kind: "success"; text: string } | { kind: "fatal"; error: Record<string, unknown> }
+  > {
     const object = await this.objectStorage.getObject({ key });
-    const body = await readBody(object.body);
+    const body = await readBodyWithinLimit(object.body, object.contentLength, maxBytes, key);
 
-    return body.toString("utf8");
+    if (body.kind === "fatal") {
+      return {
+        kind: "fatal",
+        error: {
+          code: "media_caption_markdown_limit_exceeded",
+          object_key: key,
+          actual_bytes: body.actualBytes,
+          limit_bytes: body.limitBytes,
+        },
+      };
+    }
+
+    return {
+      kind: "success",
+      text: body.content.toString("utf8"),
+    };
   }
 
   private createCompletedResult(
@@ -843,6 +1132,27 @@ export class MediaCaptionProcessor {
       provider_call_count: 0,
       captioned_markdown_object_key: null,
     };
+  }
+
+  private createFailedResult(payload: MediaCaptionPayload): MediaCaptionProcessorResult {
+    return this.createStoppedResult(payload);
+  }
+
+  private async markCaptioningFailed(
+    payload: MediaCaptionPayload,
+    error: Record<string, unknown>,
+  ): Promise<void> {
+    await this.jobProgress?.updateJobProgress({
+      jobId: payload.job_id,
+      knowledgeBaseId: payload.knowledge_base_id,
+      inputSnapshotId: payload.input_snapshot_id,
+      stage: "captioning",
+      status: "failed",
+      progress: 100,
+      message: "Media captioning failed.",
+      parsedContentId: payload.parsed_content_id,
+      error,
+    });
   }
 
   private async recordVisionCaptionModelCall(
@@ -929,6 +1239,7 @@ export class PostgresMediaCaptionRepository implements MediaCaptionRepository {
         caption_error
       from media_assets
       where id = any(${ids}::text[])
+        and caption_status in ('pending', 'failed')
       order by created_at asc
     `.execute(this.db);
 
@@ -1043,6 +1354,7 @@ export class PostgresMediaCaptionRepository implements MediaCaptionRepository {
         end,
         updated_at = now()
       where id = ${id}
+        and caption_status in ('pending', 'failed')
     `.execute(this.db);
   }
 
@@ -1093,6 +1405,79 @@ export function createCaptionCacheKey(input: MediaCaptionCacheLookupInput): stri
     sanitizeCacheKeyPart(input.model),
     sanitizeCacheKeyPart(input.promptVersion),
   ].join(":");
+}
+
+function createCaptionConfigHash(
+  config: MediaCaptionProcessorConfig,
+  promptVersion: string,
+): string {
+  return createShortConfigHash({
+    contextChars: config.contextChars,
+    maxImageBytes: config.maxImageBytes,
+    maxOutputTokens: config.maxOutputTokens,
+    model: config.model,
+    promptVersion,
+    providerName: config.providerName,
+    timeoutSeconds: config.timeoutSeconds,
+    windowSize: config.windowSize,
+  });
+}
+
+function createCaptionAssetDedupeKey(asset: MediaCaptionAssetRecord, configHash: string): string {
+  return createDocumentProcessingDedupeKey({
+    configHash,
+    contentHash: asset.sha256,
+    stage: "captioning",
+    unitKey: asset.id,
+    unitType: "media_asset",
+  });
+}
+
+function toCaptionProcessingUnit(
+  payload: MediaCaptionPayload,
+  asset: MediaCaptionAssetRecord,
+  input: {
+    configHash: string;
+    counters?: Record<string, unknown>;
+    metadata?: Record<string, unknown>;
+    model?: string | null;
+    promptVersion?: string | null;
+    providerName?: string | null;
+    retryEligible?: boolean;
+    safeError?: Record<string, unknown> | null;
+    status: DocumentProcessingUnitInput["status"];
+    unitIndex?: number;
+  },
+): DocumentProcessingUnitInput {
+  return {
+    configHash: input.configHash,
+    contentHash: asset.sha256,
+    counters: {
+      height: asset.height,
+      width: asset.width,
+      ...input.counters,
+    },
+    dedupeKey: createCaptionAssetDedupeKey(asset, input.configHash),
+    jobId: payload.job_id,
+    locator: asset.locator,
+    metadata: {
+      mime_type: asset.mime_type,
+      ...input.metadata,
+    },
+    model: input.model ?? null,
+    objectKey: asset.object_key,
+    parsedContentId: payload.parsed_content_id,
+    promptVersion: input.promptVersion ?? null,
+    providerName: input.providerName ?? null,
+    retryEligible: input.retryEligible ?? false,
+    safeError: input.safeError ?? null,
+    sourceDocumentId: payload.document_id,
+    stage: "captioning",
+    status: input.status,
+    unitIndex: input.unitIndex ?? null,
+    unitKey: asset.id,
+    unitType: "media_asset",
+  };
 }
 
 export function normalizeVisionCaptionOutput(value: string): string | null {
@@ -1223,6 +1608,13 @@ function isCaptionEligibleImage(asset: MediaCaptionAssetRecord): boolean {
   );
 }
 
+function isCaptionWorkCandidateImage(asset: MediaCaptionAssetRecord): boolean {
+  return (
+    (asset.caption_status === "pending" || asset.caption_status === "failed") &&
+    isCaptionEligibleImage(asset)
+  );
+}
+
 function escapeMarkdownAlt(value: string): string {
   return value
     .replace(/[\]\n\r[]/gu, " ")
@@ -1232,6 +1624,17 @@ function escapeMarkdownAlt(value: string): string {
 
 function sanitizeCacheKeyPart(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]+/g, "_");
+}
+
+function chunkArray<T>(items: readonly T[], size: number): T[][] {
+  const safeSize = Math.max(1, Math.floor(size));
+  const chunks: T[][] = [];
+
+  for (let index = 0; index < items.length; index += safeSize) {
+    chunks.push(items.slice(index, index + safeSize));
+  }
+
+  return chunks;
 }
 
 function sleepFor(milliseconds: number): Promise<void> {
@@ -1281,14 +1684,47 @@ function toUsage(value: unknown): ModelCallUsage | undefined {
   return Object.keys(usage).length === 0 ? undefined : usage;
 }
 
-async function readBody(body: unknown): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-
-  for await (const chunk of body as AsyncIterable<Buffer | string>) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+async function readBodyWithinLimit(
+  body: unknown,
+  contentLength: number | undefined,
+  maxBytes: number,
+  objectKey: string,
+): Promise<
+  | { kind: "success"; content: Buffer }
+  | { kind: "fatal"; objectKey: string; actualBytes: number; limitBytes: number }
+> {
+  if (contentLength !== undefined && contentLength > maxBytes) {
+    return {
+      kind: "fatal",
+      objectKey,
+      actualBytes: contentLength,
+      limitBytes: maxBytes,
+    };
   }
 
-  return Buffer.concat(chunks);
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+
+  for await (const chunk of body as AsyncIterable<Buffer | string>) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.byteLength;
+
+    if (totalBytes > maxBytes) {
+      return {
+        kind: "fatal",
+        objectKey,
+        actualBytes: totalBytes,
+        limitBytes: maxBytes,
+      };
+    }
+
+    chunks.push(buffer);
+  }
+
+  return {
+    kind: "success",
+    content: Buffer.concat(chunks, totalBytes),
+  };
 }
 
 type AsyncLimiter = <T>(task: () => Promise<T>) => Promise<T>;

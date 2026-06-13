@@ -1,4 +1,4 @@
-import { ApiError } from "@fococontext/contracts";
+import { ApiError, type ApiErrorCode } from "@fococontext/contracts";
 import { loadReleaseMetadata, type ReleaseMetadata } from "./release-metadata.js";
 import type { SourceWatchRuntimeAdapters } from "./source-watch-config.js";
 import { parseUploadLimits, type RuntimeConfigUploadLimits } from "./upload-config.js";
@@ -12,6 +12,7 @@ import {
 export { computeCompilePromptLimits, maskSecret } from "./runtime-config-helpers.js";
 export type { CompilePromptLimits } from "./runtime-config-helpers.js";
 export type {
+  SourceWatchRemoteSecurityConfig,
   SourceWatchRuntimeAdapterBase,
   SourceWatchRuntimeAdapters,
 } from "./source-watch-config.js";
@@ -19,14 +20,57 @@ export type { RuntimeConfigUploadLimits, UploadMultipartFallbackMode } from "./u
 
 export type RuntimeEnv = Readonly<Record<string, string | undefined>>;
 
+export const productionRuntimeConfigurationErrorCode = "production_runtime_configuration_invalid";
+
+export class ProductionRuntimeConfigurationError extends ApiError {
+  readonly runtimeCode = productionRuntimeConfigurationErrorCode;
+
+  constructor(input: {
+    apiErrorCode?: ApiErrorCode;
+    message: string;
+    details?: unknown;
+    cause?: unknown;
+  }) {
+    super(input.apiErrorCode ?? "invalid_request", {
+      message: input.message,
+      details: input.details,
+      cause: input.cause,
+    });
+    this.name = "ProductionRuntimeConfigurationError";
+  }
+}
+
+export function requireProductionDependency<TValue>(
+  dependencyName: string,
+  value: TValue | undefined,
+): TValue {
+  if (value === undefined) {
+    throw new ProductionRuntimeConfigurationError({
+      apiErrorCode: "durable_backend_unavailable",
+      message: `Production runtime dependency is missing or invalid: ${dependencyName}.`,
+      details: {
+        missing: [dependencyName],
+      },
+    });
+  }
+
+  return value;
+}
+
 export interface RuntimeConfig {
   api: {
     port: number;
     publicBaseUrl?: string;
   };
   admin: {
+    cookieSameSite: "lax" | "none" | "strict";
+    cookieSecure: boolean;
+    loginFailureLimit: number;
+    loginFailureWindowSeconds: number;
+    loginLockoutSeconds: number;
     port: number;
     publicBaseUrl?: string;
+    sessionTtlSeconds: number;
     username: string;
     password: string;
   };
@@ -94,6 +138,10 @@ export interface RuntimeConfig {
     adapters: SourceWatchRuntimeAdapters;
     containerDir: string;
     hostDir?: string;
+    remoteSecurity: {
+      privateNetworkAllowlist: readonly string[];
+      privateNetworkEnabled: boolean;
+    };
     scheduler: {
       enabled: boolean;
       defaultIntervalSeconds: number;
@@ -108,7 +156,47 @@ export interface RuntimeConfig {
     serviceApiKey?: string;
     languages: string[];
   };
+  security: {
+    headersEnabled: boolean;
+    hstsEnabled: boolean;
+    hstsMaxAgeSeconds: number;
+    audit: RuntimeSecurityAuditConfig;
+    rateLimits: RuntimeSecurityRateLimitConfig;
+  };
   release: ReleaseMetadata;
+}
+
+export interface RuntimeSecurityAuditConfig {
+  counterTtlSeconds: number;
+  counterWindowSeconds: number;
+  enabled: boolean;
+  maxMetadataBytes: number;
+  retentionDays: number;
+}
+
+export type RuntimeSecurityRateLimitClass =
+  | "admin_expensive"
+  | "cleanup"
+  | "default_api"
+  | "direct_upload"
+  | "diagnostics"
+  | "export"
+  | "login"
+  | "openapi"
+  | "public_health"
+  | "retrieve"
+  | "source_evidence"
+  | "upload"
+  | "webhook";
+
+export interface RuntimeSecurityRateLimitClassConfig {
+  max: number;
+  windowSeconds: number;
+}
+
+export interface RuntimeSecurityRateLimitConfig {
+  classes: Record<RuntimeSecurityRateLimitClass, RuntimeSecurityRateLimitClassConfig>;
+  enabled: boolean;
 }
 
 export interface RuntimeConfigLimits {
@@ -118,6 +206,10 @@ export interface RuntimeConfigLimits {
     maxFileSizeMb: number;
     timeoutSeconds: number;
     concurrency: number;
+    maxZipEntries: number;
+    maxZipExpandedMb: number;
+    maxZipEntryMb: number;
+    mediaUploadConcurrency: number;
     maxImagesPerDocument: number;
     maxRenderedSnapshotsPerDocument: number;
     maxImagePixels: number;
@@ -127,6 +219,14 @@ export interface RuntimeConfigLimits {
     visualExtractionConcurrency: number;
     remoteImageFetchingEnabled: boolean;
     pdfSnapshotMinTextChars: number;
+  };
+  documentProcessing: {
+    cleanupBatchSize: number;
+    detailDefaultPageSize: number;
+    detailMaxPageSize: number;
+    failureRetentionDays: number;
+    markdownWindowChars: number;
+    successRetentionDays: number;
   };
   queue: {
     concurrency: number;
@@ -176,6 +276,8 @@ export interface RuntimeConfigLimits {
   };
   webhookDelivery: WebhookDeliveryLimits;
   effectiveConcurrency: RuntimeConfigEffectiveConcurrency;
+  backgroundJobs: RuntimeBackgroundJobLimits;
+  residualMemory: RuntimeResidualMemoryLimits;
   pressure: RuntimePressureLimits;
 }
 
@@ -230,6 +332,54 @@ export interface RuntimeConfigEffectiveConcurrency {
   internal: {
     ocrPageConcurrency: number;
     visionCaptionImageConcurrency: number;
+  };
+}
+
+export type RuntimeBackgroundJobWorkload =
+  | "reindex"
+  | "graphInsights"
+  | "knowledgeCheck"
+  | "sourceWatch"
+  | "ocr"
+  | "mediaCaption"
+  | "cleanup";
+
+export interface RuntimeBackgroundJobWorkloadLimits {
+  batchSize: number;
+  cursorWindowSize: number;
+  checkpointInterval: number;
+  retryBaseDelayMs: number;
+  concurrency: number;
+  source: RuntimeBackgroundJobWorkloadConfigSource;
+}
+
+export interface RuntimeBackgroundJobWorkloadConfigSource {
+  batchSize: string;
+  cursorWindowSize: string;
+  checkpointInterval: string;
+  retryBaseDelayMs: string;
+  concurrency: string;
+}
+
+export type RuntimeBackgroundJobLimits = Record<
+  RuntimeBackgroundJobWorkload,
+  RuntimeBackgroundJobWorkloadLimits
+>;
+
+export interface RuntimeResidualMemoryWorkloadLimits {
+  checkpointInterval: number;
+  checkpointIntervalSource: string;
+  windowSize: number;
+  windowSizeSource: string;
+}
+
+export interface RuntimeResidualMemoryLimits {
+  graphInsights: RuntimeResidualMemoryWorkloadLimits;
+  mediaCaption: RuntimeResidualMemoryWorkloadLimits;
+  ocr: RuntimeResidualMemoryWorkloadLimits;
+  sourceWatch: RuntimeResidualMemoryWorkloadLimits & {
+    smallUrlListLimit: number;
+    smallUrlListLimitSource: string;
   };
 }
 
@@ -317,6 +467,18 @@ const optionalVisionCaptionProviderKeys = [
   "VISION_CAPTION_MODEL",
 ] as const;
 
+const durableBackendEnvKeys = new Set<string>([
+  "DATABASE_URL",
+  "REDIS_URL",
+  "S3_PROVIDER_NAME",
+  "S3_ENDPOINT",
+  "S3_REGION",
+  "S3_BUCKET",
+  "S3_ACCESS_KEY_ID",
+  "S3_SECRET_ACCESS_KEY",
+  "S3_FORCE_PATH_STYLE",
+]);
+
 const defaultObjectStorageMetricsWindowSeconds = 300;
 const defaultObjectStorageClassAWarningThreshold = 1000;
 const defaultObjectStorageClassBWarningThreshold = 10_000;
@@ -330,6 +492,23 @@ const defaultSourceEvidenceContextChars = 800;
 const maxSourceEvidenceContextChars = 2000;
 const defaultSourceEvidenceBatchMaxItems = 20;
 const defaultSourceEvidenceBatchTotalOutputMaxChars = 40000;
+const defaultAdminSessionTtlSeconds = 7 * 24 * 60 * 60;
+const defaultAdminLoginFailureLimit = 5;
+const defaultAdminLoginFailureWindowSeconds = 15 * 60;
+const defaultAdminLoginLockoutSeconds = 15 * 60;
+const defaultSecurityHstsMaxAgeSeconds = 15_552_000;
+const defaultSecurityAuditCounterTtlSeconds = 24 * 60 * 60;
+const defaultSecurityAuditCounterWindowSeconds = 300;
+const defaultSecurityAuditMaxMetadataBytes = 2048;
+const defaultSecurityAuditRetentionDays = 90;
+const defaultBackgroundJobBatchSize = 100;
+const defaultBackgroundJobCursorWindowSize = 100;
+const defaultBackgroundJobCheckpointInterval = 1;
+const defaultBackgroundJobRetryBaseDelayMs = 1000;
+const backgroundJobMaxBatchSize = 5000;
+const backgroundJobMaxCursorWindowSize = 10_000;
+const backgroundJobMaxCheckpointInterval = 1000;
+const backgroundJobMaxRetryBaseDelayMs = 300_000;
 
 function readRequired(env: RuntimeEnv, key: (typeof requiredEnvKeys)[number]): string {
   return env[key]?.trim() ?? "";
@@ -436,6 +615,74 @@ function parseOptionalPositiveIntegerInRange(
   return parsed;
 }
 
+function parseOptionalPositiveIntegerWithSource(
+  env: RuntimeEnv,
+  key: string,
+  defaultValue: number,
+  invalid: string[],
+  fallbackSource = "default",
+): { value: number; source: string } {
+  const value = readOptional(env, key);
+
+  if (value === undefined) {
+    return {
+      value: defaultValue,
+      source: fallbackSource,
+    };
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    invalid.push(key);
+
+    return {
+      value: defaultValue,
+      source: fallbackSource,
+    };
+  }
+
+  return {
+    value: parsed,
+    source: key,
+  };
+}
+
+function parseOptionalPositiveIntegerInRangeWithSource(
+  env: RuntimeEnv,
+  key: string,
+  defaultValue: number,
+  min: number,
+  max: number,
+  invalid: string[],
+  fallbackSource = "default",
+): { value: number; source: string } {
+  const value = readOptional(env, key);
+
+  if (value === undefined) {
+    return {
+      value: defaultValue,
+      source: fallbackSource,
+    };
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+    invalid.push(key);
+
+    return {
+      value: defaultValue,
+      source: fallbackSource,
+    };
+  }
+
+  return {
+    value: parsed,
+    source: key,
+  };
+}
+
 function parseOptionalPositiveIntegerOrNull(
   env: RuntimeEnv,
   key: string,
@@ -536,6 +783,104 @@ function parseOptionalWebhookDeliveryRetryBackoff(
   return defaultValue;
 }
 
+function resolveBackgroundJobWorkloadLimits(input: {
+  env: RuntimeEnv;
+  invalid: string[];
+  prefix: string;
+  fallbackConcurrency: number;
+}): RuntimeBackgroundJobWorkloadLimits {
+  const batch = parseOptionalPositiveIntegerInRangeWithSource(
+    input.env,
+    `${input.prefix}_BATCH_SIZE`,
+    defaultBackgroundJobBatchSize,
+    1,
+    backgroundJobMaxBatchSize,
+    input.invalid,
+  );
+  const cursorWindow = parseOptionalPositiveIntegerInRangeWithSource(
+    input.env,
+    `${input.prefix}_CURSOR_WINDOW_SIZE`,
+    defaultBackgroundJobCursorWindowSize,
+    1,
+    backgroundJobMaxCursorWindowSize,
+    input.invalid,
+    batch.source === "default" ? "default" : batch.source,
+  );
+  const checkpointInterval = parseOptionalPositiveIntegerInRangeWithSource(
+    input.env,
+    `${input.prefix}_CHECKPOINT_INTERVAL`,
+    defaultBackgroundJobCheckpointInterval,
+    1,
+    backgroundJobMaxCheckpointInterval,
+    input.invalid,
+  );
+  const retryBaseDelay = parseOptionalPositiveIntegerInRangeWithSource(
+    input.env,
+    `${input.prefix}_RETRY_BASE_DELAY_MS`,
+    defaultBackgroundJobRetryBaseDelayMs,
+    1,
+    backgroundJobMaxRetryBaseDelayMs,
+    input.invalid,
+  );
+  const concurrency = parseOptionalPositiveIntegerWithSource(
+    input.env,
+    `${input.prefix}_CONCURRENCY`,
+    input.fallbackConcurrency,
+    input.invalid,
+    "FOCOCONTEXT_QUEUE_CONCURRENCY",
+  );
+
+  return {
+    batchSize: batch.value,
+    cursorWindowSize: cursorWindow.value,
+    checkpointInterval: checkpointInterval.value,
+    retryBaseDelayMs: retryBaseDelay.value,
+    concurrency: concurrency.value,
+    source: {
+      batchSize: batch.source,
+      cursorWindowSize: cursorWindow.source,
+      checkpointInterval: checkpointInterval.source,
+      retryBaseDelayMs: retryBaseDelay.source,
+      concurrency: concurrency.source,
+    },
+  };
+}
+
+function resolveResidualMemoryWorkloadLimits(input: {
+  checkpointDefault: RuntimeBackgroundJobWorkloadLimits;
+  checkpointKey: string;
+  env: RuntimeEnv;
+  invalid: string[];
+  windowDefault: RuntimeBackgroundJobWorkloadLimits;
+  windowKey: string;
+}): RuntimeResidualMemoryWorkloadLimits {
+  const windowSize = parseOptionalPositiveIntegerInRangeWithSource(
+    input.env,
+    input.windowKey,
+    input.windowDefault.cursorWindowSize,
+    1,
+    backgroundJobMaxCursorWindowSize,
+    input.invalid,
+    input.windowDefault.source.cursorWindowSize,
+  );
+  const checkpointInterval = parseOptionalPositiveIntegerInRangeWithSource(
+    input.env,
+    input.checkpointKey,
+    input.checkpointDefault.checkpointInterval,
+    1,
+    backgroundJobMaxCheckpointInterval,
+    input.invalid,
+    input.checkpointDefault.source.checkpointInterval,
+  );
+
+  return {
+    checkpointInterval: checkpointInterval.value,
+    checkpointIntervalSource: checkpointInterval.source,
+    windowSize: windowSize.value,
+    windowSizeSource: windowSize.source,
+  };
+}
+
 function parseBoolean(env: RuntimeEnv, key: string, invalid: string[]): boolean {
   const value = readOptional(env, key);
 
@@ -575,6 +920,129 @@ function parseOptionalBoolean(
   return defaultValue;
 }
 
+function parseOptionalAdminCookieSameSite(
+  env: RuntimeEnv,
+  key: string,
+  defaultValue: "lax" | "none" | "strict",
+  invalid: string[],
+): "lax" | "none" | "strict" {
+  const value = readOptional(env, key)?.toLowerCase();
+
+  if (value === undefined) {
+    return defaultValue;
+  }
+
+  if (value === "lax" || value === "none" || value === "strict") {
+    return value;
+  }
+
+  invalid.push(key);
+  return defaultValue;
+}
+
+function parseSecurityRateLimits(
+  env: RuntimeEnv,
+  invalid: string[],
+): RuntimeSecurityRateLimitConfig {
+  const defaultWindowSeconds = parseOptionalPositiveInteger(
+    env,
+    "SECURITY_RATE_LIMIT_WINDOW_SECONDS",
+    60,
+    invalid,
+  );
+
+  return {
+    enabled: parseOptionalBoolean(env, "SECURITY_RATE_LIMIT_ENABLED", true, invalid),
+    classes: {
+      admin_expensive: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 120,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_ADMIN_EXPENSIVE",
+      }),
+      cleanup: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 30,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_CLEANUP",
+      }),
+      default_api: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 600,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_DEFAULT_API",
+      }),
+      direct_upload: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 120,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_DIRECT_UPLOAD",
+      }),
+      diagnostics: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 120,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_DIAGNOSTICS",
+      }),
+      export: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 30,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_EXPORT",
+      }),
+      login: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 30,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_LOGIN",
+      }),
+      openapi: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 120,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_OPENAPI",
+      }),
+      public_health: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 600,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_PUBLIC_HEALTH",
+      }),
+      retrieve: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 120,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_RETRIEVE",
+      }),
+      source_evidence: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 120,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_SOURCE_EVIDENCE",
+      }),
+      upload: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 120,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_UPLOAD",
+      }),
+      webhook: parseSecurityRateLimitClass(env, invalid, {
+        defaultMax: 120,
+        defaultWindowSeconds,
+        keyPrefix: "SECURITY_RATE_LIMIT_WEBHOOK",
+      }),
+    },
+  };
+}
+
+function parseSecurityRateLimitClass(
+  env: RuntimeEnv,
+  invalid: string[],
+  input: {
+    defaultMax: number;
+    defaultWindowSeconds: number;
+    keyPrefix: string;
+  },
+): RuntimeSecurityRateLimitClassConfig {
+  return {
+    max: parseOptionalPositiveInteger(env, `${input.keyPrefix}_MAX`, input.defaultMax, invalid),
+    windowSeconds: parseOptionalPositiveInteger(
+      env,
+      `${input.keyPrefix}_WINDOW_SECONDS`,
+      input.defaultWindowSeconds,
+      invalid,
+    ),
+  };
+}
+
 export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
   const missing: string[] = requiredEnvKeys.filter((key) => readRequired(env, key) === "");
   const invalid: string[] = [];
@@ -606,6 +1074,7 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
   const sourceWatchS3Region = readOptional(env, "SOURCE_WATCH_S3_REGION");
   const sourceWatchS3SecretAccessKey = readOptional(env, "SOURCE_WATCH_S3_SECRET_ACCESS_KEY");
   const uploadLimits = parseUploadLimits(env, invalid);
+  const parserMaxFileSizeMb = parsePositiveInteger(env, "PARSER_MAX_FILE_SIZE_MB", invalid);
   const parserConcurrency = parsePositiveInteger(env, "PARSER_CONCURRENCY", invalid);
   const queueConcurrency = parsePositiveInteger(env, "FOCOCONTEXT_QUEUE_CONCURRENCY", invalid);
   const sourceParseConcurrency = parseOptionalPositiveInteger(
@@ -772,7 +1241,10 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
   }
 
   if (missing.length > 0) {
-    throw new ApiError("invalid_request", {
+    throw new ProductionRuntimeConfigurationError({
+      apiErrorCode: missing.some((key) => durableBackendEnvKeys.has(key))
+        ? "durable_backend_unavailable"
+        : "invalid_request",
       message: "Missing runtime configuration.",
       details: {
         missing,
@@ -788,6 +1260,100 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
     });
   }
 
+  const backgroundJobs: RuntimeBackgroundJobLimits = {
+    reindex: resolveBackgroundJobWorkloadLimits({
+      env,
+      invalid,
+      prefix: "BACKGROUND_REINDEX",
+      fallbackConcurrency: queueConcurrency,
+    }),
+    graphInsights: resolveBackgroundJobWorkloadLimits({
+      env,
+      invalid,
+      prefix: "BACKGROUND_GRAPH_INSIGHTS",
+      fallbackConcurrency: wikiMergeConcurrency,
+    }),
+    knowledgeCheck: resolveBackgroundJobWorkloadLimits({
+      env,
+      invalid,
+      prefix: "BACKGROUND_KNOWLEDGE_CHECK",
+      fallbackConcurrency: queueConcurrency,
+    }),
+    sourceWatch: resolveBackgroundJobWorkloadLimits({
+      env,
+      invalid,
+      prefix: "BACKGROUND_SOURCE_WATCH",
+      fallbackConcurrency: sourceWatchConcurrency,
+    }),
+    ocr: resolveBackgroundJobWorkloadLimits({
+      env,
+      invalid,
+      prefix: "BACKGROUND_OCR",
+      fallbackConcurrency: ocrConcurrency,
+    }),
+    mediaCaption: resolveBackgroundJobWorkloadLimits({
+      env,
+      invalid,
+      prefix: "BACKGROUND_MEDIA_CAPTION",
+      fallbackConcurrency: visionCaptionConcurrency,
+    }),
+    cleanup: resolveBackgroundJobWorkloadLimits({
+      env,
+      invalid,
+      prefix: "BACKGROUND_CLEANUP",
+      fallbackConcurrency: deletionCleanupConcurrency,
+    }),
+  };
+  const residualSourceWatchSmallUrlList = parseOptionalPositiveIntegerInRangeWithSource(
+    env,
+    "RESIDUAL_SOURCE_WATCH_SMALL_URL_LIST_LIMIT",
+    parseOptionalPositiveInteger(env, "SOURCE_WATCH_URL_LIST_MAX_URLS", 100, invalid),
+    1,
+    backgroundJobMaxCursorWindowSize,
+    invalid,
+    readOptional(env, "SOURCE_WATCH_URL_LIST_MAX_URLS") === undefined
+      ? "default"
+      : "SOURCE_WATCH_URL_LIST_MAX_URLS",
+  );
+  const residualMemory: RuntimeResidualMemoryLimits = {
+    graphInsights: resolveResidualMemoryWorkloadLimits({
+      checkpointDefault: backgroundJobs.graphInsights,
+      checkpointKey: "RESIDUAL_GRAPH_INSIGHTS_CHECKPOINT_INTERVAL",
+      env,
+      invalid,
+      windowDefault: backgroundJobs.graphInsights,
+      windowKey: "RESIDUAL_GRAPH_INSIGHTS_SUMMARY_WINDOW_SIZE",
+    }),
+    mediaCaption: resolveResidualMemoryWorkloadLimits({
+      checkpointDefault: backgroundJobs.mediaCaption,
+      checkpointKey: "RESIDUAL_MEDIA_CAPTION_CHECKPOINT_INTERVAL",
+      env,
+      invalid,
+      windowDefault: backgroundJobs.mediaCaption,
+      windowKey: "RESIDUAL_MEDIA_CAPTION_ASSET_WINDOW_SIZE",
+    }),
+    ocr: resolveResidualMemoryWorkloadLimits({
+      checkpointDefault: backgroundJobs.ocr,
+      checkpointKey: "RESIDUAL_OCR_CHECKPOINT_INTERVAL",
+      env,
+      invalid,
+      windowDefault: backgroundJobs.ocr,
+      windowKey: "RESIDUAL_OCR_PAGE_WINDOW_SIZE",
+    }),
+    sourceWatch: {
+      ...resolveResidualMemoryWorkloadLimits({
+        checkpointDefault: backgroundJobs.sourceWatch,
+        checkpointKey: "RESIDUAL_SOURCE_WATCH_CHECKPOINT_INTERVAL",
+        env,
+        invalid,
+        windowDefault: backgroundJobs.sourceWatch,
+        windowKey: "RESIDUAL_SOURCE_WATCH_COMPARISON_WINDOW_SIZE",
+      }),
+      smallUrlListLimit: residualSourceWatchSmallUrlList.value,
+      smallUrlListLimitSource: residualSourceWatchSmallUrlList.source,
+    },
+  };
+
   const config: RuntimeConfig = {
     api: {
       port: parsePositiveInteger(env, "FOCOCONTEXT_API_PORT", invalid),
@@ -796,6 +1362,37 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
     admin: {
       port: parsePositiveInteger(env, "FOCOCONTEXT_ADMIN_PORT", invalid),
       ...(publicAdminBaseUrl === undefined ? {} : { publicBaseUrl: publicAdminBaseUrl }),
+      sessionTtlSeconds: parseOptionalPositiveInteger(
+        env,
+        "FOCOCONTEXT_ADMIN_SESSION_TTL_SECONDS",
+        defaultAdminSessionTtlSeconds,
+        invalid,
+      ),
+      loginFailureLimit: parseOptionalPositiveInteger(
+        env,
+        "FOCOCONTEXT_ADMIN_LOGIN_FAILURE_LIMIT",
+        defaultAdminLoginFailureLimit,
+        invalid,
+      ),
+      loginFailureWindowSeconds: parseOptionalPositiveInteger(
+        env,
+        "FOCOCONTEXT_ADMIN_LOGIN_FAILURE_WINDOW_SECONDS",
+        defaultAdminLoginFailureWindowSeconds,
+        invalid,
+      ),
+      loginLockoutSeconds: parseOptionalPositiveInteger(
+        env,
+        "FOCOCONTEXT_ADMIN_LOGIN_LOCKOUT_SECONDS",
+        defaultAdminLoginLockoutSeconds,
+        invalid,
+      ),
+      cookieSecure: parseOptionalBoolean(env, "FOCOCONTEXT_ADMIN_COOKIE_SECURE", false, invalid),
+      cookieSameSite: parseOptionalAdminCookieSameSite(
+        env,
+        "FOCOCONTEXT_ADMIN_COOKIE_SAMESITE",
+        "lax",
+        invalid,
+      ),
       username: readRequired(env, "FOCOCONTEXT_ADMIN_USERNAME"),
       password: readRequired(env, "FOCOCONTEXT_ADMIN_PASSWORD"),
     },
@@ -846,9 +1443,28 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
       upload: uploadLimits,
       objectStorageOperations,
       parser: {
-        maxFileSizeMb: parsePositiveInteger(env, "PARSER_MAX_FILE_SIZE_MB", invalid),
+        maxFileSizeMb: parserMaxFileSizeMb,
         timeoutSeconds: parsePositiveInteger(env, "PARSER_TIMEOUT_SECONDS", invalid),
         concurrency: parserConcurrency,
+        maxZipEntries: parseOptionalPositiveInteger(env, "PARSER_ZIP_MAX_ENTRIES", 10_000, invalid),
+        maxZipExpandedMb: parseOptionalPositiveInteger(
+          env,
+          "PARSER_ZIP_MAX_EXPANDED_MB",
+          parserMaxFileSizeMb * 20,
+          invalid,
+        ),
+        maxZipEntryMb: parseOptionalPositiveInteger(
+          env,
+          "PARSER_ZIP_MAX_ENTRY_MB",
+          parserMaxFileSizeMb,
+          invalid,
+        ),
+        mediaUploadConcurrency: parseOptionalPositiveInteger(
+          env,
+          "PARSER_MEDIA_UPLOAD_CONCURRENCY",
+          parserConcurrency,
+          invalid,
+        ),
         maxImagesPerDocument: parsePositiveInteger(env, "PARSER_MAX_IMAGES_PER_DOCUMENT", invalid),
         maxRenderedSnapshotsPerDocument: parseOptionalNonNegativeInteger(
           env,
@@ -886,6 +1502,44 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
           env,
           "PARSER_PDF_SNAPSHOT_MIN_TEXT_CHARS",
           80,
+          invalid,
+        ),
+      },
+      documentProcessing: {
+        cleanupBatchSize: parseOptionalPositiveInteger(
+          env,
+          "DOCUMENT_PROCESSING_CLEANUP_BATCH_SIZE",
+          500,
+          invalid,
+        ),
+        detailDefaultPageSize: parseOptionalPositiveInteger(
+          env,
+          "DOCUMENT_PROCESSING_DETAIL_DEFAULT_PAGE_SIZE",
+          50,
+          invalid,
+        ),
+        detailMaxPageSize: parseOptionalPositiveInteger(
+          env,
+          "DOCUMENT_PROCESSING_DETAIL_MAX_PAGE_SIZE",
+          200,
+          invalid,
+        ),
+        failureRetentionDays: parseOptionalPositiveInteger(
+          env,
+          "DOCUMENT_PROCESSING_FAILURE_RETENTION_DAYS",
+          30,
+          invalid,
+        ),
+        markdownWindowChars: parseOptionalPositiveInteger(
+          env,
+          "DOCUMENT_PROCESSING_MARKDOWN_WINDOW_CHARS",
+          64_000,
+          invalid,
+        ),
+        successRetentionDays: parseOptionalPositiveInteger(
+          env,
+          "DOCUMENT_PROCESSING_SUCCESS_RETENTION_DAYS",
+          7,
           invalid,
         ),
       },
@@ -1154,6 +1808,8 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
           visionCaptionImageConcurrency,
         },
       },
+      backgroundJobs,
+      residualMemory,
       pressure: {
         uploadDegradedThreshold: uploadLimits.pressureDegradedThreshold,
         queueDepthDegradedThreshold: parseOptionalPositiveInteger(
@@ -1338,6 +1994,19 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
       },
       containerDir: sourceWatchContainerDir,
       ...(sourceWatchHostDir === undefined ? {} : { hostDir: sourceWatchHostDir }),
+      remoteSecurity: {
+        privateNetworkAllowlist: parseOptionalStringList(
+          env,
+          "SOURCE_WATCH_PRIVATE_NETWORK_ALLOWLIST",
+          [],
+        ),
+        privateNetworkEnabled: parseOptionalBoolean(
+          env,
+          "SOURCE_WATCH_PRIVATE_NETWORK_ENABLED",
+          false,
+          invalid,
+        ),
+      },
       scheduler: {
         defaultIntervalSeconds: sourceWatchScanIntervalSeconds,
         enabled: parseOptionalBoolean(env, "SOURCE_WATCH_SCHEDULER_ENABLED", true, invalid),
@@ -1351,6 +2020,44 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
       ...(ocrServiceBaseUrl === undefined ? {} : { serviceBaseUrl: ocrServiceBaseUrl }),
       ...(ocrServiceApiKey === undefined ? {} : { serviceApiKey: ocrServiceApiKey }),
       languages: ocrLanguages,
+    },
+    security: {
+      headersEnabled: parseOptionalBoolean(env, "SECURITY_HEADERS_ENABLED", true, invalid),
+      hstsEnabled: parseOptionalBoolean(env, "SECURITY_HSTS_ENABLED", false, invalid),
+      hstsMaxAgeSeconds: parseOptionalPositiveInteger(
+        env,
+        "SECURITY_HSTS_MAX_AGE_SECONDS",
+        defaultSecurityHstsMaxAgeSeconds,
+        invalid,
+      ),
+      audit: {
+        counterTtlSeconds: parseOptionalPositiveInteger(
+          env,
+          "SECURITY_AUDIT_COUNTER_TTL_SECONDS",
+          defaultSecurityAuditCounterTtlSeconds,
+          invalid,
+        ),
+        counterWindowSeconds: parseOptionalPositiveInteger(
+          env,
+          "SECURITY_AUDIT_COUNTER_WINDOW_SECONDS",
+          defaultSecurityAuditCounterWindowSeconds,
+          invalid,
+        ),
+        enabled: parseOptionalBoolean(env, "SECURITY_AUDIT_ENABLED", true, invalid),
+        maxMetadataBytes: parseOptionalPositiveInteger(
+          env,
+          "SECURITY_AUDIT_MAX_METADATA_BYTES",
+          defaultSecurityAuditMaxMetadataBytes,
+          invalid,
+        ),
+        retentionDays: parseOptionalPositiveInteger(
+          env,
+          "SECURITY_AUDIT_RETENTION_DAYS",
+          defaultSecurityAuditRetentionDays,
+          invalid,
+        ),
+      },
+      rateLimits: parseSecurityRateLimits(env, invalid),
     },
     release: loadReleaseMetadata(env, "api"),
   };
@@ -1380,7 +2087,7 @@ export function loadRuntimeConfig(env: RuntimeEnv): RuntimeConfig {
   }
 
   if (invalid.length > 0) {
-    throw new ApiError("invalid_request", {
+    throw new ProductionRuntimeConfigurationError({
       message: "Invalid runtime configuration.",
       details: {
         invalid,

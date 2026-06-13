@@ -8,14 +8,16 @@ import { ApiError, createResourceId, resolveJobProgressState } from "@fococontex
 import type { RuntimeConfig } from "@fococontext/core";
 import type { ObjectStorageAdapter } from "@fococontext/storage";
 
-import { KnowledgeBaseService } from "../knowledge-bases/knowledge-base.service.js";
 import type {
   DatasetConfigurationResponse,
   KnowledgeBaseResponse,
 } from "../knowledge-bases/knowledge-base.types.js";
-import type { ApiResourceScope } from "../auth/api-key.guard.js";
+import {
+  defaultApiResourceScope,
+  type ApiKeyScope,
+  type ApiResourceScope,
+} from "../auth/api-key.guard.js";
 import { objectStorageToken } from "../object-storage.provider.js";
-import { DocumentRepository } from "./document.repository.js";
 import { apiDatabaseMirrorToken, type ApiDatabaseMirror } from "../database/api-database-mirror.js";
 import {
   createQueuedDeletionCleanupOperation,
@@ -23,13 +25,14 @@ import {
 } from "../deletion-cleanup/deletion-cleanup.response.js";
 import {
   applyManifestToOperation,
+  collectSourceDocumentManifestFromRecords,
+  collectSourceDocumentObjectKeysFromRecords,
   DeletionCleanupManifestCollector,
 } from "../deletion-cleanup/deletion-cleanup.manifest.js";
-import { DeletionCleanupRepository } from "../deletion-cleanup/deletion-cleanup.repository.js";
 import {
-  apiDatabaseHydratorToken,
-  type ApiDatabaseHydrator,
-} from "../database/api-database-hydrator.js";
+  operationalReadStoreToken,
+  type OperationalReadStore,
+} from "../database/operational-read-store.js";
 import {
   sourceParseQueueToken,
   type SourceParseQueue,
@@ -48,12 +51,21 @@ import {
 import { runtimeConfigToken } from "../runtime-config.provider.js";
 import { WebhookService } from "../webhooks/webhook.service.js";
 import { wikiStoreToken, type WikiStore } from "../wiki/wiki-store.js";
+import {
+  createRemoteSourceSecurityPolicy,
+  validateRemoteSourceUrl,
+} from "../source-watch/remote-source-security.js";
+import type { DeletionCleanupOperationRecord } from "../deletion-cleanup/deletion-cleanup.types.js";
 import { sourceEvidenceKinds } from "./document.types.js";
 import type {
   DocumentParsedContentResponse,
   DocumentUploadResponse,
   CreateUploadSessionResponse,
   DeleteImpactPreviewResponse,
+  DocumentProcessingStage,
+  DocumentProcessingUnitRecord,
+  DocumentProcessingUnitResponse,
+  DocumentProcessingUnitStatus,
   JobRecord,
   JobResponse,
   ListMediaAssetsInput,
@@ -99,6 +111,11 @@ interface MultipartFieldPart {
 type MultipartPart = MultipartFilePart | MultipartFieldPart;
 
 const parsedMarkdownPreviewMaxChars = 200_000;
+const parsedContentMediaAssetPreviewLimit = 100;
+const documentDetailRelatedPageLimit = 100;
+const documentDetailPageVersionLimit = 200;
+const sourceDocumentDeletionMediaAssetLimit = 10_000;
+const expiredUploadSessionSweepLimit = 500;
 
 interface ParsedMarkdownPreviewOptions {
   enabled: boolean;
@@ -162,6 +179,15 @@ interface FinalizeUploadSessionInput {
   content_hash?: string;
 }
 
+interface UploadSessionActorScope {
+  actorAccountId: string | null;
+  actorId: string;
+  actorSource: string;
+  actorType: UploadSessionRecord["actorType"];
+  projectId: string;
+  tenantId: string;
+}
+
 interface RetryOcrInput {
   mode?: string;
   page_numbers?: unknown;
@@ -205,12 +231,9 @@ export class DocumentService {
     @Inject(deletionCleanupQueueToken)
     private readonly deletionCleanupQueue: DeletionCleanupQueue,
     @Inject(apiDatabaseMirrorToken) private readonly databaseMirror: ApiDatabaseMirror,
-    @Inject(apiDatabaseHydratorToken) private readonly databaseHydrator: ApiDatabaseHydrator,
+    @Inject(operationalReadStoreToken) private readonly operationalReadStore: OperationalReadStore,
     @Inject(wikiStoreToken) private readonly wikiStore: WikiStore,
     @Inject(runtimeConfigToken) private readonly runtimeConfig: RuntimeConfig,
-    private readonly knowledgeBaseService: KnowledgeBaseService,
-    private readonly repository: DocumentRepository,
-    private readonly deletionCleanupRepository: DeletionCleanupRepository,
     private readonly deletionCleanupManifestCollector: DeletionCleanupManifestCollector,
     private readonly webhookService: WebhookService,
     private readonly uploadAdmissionService: UploadAdmissionService,
@@ -237,7 +260,7 @@ export class DocumentService {
       });
     }
 
-    const uploadLease = this.uploadAdmissionService.acquireMultipartUpload();
+    const uploadLease = await this.uploadAdmissionService.acquireMultipartUpload();
     const abortController = new AbortController();
     const removeAbortWatcher = bindMultipartRequestAbort(request, abortController);
 
@@ -255,7 +278,7 @@ export class DocumentService {
       );
     } finally {
       removeAbortWatcher();
-      uploadLease.release();
+      await uploadLease.release();
     }
   }
 
@@ -266,10 +289,9 @@ export class DocumentService {
     scope?: ApiResourceScope,
     signal?: AbortSignal,
   ): Promise<DocumentUploadResponse> {
-    await this.databaseHydrator.refresh();
-    const knowledgeBase = this.getKnowledgeBase(knowledgeBaseId, scope);
+    const knowledgeBase = await this.getReadableKnowledgeBase(knowledgeBaseId, scope);
 
-    const replayed = this.findUploadByIdempotencyKey(knowledgeBaseId, idempotencyKey);
+    const replayed = await this.findUploadByIdempotencyKey(knowledgeBaseId, idempotencyKey);
 
     if (replayed !== undefined) {
       return replayed;
@@ -303,18 +325,15 @@ export class DocumentService {
     }
 
     const now = new Date().toISOString();
-    const document = this.repository.createDocument(
-      createSourceDocumentRecord(
-        knowledgeBaseId,
-        uploadedFile,
-        uploadData,
-        now,
-        createSourceVisibilityMetadata(knowledgeBase),
-      ),
+    const document = createSourceDocumentRecord(
+      knowledgeBaseId,
+      uploadedFile,
+      uploadData,
+      now,
+      createSourceDocumentScope(scope),
+      createSourceVisibilityMetadata(knowledgeBase),
     );
-    const job = this.repository.createJob(
-      createParseJobRecord(knowledgeBaseId, uploadedFile, now, idempotencyKey),
-    );
+    const job = createParseJobRecord(knowledgeBaseId, uploadedFile, now, idempotencyKey);
     await this.persistCreatedSource(document, job);
     await this.enqueueSourceParse(document, job, scope);
 
@@ -327,8 +346,7 @@ export class DocumentService {
     idempotencyKey?: string,
     scope?: ApiResourceScope,
   ): Promise<CreateUploadSessionResponse> {
-    await this.databaseHydrator.refresh();
-    this.getKnowledgeBase(knowledgeBaseId, scope);
+    await this.getReadableKnowledgeBase(knowledgeBaseId, scope);
     await this.expireCreatedUploadSessions(new Date().toISOString());
 
     if (!this.runtimeConfig.limits.upload.directUploadEnabled) {
@@ -341,7 +359,7 @@ export class DocumentService {
     const replayed =
       normalizedKey === undefined
         ? undefined
-        : this.repository.findUploadSessionByIdempotencyKey(knowledgeBaseId, normalizedKey);
+        : await this.findUploadSessionByIdempotencyKey(knowledgeBaseId, normalizedKey, scope);
 
     if (replayed !== undefined) {
       return this.createUploadSessionResponse(replayed);
@@ -361,8 +379,9 @@ export class DocumentService {
     const objectKey = `sources/${knowledgeBaseId}/${documentId}/${sanitizeObjectKeySegment(
       fileName,
     )}`;
-    const session = this.repository.createUploadSession({
+    const session: UploadSessionRecord = {
       id: createResourceId("uploadSession"),
+      ...createUploadSessionActorScope(scope),
       knowledgeBaseId,
       documentId,
       objectKey,
@@ -382,7 +401,7 @@ export class DocumentService {
       expiresAt,
       createdAt: now,
       updatedAt: now,
-    });
+    };
     await this.databaseMirror.saveUploadSession(session);
 
     return this.createUploadSessionResponse(session);
@@ -395,12 +414,11 @@ export class DocumentService {
     idempotencyKey?: string,
     scope?: ApiResourceScope,
   ): Promise<DocumentUploadResponse> {
-    await this.databaseHydrator.refresh();
-    this.getKnowledgeBase(knowledgeBaseId, scope);
+    const knowledgeBase = await this.getReadableKnowledgeBase(knowledgeBaseId, scope);
     await this.expireCreatedUploadSessions(new Date().toISOString());
 
-    const session = this.requireUploadSession(knowledgeBaseId, uploadSessionId);
-    const replayed = this.findFinalizedUploadSessionResult(session);
+    const session = await this.requireUploadSession(knowledgeBaseId, uploadSessionId, scope);
+    const replayed = await this.findFinalizedUploadSessionResult(session);
 
     if (replayed !== undefined) {
       return replayed;
@@ -486,25 +504,24 @@ export class DocumentService {
       contentHash,
     };
     const now = new Date().toISOString();
-    const knowledgeBase = this.getKnowledgeBase(knowledgeBaseId, scope);
-    const document = this.repository.createDocument(
-      createSourceDocumentRecord(
-        knowledgeBaseId,
-        uploadedFile,
-        {
-          display_name: session.displayName,
-          ...(session.sourcePath === undefined ? {} : { source_path: session.sourcePath }),
-          metadata: finalizedMetadata,
-        },
-        now,
-        createSourceVisibilityMetadata(knowledgeBase),
-      ),
+    const document = createSourceDocumentRecord(
+      knowledgeBaseId,
+      uploadedFile,
+      {
+        display_name: session.displayName,
+        ...(session.sourcePath === undefined ? {} : { source_path: session.sourcePath }),
+        metadata: finalizedMetadata,
+      },
+      now,
+      {
+        tenantId: session.tenantId,
+        projectId: session.projectId,
+      },
+      createSourceVisibilityMetadata(knowledgeBase),
     );
-    const job = this.repository.createJob(
-      createParseJobRecord(knowledgeBaseId, uploadedFile, now, idempotencyKey),
-    );
+    const job = createParseJobRecord(knowledgeBaseId, uploadedFile, now, idempotencyKey);
 
-    const finalizedSession = this.repository.updateUploadSession({
+    const finalizedSession: UploadSessionRecord = {
       ...session,
       status: "finalized",
       contentHash,
@@ -513,7 +530,7 @@ export class DocumentService {
       finalizedJobId: job.id,
       metadata: finalizedMetadata,
       updatedAt: now,
-    });
+    };
     await this.persistCreatedSource(document, job);
     await this.databaseMirror.updateUploadSession(finalizedSession);
     await this.enqueueSourceParse(document, job, scope);
@@ -527,10 +544,9 @@ export class DocumentService {
     idempotencyKey?: string,
     scope?: ApiResourceScope,
   ): Promise<DocumentUploadResponse> {
-    await this.databaseHydrator.refresh();
-    const knowledgeBase = this.getKnowledgeBase(knowledgeBaseId, scope);
+    const knowledgeBase = await this.getReadableKnowledgeBase(knowledgeBaseId, scope);
 
-    const replayed = this.findUploadByIdempotencyKey(knowledgeBaseId, idempotencyKey);
+    const replayed = await this.findUploadByIdempotencyKey(knowledgeBaseId, idempotencyKey);
 
     if (replayed !== undefined) {
       return replayed;
@@ -545,19 +561,16 @@ export class DocumentService {
       objectKeyName: "text.txt",
     });
     const now = new Date().toISOString();
-    const document = this.repository.createDocument(
-      createSourceDocumentRecord(
-        knowledgeBaseId,
-        uploadedFile,
-        createUploadDataField(name, input.source_path, input.metadata),
-        now,
-        createSourceVisibilityMetadata(knowledgeBase),
-        "text",
-      ),
+    const document = createSourceDocumentRecord(
+      knowledgeBaseId,
+      uploadedFile,
+      createUploadDataField(name, input.source_path, input.metadata),
+      now,
+      createSourceDocumentScope(scope),
+      createSourceVisibilityMetadata(knowledgeBase),
+      "text",
     );
-    const job = this.repository.createJob(
-      createParseJobRecord(knowledgeBaseId, uploadedFile, now, idempotencyKey),
-    );
+    const job = createParseJobRecord(knowledgeBaseId, uploadedFile, now, idempotencyKey);
     await this.persistCreatedSource(document, job);
     await this.enqueueSourceParse(document, job, scope);
 
@@ -570,16 +583,15 @@ export class DocumentService {
     idempotencyKey?: string,
     scope?: ApiResourceScope,
   ): Promise<DocumentUploadResponse> {
-    await this.databaseHydrator.refresh();
-    const knowledgeBase = this.getKnowledgeBase(knowledgeBaseId, scope);
+    const knowledgeBase = await this.getReadableKnowledgeBase(knowledgeBaseId, scope);
 
-    const replayed = this.findUploadByIdempotencyKey(knowledgeBaseId, idempotencyKey);
+    const replayed = await this.findUploadByIdempotencyKey(knowledgeBaseId, idempotencyKey);
 
     if (replayed !== undefined) {
       return replayed;
     }
 
-    const sourceUrl = readValidUrl(input.url);
+    const sourceUrl = readValidUrl(input.url, this.runtimeConfig);
     const name = input.name?.trim() || sourceUrl;
     const uploadedFile = await this.uploadBuffer(knowledgeBaseId, {
       name,
@@ -588,20 +600,17 @@ export class DocumentService {
       objectKeyName: "source.url",
     });
     const now = new Date().toISOString();
-    const document = this.repository.createDocument(
-      createSourceDocumentRecord(
-        knowledgeBaseId,
-        uploadedFile,
-        createUploadDataField(name, input.source_path, input.metadata),
-        now,
-        createSourceVisibilityMetadata(knowledgeBase),
-        "url",
-        sourceUrl,
-      ),
+    const document = createSourceDocumentRecord(
+      knowledgeBaseId,
+      uploadedFile,
+      createUploadDataField(name, input.source_path, input.metadata),
+      now,
+      createSourceDocumentScope(scope),
+      createSourceVisibilityMetadata(knowledgeBase),
+      "url",
+      sourceUrl,
     );
-    const job = this.repository.createJob(
-      createParseJobRecord(knowledgeBaseId, uploadedFile, now, idempotencyKey),
-    );
+    const job = createParseJobRecord(knowledgeBaseId, uploadedFile, now, idempotencyKey);
     await this.persistCreatedSource(document, job);
     await this.enqueueSourceParse(document, job, scope);
 
@@ -614,10 +623,9 @@ export class DocumentService {
     idempotencyKey?: string,
     scope?: ApiResourceScope,
   ): Promise<DocumentUploadResponse> {
-    await this.databaseHydrator.refresh();
-    const knowledgeBase = this.getKnowledgeBase(knowledgeBaseId, scope);
+    const knowledgeBase = await this.getReadableKnowledgeBase(knowledgeBaseId, scope);
 
-    const replayed = this.findUploadByIdempotencyKey(knowledgeBaseId, idempotencyKey);
+    const replayed = await this.findUploadByIdempotencyKey(knowledgeBaseId, idempotencyKey);
 
     if (replayed !== undefined) {
       return replayed;
@@ -644,18 +652,15 @@ export class DocumentService {
       objectKeyName: sanitizeObjectKeySegment(name),
     });
     const now = new Date().toISOString();
-    const document = this.repository.createDocument(
-      createSourceDocumentRecord(
-        knowledgeBaseId,
-        uploadedFile,
-        createUploadDataField(name, input.source_path, input.metadata),
-        now,
-        createSourceVisibilityMetadata(knowledgeBase),
-      ),
+    const document = createSourceDocumentRecord(
+      knowledgeBaseId,
+      uploadedFile,
+      createUploadDataField(name, input.source_path, input.metadata),
+      now,
+      createSourceDocumentScope(scope),
+      createSourceVisibilityMetadata(knowledgeBase),
     );
-    const job = this.repository.createJob(
-      createParseJobRecord(knowledgeBaseId, uploadedFile, now, idempotencyKey),
-    );
+    const job = createParseJobRecord(knowledgeBaseId, uploadedFile, now, idempotencyKey);
     await this.persistCreatedSource(document, job);
     await this.enqueueSourceParse(document, job, scope);
 
@@ -666,11 +671,14 @@ export class DocumentService {
     documentId: string,
     scope?: ApiResourceScope,
   ): Promise<DocumentUploadResponse> {
-    await this.databaseHydrator.refresh();
-    const document = this.requireLiveDocument(documentId, scope);
-    const previousJob = this.repository.findLatestJobByDocumentId(documentId);
+    const document = await this.requireOperationalLiveDocument(
+      documentId,
+      await this.operationalReadStore.getSourceDocumentById(documentId),
+      scope,
+    );
+    const previousJob = await this.operationalReadStore.getLatestJobByDocumentId(documentId);
     const now = new Date().toISOString();
-    const updatedDocument = this.repository.updateDocument({
+    const updatedDocument: SourceDocumentRecord = {
       ...document,
       status: "queued",
       metadata: {
@@ -684,8 +692,8 @@ export class DocumentService {
         ],
       },
       updatedAt: now,
-    });
-    const job = this.repository.createJob({
+    };
+    const job: JobRecord = {
       id: createResourceId("ingestJob"),
       knowledgeBaseId: document.knowledgeBaseId,
       documentId: document.id,
@@ -704,7 +712,7 @@ export class DocumentService {
       error: null,
       createdAt: now,
       updatedAt: now,
-    });
+    };
 
     await this.databaseMirror.updateSourceDocument(updatedDocument);
     await this.databaseMirror.saveJob(job);
@@ -719,52 +727,73 @@ export class DocumentService {
     input: ListSourceDocumentsInput,
     scope?: ApiResourceScope,
   ): Promise<ListSourceDocumentsResult> {
-    await this.databaseHydrator.refresh();
-    this.getKnowledgeBase(knowledgeBaseId, scope);
+    await this.getReadableKnowledgeBase(knowledgeBaseId, scope);
 
-    const keyword = input.keyword?.trim().toLowerCase();
-    const filtered = this.repository
-      .listVisibleDocuments(knowledgeBaseId)
-      .filter((record) => record.status !== "deleted")
-      .filter((record) => filterBySourceType(record, input.sourceType))
-      .filter((record) => filterByStatus(record, input.status))
-      .filter((record) => filterByKeyword(record, keyword))
-      .sort((left, right) =>
-        compareUpdatedAtDesc(left.updatedAt, left.id, right.updatedAt, right.id),
-      );
-    const start = (input.page - 1) * input.pageSize;
-    const end = start + input.pageSize;
+    try {
+      const dbResult = await this.operationalReadStore.listSourceDocuments({
+        knowledgeBaseId,
+        page: input.page,
+        pageSize: input.pageSize,
+        ...(input.keyword === undefined ? {} : { keyword: input.keyword }),
+        ...(input.status === undefined ? {} : { status: input.status }),
+        ...(input.sourceType === undefined ? {} : { sourceType: input.sourceType }),
+      });
 
-    return {
-      items: filtered.slice(start, end).map(toSourceDocumentResponse),
-      page: input.page,
-      pageSize: input.pageSize,
-      total: filtered.length,
-      hasMore: end < filtered.length,
-    };
+      if (dbResult !== null) {
+        return {
+          items: dbResult.items.map(toSourceDocumentResponse),
+          page: input.page,
+          pageSize: input.pageSize,
+          total: dbResult.total,
+          hasMore: dbResult.hasMore,
+        };
+      }
+    } catch (error) {
+      throw toOperationalListError(error);
+    }
+
+    throw new ApiError("internal_error");
   }
 
   async getDocumentDetail(
     documentId: string,
     scope?: ApiResourceScope,
   ): Promise<SourceDocumentDetailResponse> {
-    await this.databaseHydrator.refresh();
-    const document = this.requireLiveDocument(documentId, scope);
-    const latestJob = this.repository.findLatestJobByDocumentId(documentId);
-    const parsedContent = this.repository.findParsedContentByDocumentId(documentId);
-    const mediaAssets = this.repository.listMediaAssetsByDocumentId(documentId);
-    const wikiPages = (await this.wikiStore.listPages(document.knowledgeBaseId)).filter((page) =>
-      page.source_document_ids.includes(document.id),
+    const document = await this.requireOperationalLiveDocument(
+      documentId,
+      await this.operationalReadStore.getSourceDocumentById(documentId),
+      scope,
     );
-    const pageVersions = (
-      await Promise.all(wikiPages.map((page) => this.wikiStore.listPageVersions(page.id)))
-    ).flat();
+    const [latestJob, parsedContent, mediaAssetsResult, wikiPages] = await Promise.all([
+      this.operationalReadStore.getLatestJobByDocumentId(document.id),
+      this.operationalReadStore.getParsedContentByDocumentId(document.id),
+      this.operationalReadStore.listMediaAssetsByDocumentId(document.id, {
+        page: 1,
+        pageSize: parsedContentMediaAssetPreviewLimit,
+      }),
+      this.operationalReadStore.listWikiPageRecordsBySourceDocumentId(
+        document.knowledgeBaseId,
+        document.id,
+        documentDetailRelatedPageLimit,
+      ),
+    ]);
+    const mediaAssets = mediaAssetsResult?.items ?? [];
+    const pageRecords = wikiPages ?? [];
+    const pageVersions =
+      (await this.operationalReadStore.listWikiPageVersionRecordsByPageIds(
+        pageRecords.flatMap((page) => {
+          const pageId = page.id;
+
+          return typeof pageId === "string" ? [pageId] : [];
+        }),
+        documentDetailPageVersionLimit,
+      )) ?? [];
 
     return {
       document: toSourceDocumentResponse(document),
-      latest_job: latestJob === undefined ? null : toJobResponse(latestJob),
+      latest_job: latestJob === null ? null : toJobResponse(latestJob),
       parsed_content:
-        parsedContent === undefined
+        parsedContent === null
           ? null
           : await toParsedContentResponse(
               parsedContent,
@@ -773,7 +802,7 @@ export class DocumentService {
               this.createParsedMarkdownPreviewOptions(),
             ),
       media_assets: mediaAssets.map(toMediaAssetResponse),
-      wiki_pages: wikiPages.map(toRecordResponse),
+      wiki_pages: pageRecords,
       page_versions: pageVersions,
       delete_preview_required: false,
       update_preview_required: false,
@@ -784,12 +813,22 @@ export class DocumentService {
     documentId: string,
     scope?: ApiResourceScope,
   ): Promise<DeleteImpactPreviewResponse> {
-    await this.databaseHydrator.refresh();
-    const document = this.requireLiveDocument(documentId, scope);
-    const affectedPages = (await this.wikiStore.listPages(document.knowledgeBaseId)).filter(
-      (page) => page.source_document_ids.includes(document.id),
+    const document = await this.requireOperationalLiveDocument(
+      documentId,
+      await this.operationalReadStore.getSourceDocumentById(documentId),
+      scope,
     );
-    const affectedPageIds = affectedPages.map((page) => page.id);
+    const affectedPages =
+      (await this.operationalReadStore.listWikiPageRecordsBySourceDocumentId(
+        document.knowledgeBaseId,
+        document.id,
+        documentDetailRelatedPageLimit,
+      )) ?? [];
+    const affectedPageIds = affectedPages.flatMap((page) => {
+      const pageId = page.id;
+
+      return typeof pageId === "string" ? [pageId] : [];
+    });
     const changeSetId = createResourceId("changeSet");
 
     return {
@@ -825,19 +864,51 @@ export class DocumentService {
     documentId: string,
     scope?: ApiResourceScope,
   ): Promise<SourceDocumentDeleteResponse> {
-    await this.databaseHydrator.refresh();
-    const document = this.requireLiveDocument(documentId, scope);
-    const affectedPages = (await this.wikiStore.listPages(document.knowledgeBaseId)).filter(
-      (page) => page.source_document_ids.includes(document.id),
+    return this.deleteDocumentWithOperationalReads(documentId, scope);
+  }
+
+  private async deleteDocumentWithOperationalReads(
+    documentId: string,
+    scope?: ApiResourceScope,
+  ): Promise<SourceDocumentDeleteResponse> {
+    const document = await this.requireOperationalLiveDocument(
+      documentId,
+      await this.operationalReadStore.getSourceDocumentById(documentId),
+      scope,
     );
-    const affectedPageIds = affectedPages.map((page) => page.id);
+    const affectedPages =
+      (await this.operationalReadStore.listWikiPageRecordsBySourceDocumentId(
+        document.knowledgeBaseId,
+        document.id,
+        documentDetailRelatedPageLimit,
+      )) ?? [];
+    const affectedPageIds = affectedPages.flatMap((page) => {
+      const pageId = page.id;
+
+      return typeof pageId === "string" ? [pageId] : [];
+    });
 
     const now = new Date().toISOString();
     const changeSetId = createResourceId("changeSet");
+    const createdCleanupOperation = createQueuedDeletionCleanupOperation({
+      targetType: "source_document",
+      targetId: document.id,
+      knowledgeBaseId: document.knowledgeBaseId,
+      now,
+      maxAttempts: this.runtimeConfig.limits.deletionCleanup.maxRetries + 1,
+      retentionExpiresAt: createRetentionTimestamp(
+        now,
+        this.runtimeConfig.limits.deletionCleanup.operationRetentionDays,
+      ),
+      itemRetentionExpiresAt: createRetentionTimestamp(
+        now,
+        this.runtimeConfig.limits.deletionCleanup.itemRetentionDays,
+      ),
+    });
 
-    await this.cancelOpenJobsForDeletedSourceDocument(document, now);
+    await this.cancelOpenOperationalJobsForDeletedSourceDocument(document, now);
 
-    const updated = this.repository.updateDocument({
+    const updated: SourceDocumentRecord = {
       ...document,
       status: "deleted",
       metadata: {
@@ -848,42 +919,60 @@ export class DocumentService {
             type: "deleted",
             affected_page_ids: affectedPageIds,
             change_set_id: changeSetId,
+            cleanup_operation_id: createdCleanupOperation.id,
             deleted_at: now,
           },
         ],
       },
       updatedAt: now,
-    });
-    const createdCleanupOperation = this.deletionCleanupRepository.createOperation(
-      createQueuedDeletionCleanupOperation({
-        targetType: "source_document",
-        targetId: updated.id,
-        knowledgeBaseId: updated.knowledgeBaseId,
-        now,
-        maxAttempts: this.runtimeConfig.limits.deletionCleanup.maxRetries + 1,
-        retentionExpiresAt: createRetentionTimestamp(
-          now,
-          this.runtimeConfig.limits.deletionCleanup.operationRetentionDays,
-        ),
-        itemRetentionExpiresAt: createRetentionTimestamp(
-          now,
-          this.runtimeConfig.limits.deletionCleanup.itemRetentionDays,
-        ),
+    };
+    const [parsedContent, mediaAssetsResult, jobs] = await Promise.all([
+      this.operationalReadStore.getParsedContentByDocumentId(updated.id),
+      this.operationalReadStore.listMediaAssetsByDocumentId(updated.id, {
+        page: 1,
+        pageSize: sourceDocumentDeletionMediaAssetLimit,
       }),
+      this.operationalReadStore.listJobsByDocumentId(updated.id),
+    ]);
+    const mediaAssets = mediaAssetsResult?.items ?? [];
+
+    if (mediaAssetsResult?.hasMore === true) {
+      throw new ApiError("invalid_request", {
+        message: "Source document cleanup planning exceeded the synchronous media asset limit.",
+        details: {
+          limit: sourceDocumentDeletionMediaAssetLimit,
+          target_type: "source_document",
+          target_id: updated.id,
+        },
+      });
+    }
+
+    const jobEventsByJobId = await this.operationalReadStore.listJobEventsByJobIds(
+      jobs.map((job) => job.id),
     );
-    const manifest = this.deletionCleanupManifestCollector.collectSourceDocumentManifest({
+    const activeObjectKeys = await this.operationalReadStore.findReferencedObjectKeys({
       knowledgeBaseId: updated.knowledgeBaseId,
       documentId: updated.id,
+      objectKeys: collectSourceDocumentObjectKeysFromRecords({
+        document: updated,
+        parsedContent,
+        mediaAssets,
+      }),
+    });
+    const manifest = collectSourceDocumentManifestFromRecords({
       operationId: createdCleanupOperation.id,
       now,
       maxAttempts: createdCleanupOperation.maxAttempts,
       retainedUntil: createdCleanupOperation.itemRetentionExpiresAt,
+      knowledgeBaseId: updated.knowledgeBaseId,
+      document: updated,
+      parsedContent,
+      mediaAssets,
+      jobs,
+      jobEventsByJobId,
+      activeObjectKeys,
     });
-    const cleanupOperation = this.deletionCleanupRepository.updateOperation(
-      applyManifestToOperation(createdCleanupOperation, manifest),
-    );
-
-    this.deletionCleanupRepository.replaceItemsForOperation(cleanupOperation.id, manifest.items);
+    const cleanupOperation = applyManifestToOperation(createdCleanupOperation, manifest);
 
     await this.databaseMirror.updateSourceDocument(updated);
     await this.databaseMirror.saveDeletionCleanupOperation(cleanupOperation);
@@ -916,24 +1005,31 @@ export class DocumentService {
     documentId: string,
     scope?: ApiResourceScope,
   ): Promise<DocumentParsedContentResponse> {
-    await this.databaseHydrator.refresh();
-    this.requireLiveDocument(documentId, scope);
+    const document = await this.requireOperationalLiveDocument(
+      documentId,
+      await this.operationalReadStore.getSourceDocumentById(documentId),
+      scope,
+    );
+    const parsedContent = await this.operationalReadStore.getParsedContentByDocumentId(document.id);
 
-    const parsedContent = this.repository.findParsedContentByDocumentId(documentId);
-
-    if (parsedContent === undefined) {
+    if (parsedContent === null) {
       return {
-        document_id: documentId,
+        document_id: document.id,
         parsed_content: null,
         status: "not_available",
       };
     }
 
+    const mediaAssets = await this.operationalReadStore.listMediaAssetsByDocumentId(document.id, {
+      page: 1,
+      pageSize: parsedContentMediaAssetPreviewLimit,
+    });
+
     return {
-      document_id: documentId,
+      document_id: document.id,
       parsed_content: await toParsedContentResponse(
         parsedContent,
-        this.repository.listMediaAssetsByDocumentId(documentId),
+        mediaAssets?.items ?? [],
         this.objectStorage,
         this.createParsedMarkdownPreviewOptions(),
       ),
@@ -946,8 +1042,6 @@ export class DocumentService {
     input: SourceEvidenceInput,
     scope?: ApiResourceScope,
   ): Promise<SourceEvidenceResponse> {
-    await this.databaseHydrator.refresh();
-
     return this.resolveSourceEvidenceItem(
       {
         ...input,
@@ -962,8 +1056,6 @@ export class DocumentService {
     input: SourceEvidenceBatchInput,
     scope?: ApiResourceScope,
   ): Promise<SourceEvidenceBatchResponse> {
-    await this.databaseHydrator.refresh();
-
     if (!Array.isArray(input.items)) {
       throw new ApiError("invalid_request", {
         messageKey: "api.validation.source_evidence_locator_invalid",
@@ -1055,34 +1147,45 @@ export class DocumentService {
     input: ListMediaAssetsInput,
     scope?: ApiResourceScope,
   ): Promise<ListMediaAssetsResult> {
-    await this.databaseHydrator.refresh();
-    this.requireLiveDocument(documentId, scope);
+    const document = await this.requireOperationalLiveDocument(
+      documentId,
+      await this.operationalReadStore.getSourceDocumentById(documentId),
+      scope,
+    );
+    const dbResult = await this.operationalReadStore.listMediaAssetsByDocumentId(
+      document.id,
+      input,
+    );
 
-    const mediaAssets = this.repository.listMediaAssetsByDocumentId(documentId);
-    const start = (input.page - 1) * input.pageSize;
-    const end = start + input.pageSize;
+    if (dbResult !== null) {
+      return {
+        items: dbResult.items.map(toMediaAssetResponse),
+        page: input.page,
+        pageSize: input.pageSize,
+        total: dbResult.total,
+        hasMore: dbResult.hasMore,
+      };
+    }
 
-    return {
-      items: mediaAssets.slice(start, end).map(toMediaAssetResponse),
-      page: input.page,
-      pageSize: input.pageSize,
-      total: mediaAssets.length,
-      hasMore: end < mediaAssets.length,
-    };
+    throw new ApiError("internal_error");
   }
 
   async getMediaAssetPreview(
     mediaAssetId: string,
     scope?: ApiResourceScope,
   ): Promise<MediaAssetPreviewEnvelope> {
-    await this.databaseHydrator.refresh();
-    const mediaAsset = this.repository.findMediaAssetById(mediaAssetId);
+    const mediaAsset = await this.operationalReadStore.getMediaAssetById(mediaAssetId);
 
-    if (mediaAsset === undefined) {
+    if (mediaAsset === null) {
       throw createMediaAssetNotFoundError();
     }
 
-    this.requireLiveDocument(mediaAsset.documentId, scope, createMediaAssetNotFoundError);
+    await this.requireOperationalLiveDocument(
+      mediaAsset.documentId,
+      await this.operationalReadStore.getSourceDocumentById(mediaAsset.documentId),
+      scope,
+      createMediaAssetNotFoundError,
+    );
 
     const expiresInSeconds = 300;
     const previewUrl = await this.objectStorage.createPresignedGetUrl({
@@ -1107,14 +1210,49 @@ export class DocumentService {
     };
   }
 
+  async listDocumentProcessingUnits(
+    documentId: string,
+    input: {
+      jobId?: string;
+      page: number;
+      pageSize: number;
+      stage?: DocumentProcessingStage;
+      status?: DocumentProcessingUnitStatus;
+    },
+    scope?: ApiResourceScope,
+  ): Promise<{
+    items: DocumentProcessingUnitResponse[];
+    page: number;
+    pageSize: number;
+    total: number;
+    hasMore: boolean;
+  }> {
+    await this.requireOperationalLiveDocument(
+      documentId,
+      await this.operationalReadStore.getSourceDocumentById(documentId),
+      scope,
+    );
+    const dbResult = await this.operationalReadStore.listDocumentProcessingUnitsByDocumentId(
+      documentId,
+      input,
+    );
+
+    return {
+      items: dbResult?.items.map(toDocumentProcessingUnitResponse) ?? [],
+      page: input.page,
+      pageSize: input.pageSize,
+      total: dbResult?.total ?? 0,
+      hasMore: dbResult?.hasMore ?? false,
+    };
+  }
+
   async retryMediaAssetCaption(
     mediaAssetId: string,
     scope?: ApiResourceScope,
   ): Promise<JobResponse> {
-    await this.databaseHydrator.refresh();
-    const mediaAsset = this.repository.findMediaAssetById(mediaAssetId);
+    const mediaAsset = await this.operationalReadStore.getMediaAssetById(mediaAssetId);
 
-    if (mediaAsset === undefined) {
+    if (mediaAsset === null) {
       throw createMediaAssetNotFoundError();
     }
 
@@ -1127,27 +1265,33 @@ export class DocumentService {
       });
     }
 
-    const document = this.requireDocument(
+    const document = await this.requireOperationalLiveDocument(
       mediaAsset.documentId,
+      await this.operationalReadStore.getSourceDocumentById(mediaAsset.documentId),
       scope,
       createMediaAssetNotFoundError,
     );
-    const parsedContent = this.repository.findParsedContentByDocumentId(document.id);
-    const latestJob = this.repository.findLatestJobByDocumentId(document.id);
+    const [parsedContent, latestJob] = await Promise.all([
+      this.operationalReadStore.getParsedContentByDocumentId(document.id),
+      this.operationalReadStore.getLatestJobByDocumentId(document.id),
+    ]);
 
-    if (parsedContent === undefined || latestJob === undefined) {
+    if (parsedContent === null || latestJob === null) {
       throw new ApiError("invalid_request", {
         messageKey: "api.validation.caption_retry_requires_context",
       });
     }
 
-    const datasetConfiguration = this.knowledgeBaseService.getDatasetConfiguration(
+    const datasetConfiguration = await this.requireDatasetConfiguration(
       document.knowledgeBaseId,
       scope,
     );
+    const actorScope = createUploadSessionActorScope(scope);
 
     await this.mediaCaptionQueue.enqueueMediaCaptionJob({
       job_id: latestJob.id,
+      tenant_id: actorScope.tenantId,
+      project_id: actorScope.projectId,
       knowledge_base_id: document.knowledgeBaseId,
       document_id: document.id,
       parsed_content_id: mediaAsset.parsedContentId ?? parsedContent.id,
@@ -1166,8 +1310,11 @@ export class DocumentService {
     input: RetryOcrInput = {},
     scope?: ApiResourceScope,
   ): Promise<JobResponse> {
-    await this.databaseHydrator.refresh();
-    const document = this.requireDocument(documentId, scope);
+    const document = await this.requireOperationalLiveDocument(
+      documentId,
+      await this.operationalReadStore.getSourceDocumentById(documentId),
+      scope,
+    );
 
     if (document.mimeType !== "application/pdf") {
       throw new ApiError("invalid_request", {
@@ -1183,10 +1330,12 @@ export class DocumentService {
       });
     }
 
-    const parsedContent = this.repository.findParsedContentByDocumentId(document.id);
-    const previousJob = this.repository.findLatestJobByDocumentId(document.id);
+    const [parsedContent, previousJob] = await Promise.all([
+      this.operationalReadStore.getParsedContentByDocumentId(document.id),
+      this.operationalReadStore.getLatestJobByDocumentId(document.id),
+    ]);
 
-    if (parsedContent === undefined || previousJob === undefined) {
+    if (parsedContent === null || previousJob === null) {
       throw new ApiError("invalid_request", {
         messageKey: "api.validation.ocr_retry_requires_context",
       });
@@ -1194,7 +1343,7 @@ export class DocumentService {
 
     const pageNumbers = readOcrRetryPageNumbers(input, parsedContent);
     const now = new Date().toISOString();
-    const job = this.repository.createJob({
+    const job: JobRecord = {
       id: createResourceId("ingestJob"),
       knowledgeBaseId: document.knowledgeBaseId,
       documentId: document.id,
@@ -1213,8 +1362,8 @@ export class DocumentService {
       error: null,
       createdAt: now,
       updatedAt: now,
-    });
-    const updatedDocument = this.repository.updateDocument({
+    };
+    const updatedDocument: SourceDocumentRecord = {
       ...document,
       status: "queued",
       ocrStatus: "queued",
@@ -1224,13 +1373,14 @@ export class DocumentService {
         retry_of_job_id: previousJob.id,
       },
       updatedAt: now,
-    });
+    };
 
     await this.databaseMirror.updateSourceDocument(updatedDocument);
     await this.databaseMirror.saveJob(job);
     await this.databaseMirror.appendJobEvent(createQueuedJobEvent(job));
+    const actorScope = createUploadSessionActorScope(scope);
     await this.sourceOcrQueue.enqueueSourceOcrJob(
-      createSourceOcrRetryPayload(document, parsedContent, job, pageNumbers),
+      createSourceOcrRetryPayload(document, parsedContent, job, pageNumbers, actorScope),
     );
 
     return toJobResponse(job);
@@ -1345,10 +1495,10 @@ export class DocumentService {
       this.runtimeConfig.limits.sourceEvidence,
       batchRemainingChars,
     );
-    const document = this.requireSourceEvidenceDocument(normalized, scope);
-    const parsedContent = this.repository.findParsedContentByDocumentId(document.id);
+    const document = await this.requireSourceEvidenceDocument(normalized, scope);
+    const parsedContent = await this.operationalReadStore.getParsedContentByDocumentId(document.id);
 
-    if (parsedContent === undefined) {
+    if (parsedContent === null) {
       throw new ApiError("parsed_content_not_available", {
         messageKey: "api.validation.source_evidence_parsed_content_required",
         details: {
@@ -1391,7 +1541,31 @@ export class DocumentService {
     const objectKey =
       parsedContent.captionedMarkdownObjectKey ?? parsedContent.normalizedMarkdownObjectKey;
     const object = await this.objectStorage.getObject({ key: objectKey });
-    const markdown = await readObjectBodyText(object.body);
+    const markdownRead = await readObjectBodyTextWithinLimit(
+      object.body,
+      object.contentLength,
+      this.runtimeConfig.limits.parser.maxFileSizeMb * 1024 * 1024,
+    );
+
+    if (markdownRead.kind === "fatal") {
+      return createSourceEvidenceResponse({
+        document,
+        parsedContent,
+        sourceAnchorId: input.sourceAnchorId,
+        evidenceKind: "text",
+        locator: input.locator,
+        locatorStatus: "not_found",
+        excerpt: emptyEvidenceExcerpt(),
+        warnings: [
+          {
+            code: "source_evidence_object_limit_exceeded",
+            message: "Source evidence object exceeded configured read limits.",
+          },
+        ],
+      });
+    }
+
+    const markdown = markdownRead.text;
     let resolvedRange = resolveTextEvidenceRange(markdown, parsedContent, input);
 
     if (resolvedRange === null && input.allowFallback) {
@@ -1532,18 +1706,24 @@ export class DocumentService {
     });
   }
 
-  private resolveMediaSourceEvidence(
+  private async resolveMediaSourceEvidence(
     document: SourceDocumentRecord,
     parsedContent: ParsedContentRecord,
     input: NormalizedSourceEvidenceInput,
-  ): SourceEvidenceResponse {
-    const mediaAssets = this.repository.listMediaAssetsByDocumentId(document.id);
+  ): Promise<SourceEvidenceResponse> {
+    const mediaAssetsResult =
+      input.mediaAssetId === undefined
+        ? await this.operationalReadStore.listMediaAssetsByDocumentId(document.id, {
+            page: 1,
+            pageSize: 1,
+          })
+        : null;
     const mediaAsset =
       input.mediaAssetId === undefined
-        ? mediaAssets[0]
-        : mediaAssets.find((item) => item.id === input.mediaAssetId);
+        ? mediaAssetsResult?.items[0]
+        : await this.operationalReadStore.getMediaAssetById(input.mediaAssetId);
 
-    if (mediaAsset === undefined || mediaAsset.documentId !== document.id) {
+    if (mediaAsset === undefined || mediaAsset === null || mediaAsset.documentId !== document.id) {
       return createSourceEvidenceResponse({
         document,
         parsedContent,
@@ -1605,48 +1785,59 @@ export class DocumentService {
     });
   }
 
-  private getKnowledgeBase(
+  private async getReadableKnowledgeBase(
     knowledgeBaseId: string,
     scope?: ApiResourceScope,
-  ): KnowledgeBaseResponse {
-    return scope === undefined
-      ? this.knowledgeBaseService.get(knowledgeBaseId)
-      : this.knowledgeBaseService.get(knowledgeBaseId, scope);
-  }
+    notFoundFactory: () => ApiError = () => new ApiError("knowledge_base_not_found"),
+  ): Promise<KnowledgeBaseResponse> {
+    const record = await this.operationalReadStore.getKnowledgeBaseById(
+      scope ?? defaultApiResourceScope,
+      knowledgeBaseId,
+    );
 
-  private requireDocument(
-    documentId: string,
-    scope?: ApiResourceScope,
-    notFoundFactory: () => ApiError = () => new ApiError("document_not_found"),
-  ): SourceDocumentRecord {
-    const record = this.repository.findDocumentById(documentId);
-
-    if (record === undefined) {
+    if (record === null) {
       throw notFoundFactory();
     }
-    this.assertKnowledgeBaseVisible(record.knowledgeBaseId, scope, notFoundFactory);
 
     return record;
   }
 
-  private requireLiveDocument(
+  private async requireDatasetConfiguration(
+    knowledgeBaseId: string,
+    scope?: ApiResourceScope,
+  ): Promise<DatasetConfigurationResponse> {
+    const datasetConfiguration =
+      await this.operationalReadStore.getDatasetConfigurationByKnowledgeBaseId(
+        scope ?? defaultApiResourceScope,
+        knowledgeBaseId,
+      );
+
+    if (datasetConfiguration === null) {
+      throw new ApiError("internal_error");
+    }
+
+    return datasetConfiguration;
+  }
+
+  private async requireOperationalLiveDocument(
     documentId: string,
+    record: SourceDocumentRecord | null,
     scope?: ApiResourceScope,
     notFoundFactory: () => ApiError = () => new ApiError("document_not_found"),
-  ): SourceDocumentRecord {
-    const record = this.requireDocument(documentId, scope, notFoundFactory);
+  ): Promise<SourceDocumentRecord> {
+    if (record === null) {
+      throw notFoundFactory();
+    }
+    await this.assertKnowledgeBaseVisible(record.knowledgeBaseId, scope, notFoundFactory);
 
     if (record.status === "deleted") {
-      const cleanupOperation = this.deletionCleanupRepository.findLatestOperationForTarget({
-        targetType: "source_document",
-        targetId: documentId,
-      });
+      const cleanupOperationId = readSourceDocumentCleanupOperationId(record.metadata);
 
       throw new ApiError("resource_deleted", {
         details: {
           target_type: "source_document",
           target_id: documentId,
-          cleanup_operation_id: cleanupOperation?.id ?? null,
+          cleanup_operation_id: cleanupOperationId,
           guidance: "Reload the source list and select an active source document.",
         },
       });
@@ -1655,26 +1846,28 @@ export class DocumentService {
     return record;
   }
 
-  private requireSourceEvidenceDocument(
+  private async requireSourceEvidenceDocument(
     input: NormalizedSourceEvidenceInput,
     scope?: ApiResourceScope,
-  ): SourceDocumentRecord {
+  ): Promise<SourceDocumentRecord> {
     if (input.knowledgeBaseId === undefined) {
-      return this.requireLiveDocument(input.documentId, scope);
+      return this.requireOperationalLiveDocument(
+        input.documentId,
+        await this.operationalReadStore.getSourceDocumentById(input.documentId),
+        scope,
+      );
     }
 
-    this.assertKnowledgeBaseVisible(input.knowledgeBaseId, scope, () =>
+    await this.getReadableKnowledgeBase(input.knowledgeBaseId, scope, () =>
       createSourceEvidenceDocumentNotFoundError(input),
     );
 
-    const visibleDocument = this.repository
-      .listVisibleDocuments(input.knowledgeBaseId)
-      .find(
-        (document) =>
-          document.id === input.documentId || document.upstreamResourceId === input.documentId,
-      );
+    const visibleDocument = await this.operationalReadStore.getVisibleSourceDocumentById(
+      input.knowledgeBaseId,
+      input.documentId,
+    );
 
-    if (visibleDocument === undefined) {
+    if (visibleDocument === null) {
       throw new ApiError("document_not_found", {
         details: {
           document_id: input.documentId,
@@ -1684,87 +1877,113 @@ export class DocumentService {
     }
 
     if (visibleDocument.status === "deleted") {
-      this.requireLiveDocument(visibleDocument.id, scope);
+      await this.requireOperationalLiveDocument(visibleDocument.id, visibleDocument, scope, () =>
+        createSourceEvidenceDocumentNotFoundError(input),
+      );
     }
 
     return visibleDocument;
   }
 
-  private assertKnowledgeBaseVisible(
+  private async assertKnowledgeBaseVisible(
     knowledgeBaseId: string,
     scope: ApiResourceScope | undefined,
     notFoundFactory: () => ApiError,
-  ): void {
-    if (scope === undefined) {
-      return;
-    }
+  ): Promise<void> {
+    const record = await this.operationalReadStore.getKnowledgeBaseById(
+      scope ?? defaultApiResourceScope,
+      knowledgeBaseId,
+    );
 
-    try {
-      this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
-    } catch (error) {
-      if (error instanceof ApiError && error.code === "knowledge_base_not_found") {
-        throw notFoundFactory();
-      }
-
-      throw error;
+    if (record === null) {
+      throw notFoundFactory();
     }
   }
 
-  private findUploadByIdempotencyKey(
+  private async findUploadByIdempotencyKey(
     knowledgeBaseId: string,
     idempotencyKey: string | undefined,
-  ): DocumentUploadResponse | undefined {
+  ): Promise<DocumentUploadResponse | undefined> {
     const normalizedKey = normalizeIdempotencyKey(idempotencyKey);
 
     if (normalizedKey === undefined) {
       return undefined;
     }
 
-    const job = this.repository.findJobByIdempotencyKey(knowledgeBaseId, normalizedKey);
+    const job = await this.operationalReadStore.getJobByIdempotencyKey(
+      knowledgeBaseId,
+      normalizedKey,
+    );
 
-    if (job === undefined) {
+    if (job === undefined || job === null) {
       return undefined;
     }
     if (job.documentId === null) {
       return undefined;
     }
 
-    const document = this.repository.findDocumentById(job.documentId);
+    const document = await this.operationalReadStore.getSourceDocumentById(job.documentId);
 
-    if (document === undefined) {
+    if (document === undefined || document === null) {
       return undefined;
     }
 
     return createDocumentUploadResponse(document, job);
   }
 
-  private requireUploadSession(
+  private async findUploadSessionByIdempotencyKey(
+    knowledgeBaseId: string,
+    idempotencyKey: string,
+    scope?: ApiResourceScope,
+  ): Promise<UploadSessionRecord | undefined> {
+    const actorScope = createUploadSessionActorScope(scope);
+    const session = await this.operationalReadStore.getUploadSessionByIdempotencyKey({
+      actorId: actorScope.actorId,
+      actorType: actorScope.actorType,
+      idempotencyKey,
+      knowledgeBaseId,
+      projectId: actorScope.projectId,
+      tenantId: actorScope.tenantId,
+    });
+
+    return session ?? undefined;
+  }
+
+  private async requireUploadSession(
     knowledgeBaseId: string,
     uploadSessionId: string,
-  ): UploadSessionRecord {
-    const session = this.repository.findUploadSessionById(uploadSessionId);
+    scope?: ApiResourceScope,
+  ): Promise<UploadSessionRecord> {
+    const session = await this.operationalReadStore.getUploadSessionById(uploadSessionId);
 
-    if (session === undefined || session.knowledgeBaseId !== knowledgeBaseId) {
+    if (
+      session === undefined ||
+      session === null ||
+      session.knowledgeBaseId !== knowledgeBaseId ||
+      !isUploadSessionScopeMatch(session, createUploadSessionActorScope(scope))
+    ) {
       throw new ApiError("upload_session_not_found");
     }
 
     return session;
   }
 
-  private findFinalizedUploadSessionResult(
+  private async findFinalizedUploadSessionResult(
     session: UploadSessionRecord,
-  ): DocumentUploadResponse | undefined {
+  ): Promise<DocumentUploadResponse | undefined> {
     if (session.status !== "finalized" || session.finalizedDocumentId === null) {
       return undefined;
     }
 
-    const document = this.repository.findDocumentById(session.finalizedDocumentId);
+    const document = await this.operationalReadStore.getSourceDocumentById(
+      session.finalizedDocumentId,
+    );
     const job =
       session.finalizedJobId === null
         ? undefined
-        : this.repository.findJobById(session.finalizedJobId);
+        : await this.operationalReadStore.getJobById(session.finalizedJobId);
 
-    if (document === undefined || job === undefined) {
+    if (document === undefined || document === null || job === undefined || job === null) {
       return undefined;
     }
 
@@ -1832,12 +2051,15 @@ export class DocumentService {
     job: JobRecord,
     scope?: ApiResourceScope,
   ): Promise<void> {
-    const datasetConfiguration = this.knowledgeBaseService.getDatasetConfiguration(
+    const datasetConfiguration = await this.requireDatasetConfiguration(
       document.knowledgeBaseId,
       scope,
     );
+    const actorScope = createUploadSessionActorScope(scope);
     const payload: SourceParseQueuePayload = {
       job_id: job.id,
+      tenant_id: actorScope.tenantId,
+      project_id: actorScope.projectId,
       knowledge_base_id: job.knowledgeBaseId,
       document_id: document.id,
       content_hash: job.contentHash,
@@ -1849,7 +2071,7 @@ export class DocumentService {
       ocr_policy: datasetConfiguration.values.ocr_policy,
     };
 
-    await this.sourceParseQueue.enqueueSourceParseJob(payload);
+    await this.enqueueSourceParseWithRetry(payload, job);
     await this.webhookService.emit({
       eventType: "document.ingest.started",
       knowledgeBaseId: job.knowledgeBaseId,
@@ -1865,29 +2087,108 @@ export class DocumentService {
     });
   }
 
+  private async enqueueSourceParseWithRetry(
+    payload: SourceParseQueuePayload,
+    job: JobRecord,
+  ): Promise<void> {
+    const maxAttempts = 3;
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        await this.sourceParseQueue.enqueueSourceParseJob(payload);
+        return;
+      } catch (error) {
+        lastError = error;
+        if (attempt < maxAttempts) {
+          await delay(100 * attempt);
+        }
+      }
+    }
+
+    const failedAt = new Date().toISOString();
+    const failedJob: JobRecord = {
+      ...job,
+      error: {
+        code: "source_parse_enqueue_failed",
+        details: {
+          attempts: maxAttempts,
+          error: toSafeQueueError(lastError),
+        },
+      },
+      progressMessage: "Source parse job could not be queued.",
+      status: "failed",
+      updatedAt: failedAt,
+    };
+
+    await this.databaseMirror.updateJob(failedJob);
+    await this.databaseMirror.appendJobEvent({
+      createdAt: failedAt,
+      jobId: failedJob.id,
+      message: failedJob.progressMessage,
+      metadata: {
+        enqueue: {
+          attempts: maxAttempts,
+          error: toSafeQueueError(lastError),
+          status: "failed",
+        },
+      },
+      stage: failedJob.stage,
+      status: failedJob.status,
+      type: "job.failed",
+    });
+
+    throw new ApiError("durable_backend_unavailable", {
+      details: {
+        operation: "source_parse_enqueue",
+        retryable: true,
+      },
+    });
+  }
+
   private async expireCreatedUploadSessions(now: string): Promise<void> {
-    const expiredSessions = this.repository
-      .listUploadSessions()
-      .filter((session) => session.status === "created")
-      .filter((session) => session.expiresAt <= now);
+    const expiredSessions = await this.operationalReadStore.listExpiredCreatedUploadSessions(
+      now,
+      expiredUploadSessionSweepLimit,
+    );
 
     for (const session of expiredSessions) {
-      await this.expireUploadSession(session, now);
+      try {
+        await this.expireUploadSession(session, now);
+      } catch {
+        await this.expireUploadSessionWithoutCleanup(session, now);
+      }
     }
+  }
+
+  private async expireUploadSessionWithoutCleanup(
+    session: UploadSessionRecord,
+    now: string,
+  ): Promise<void> {
+    const expiredSession: UploadSessionRecord =
+      session.status === "expired"
+        ? session
+        : {
+            ...session,
+            status: "expired" as const,
+            updatedAt: now,
+          };
+
+    await this.databaseMirror.updateUploadSession(expiredSession);
   }
 
   private async expireUploadSession(
     session: UploadSessionRecord,
     now: string,
   ): Promise<UploadSessionRecord> {
-    const expiredSession =
+    const expiredSession: UploadSessionRecord =
       session.status === "expired"
         ? session
-        : this.repository.updateUploadSession({
+        : {
             ...session,
-            status: "expired",
+            status: "expired" as const,
             updatedAt: now,
-          });
+          };
 
     if (expiredSession.cleanupOperationId !== null) {
       await this.databaseMirror.updateUploadSession(expiredSession);
@@ -1895,23 +2196,21 @@ export class DocumentService {
       return expiredSession;
     }
 
-    const createdCleanupOperation = this.deletionCleanupRepository.createOperation(
-      createQueuedDeletionCleanupOperation({
-        targetType: "source_document",
-        targetId: expiredSession.documentId,
-        knowledgeBaseId: expiredSession.knowledgeBaseId,
+    const createdCleanupOperation = createQueuedDeletionCleanupOperation({
+      targetType: "source_document",
+      targetId: expiredSession.documentId,
+      knowledgeBaseId: expiredSession.knowledgeBaseId,
+      now,
+      maxAttempts: this.runtimeConfig.limits.deletionCleanup.maxRetries + 1,
+      retentionExpiresAt: createRetentionTimestamp(
         now,
-        maxAttempts: this.runtimeConfig.limits.deletionCleanup.maxRetries + 1,
-        retentionExpiresAt: createRetentionTimestamp(
-          now,
-          this.runtimeConfig.limits.deletionCleanup.operationRetentionDays,
-        ),
-        itemRetentionExpiresAt: createRetentionTimestamp(
-          now,
-          this.runtimeConfig.limits.deletionCleanup.itemRetentionDays,
-        ),
-      }),
-    );
+        this.runtimeConfig.limits.deletionCleanup.operationRetentionDays,
+      ),
+      itemRetentionExpiresAt: createRetentionTimestamp(
+        now,
+        this.runtimeConfig.limits.deletionCleanup.itemRetentionDays,
+      ),
+    });
     const manifest = this.deletionCleanupManifestCollector.collectUploadSessionManifest({
       session: expiredSession,
       operationId: createdCleanupOperation.id,
@@ -1919,17 +2218,13 @@ export class DocumentService {
       maxAttempts: createdCleanupOperation.maxAttempts,
       retainedUntil: createdCleanupOperation.itemRetentionExpiresAt,
     });
-    const cleanupOperation = this.deletionCleanupRepository.updateOperation(
-      applyManifestToOperation(createdCleanupOperation, manifest),
-    );
+    const cleanupOperation = applyManifestToOperation(createdCleanupOperation, manifest);
 
-    this.deletionCleanupRepository.replaceItemsForOperation(cleanupOperation.id, manifest.items);
-
-    const updatedSession = this.repository.updateUploadSession({
+    const updatedSession: UploadSessionRecord = {
       ...expiredSession,
       cleanupOperationId: cleanupOperation.id,
       updatedAt: now,
-    });
+    };
 
     await this.databaseMirror.saveDeletionCleanupOperation(cleanupOperation);
     await this.databaseMirror.saveDeletionCleanupItems(manifest.items);
@@ -1953,79 +2248,59 @@ export class DocumentService {
     document: SourceDocumentRecord,
     job: JobRecord,
   ): Promise<void> {
-    const [event] = this.repository.replaceJobEvents(job.id, [
-      createQueuedJobEvent(job, createUploadJobMetadata(document, this.uploadAdmissionService)),
-    ]);
+    const event = createQueuedJobEvent(
+      job,
+      await createUploadJobMetadata(document, this.uploadAdmissionService),
+    );
 
     await this.databaseMirror.saveSourceDocument(document);
     await this.databaseMirror.saveJob(job);
-    if (event !== undefined) {
-      await this.databaseMirror.appendJobEvent(event);
-    }
+    await this.databaseMirror.appendJobEvent(event);
   }
 
-  private async cancelOpenJobsForDeletedSourceDocument(
+  private async cancelOpenOperationalJobsForDeletedSourceDocument(
     document: SourceDocumentRecord,
     now: string,
   ): Promise<void> {
     const message = "Canceled because the source document was deleted.";
-    const openJobs = this.repository
-      .listJobs(document.knowledgeBaseId)
-      .filter((job) => job.documentId === document.id)
-      .filter((job) => job.status === "queued" || job.status === "running");
-
-    for (const job of openJobs) {
-      const updated = this.repository.updateJob({
-        ...job,
-        status: "canceled",
-        progressMessage: message,
-        updatedAt: now,
-      });
-      const event = this.repository.appendJobEvent({
-        jobId: updated.id,
-        type: "job.canceled",
-        stage: updated.stage,
-        status: updated.status,
-        message,
-        metadata: {
-          source_document_deleted: true,
-        },
-        createdAt: now,
-      });
-
-      await this.databaseMirror.updateJob(updated);
-      await this.databaseMirror.appendJobEvent(event);
-    }
+    await this.databaseMirror.cancelOpenJobsForSourceDocument({
+      sourceDocumentId: document.id,
+      message,
+      metadata: {
+        source_document_deleted: true,
+      },
+      now,
+    });
   }
 
   private async enqueueDeletionCleanupOperation(
-    operation: ReturnType<DeletionCleanupRepository["updateOperation"]>,
-  ): Promise<ReturnType<DeletionCleanupRepository["updateOperation"]>> {
+    operation: DeletionCleanupOperationRecord,
+  ): Promise<DeletionCleanupOperationRecord> {
     const now = new Date().toISOString();
 
     try {
       const enqueued = await this.deletionCleanupQueue.enqueueDeletionCleanupJob({
         operation_id: operation.id,
       });
-      const updated = this.deletionCleanupRepository.updateOperation({
+      const updated: DeletionCleanupOperationRecord = {
         ...operation,
         queueJobId: enqueued.job_id,
         lastError: null,
         updatedAt: now,
-      });
+      };
 
       await this.databaseMirror.updateDeletionCleanupOperation(updated);
 
       return updated;
     } catch (error) {
-      const updated = this.deletionCleanupRepository.updateOperation({
+      const updated: DeletionCleanupOperationRecord = {
         ...operation,
         lastError: {
           message: "Cleanup queue enqueue failed.",
           detail: error instanceof Error ? error.message : "Unknown cleanup queue error.",
         },
         updatedAt: now,
-      });
+      };
 
       await this.databaseMirror.updateDeletionCleanupOperation(updated);
 
@@ -2039,6 +2314,7 @@ function createSourceDocumentRecord(
   uploadedFile: UploadedFile,
   uploadData: UploadDataField,
   timestamp: string,
+  documentScope: Pick<SourceDocumentRecord, "tenantId" | "projectId">,
   visibilityMetadata: Pick<
     SourceDocumentRecord,
     "visibilityOrigin" | "ownerKnowledgeBaseId" | "upstreamResourceId" | "forkTombstonedAt"
@@ -2048,6 +2324,7 @@ function createSourceDocumentRecord(
 ): SourceDocumentRecord {
   const record: SourceDocumentRecord = {
     id: uploadedFile.documentId,
+    ...documentScope,
     knowledgeBaseId,
     name: uploadedFile.name,
     displayName: uploadData.display_name ?? uploadedFile.name,
@@ -2073,6 +2350,17 @@ function createSourceDocumentRecord(
   }
 
   return record;
+}
+
+function createSourceDocumentScope(
+  scope: ApiResourceScope | undefined,
+): Pick<SourceDocumentRecord, "tenantId" | "projectId"> {
+  const resolvedScope = scope ?? defaultApiResourceScope;
+
+  return {
+    tenantId: resolvedScope.tenantId,
+    projectId: resolvedScope.projectId,
+  };
 }
 
 function createSourceVisibilityMetadata(
@@ -2187,11 +2475,11 @@ function createQueuedJobEvent(record: JobRecord, metadata: Record<string, unknow
   };
 }
 
-function createUploadJobMetadata(
+async function createUploadJobMetadata(
   document: SourceDocumentRecord,
   uploadAdmissionService: UploadAdmissionService,
-): Record<string, unknown> {
-  const pressure = uploadAdmissionService.getSnapshot();
+): Promise<Record<string, unknown>> {
+  const pressure = await uploadAdmissionService.getSnapshot();
 
   return {
     source_document_id: document.id,
@@ -2201,6 +2489,7 @@ function createUploadJobMetadata(
     pressure: {
       active_multipart_uploads: pressure.activeMultipartUploads,
       admission_limit: pressure.multipartAdmissionLimit,
+      backend: pressure.backend,
       degraded_threshold: pressure.pressureDegradedThreshold,
       state: pressure.pressure,
     },
@@ -2212,9 +2501,12 @@ function createSourceOcrRetryPayload(
   parsedContent: ParsedContentRecord,
   job: JobRecord,
   pageNumbers: readonly number[],
+  scope: UploadSessionActorScope,
 ): SourceOcrQueuePayload {
   return {
     job_id: job.id,
+    tenant_id: scope.tenantId,
+    project_id: scope.projectId,
     knowledge_base_id: job.knowledgeBaseId,
     document_id: document.id,
     parsed_content_id: parsedContent.id,
@@ -3045,6 +3337,42 @@ function toUploadSessionResponse(record: UploadSessionRecord): UploadSessionResp
   return response;
 }
 
+function createUploadSessionActorScope(
+  scope?: ApiResourceScope,
+): Pick<
+  UploadSessionRecord,
+  "actorAccountId" | "actorId" | "actorSource" | "actorType" | "projectId" | "tenantId"
+> {
+  const scopedActor = scope as Partial<ApiKeyScope> | undefined;
+  const apiKeyId = scopedActor?.apiKeyId;
+  const actorType: UploadSessionRecord["actorType"] =
+    apiKeyId === "admin_session" ? "admin_session" : apiKeyId === undefined ? "system" : "api_key";
+
+  return {
+    actorAccountId:
+      typeof scopedActor?.accountId === "string" && scopedActor.accountId.length > 0
+        ? scopedActor.accountId
+        : null,
+    actorId: apiKeyId ?? "system",
+    actorSource: scopedActor?.source ?? "system",
+    actorType,
+    projectId: scope?.projectId ?? defaultApiResourceScope.projectId,
+    tenantId: scope?.tenantId ?? defaultApiResourceScope.tenantId,
+  };
+}
+
+function isUploadSessionScopeMatch(
+  session: UploadSessionRecord,
+  actorScope: UploadSessionActorScope,
+): boolean {
+  return (
+    session.tenantId === actorScope.tenantId &&
+    session.projectId === actorScope.projectId &&
+    session.actorType === actorScope.actorType &&
+    session.actorId === actorScope.actorId
+  );
+}
+
 export function toJobResponse(record: JobRecord): JobResponse {
   const progressState = resolveJobProgressState({
     progress: record.progress,
@@ -3166,8 +3494,23 @@ async function readParsedMarkdownPreview(
 
   try {
     const object = await objectStorage.getObject({ key: objectKey });
-    const markdown = await readObjectBodyText(object.body);
     const maxChars = previewOptions.maxChars;
+    const markdownRead = await readObjectBodyTextWithinLimit(
+      object.body,
+      object.contentLength,
+      maxChars * 4,
+    );
+
+    if (markdownRead.kind === "fatal") {
+      return {
+        error: "Parsed markdown preview exceeded configured read limits.",
+        markdown: null,
+        objectKey,
+        truncated: false,
+      };
+    }
+
+    const markdown = markdownRead.text;
     const truncated = markdown.length > maxChars;
 
     return {
@@ -3185,44 +3528,107 @@ async function readParsedMarkdownPreview(
   }
 }
 
-async function readObjectBodyText(body: unknown): Promise<string> {
+async function readObjectBodyTextWithinLimit(
+  body: unknown,
+  contentLength: number | undefined,
+  maxBytes: number,
+): Promise<{ kind: "success"; text: string } | { kind: "fatal"; actualBytes: number }> {
+  if (contentLength !== undefined && contentLength > maxBytes) {
+    return {
+      kind: "fatal",
+      actualBytes: contentLength,
+    };
+  }
+
   if (body === undefined || body === null) {
-    return "";
+    return {
+      kind: "success",
+      text: "",
+    };
   }
 
   if (typeof body === "string") {
-    return body;
+    const byteLength = Buffer.byteLength(body);
+
+    return byteLength > maxBytes
+      ? { kind: "fatal", actualBytes: byteLength }
+      : { kind: "success", text: body };
   }
 
   if (body instanceof Uint8Array) {
-    return Buffer.from(body).toString("utf8");
+    return body.byteLength > maxBytes
+      ? { kind: "fatal", actualBytes: body.byteLength }
+      : { kind: "success", text: Buffer.from(body).toString("utf8") };
   }
 
   if (hasTransformToString(body)) {
-    return body.transformToString("utf8");
+    if (contentLength === undefined) {
+      return {
+        kind: "fatal",
+        actualBytes: maxBytes + 1,
+      };
+    }
+
+    const text = await body.transformToString("utf8");
+    const byteLength = Buffer.byteLength(text);
+
+    return byteLength > maxBytes
+      ? { kind: "fatal", actualBytes: byteLength }
+      : { kind: "success", text };
   }
 
   if (isAsyncIterable(body)) {
     const chunks: Buffer[] = [];
+    let totalBytes = 0;
 
     for await (const chunk of body as AsyncIterable<Buffer | Uint8Array | string>) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += buffer.byteLength;
+
+      if (totalBytes > maxBytes) {
+        return {
+          kind: "fatal",
+          actualBytes: totalBytes,
+        };
+      }
+
+      chunks.push(buffer);
     }
 
-    return Buffer.concat(chunks).toString("utf8");
+    return {
+      kind: "success",
+      text: Buffer.concat(chunks, totalBytes).toString("utf8"),
+    };
   }
 
   if (isNodeReadable(body)) {
     const chunks: Buffer[] = [];
+    let totalBytes = 0;
 
     for await (const chunk of body) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array | string));
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array | string);
+      totalBytes += buffer.byteLength;
+
+      if (totalBytes > maxBytes) {
+        return {
+          kind: "fatal",
+          actualBytes: totalBytes,
+        };
+      }
+
+      chunks.push(buffer);
     }
 
-    return Buffer.concat(chunks).toString("utf8");
+    return {
+      kind: "success",
+      text: Buffer.concat(chunks, totalBytes).toString("utf8"),
+    };
   }
 
-  return "";
+  return {
+    kind: "success",
+    text: "",
+  };
 }
 
 function hasTransformToString(
@@ -3276,32 +3682,36 @@ function toMediaAssetResponse(record: MediaAssetRecord): MediaAssetResponse {
   };
 }
 
-function toRecordResponse<T extends object>(record: T): Record<string, unknown> {
-  return { ...record } as Record<string, unknown>;
-}
-
-function filterBySourceType(
-  record: SourceDocumentRecord,
-  sourceType: ListSourceDocumentsInput["sourceType"],
-): boolean {
-  return sourceType === undefined || record.sourceType === sourceType;
-}
-
-function filterByStatus(
-  record: SourceDocumentRecord,
-  status: ListSourceDocumentsInput["status"],
-): boolean {
-  return status === undefined || record.status === status;
-}
-
-function filterByKeyword(record: SourceDocumentRecord, keyword: string | undefined): boolean {
-  if (keyword === undefined || keyword.length === 0) {
-    return true;
-  }
-
-  return [record.name, record.displayName, record.sourcePath, record.sourceUrl].some((value) =>
-    value?.toLowerCase().includes(keyword),
-  );
+function toDocumentProcessingUnitResponse(
+  record: DocumentProcessingUnitRecord,
+): DocumentProcessingUnitResponse {
+  return {
+    id: record.id,
+    source_document_id: record.sourceDocumentId,
+    job_id: record.jobId,
+    parsed_content_id: record.parsedContentId,
+    stage: record.stage,
+    unit_type: record.unitType,
+    unit_key: record.unitKey,
+    unit_index: record.unitIndex,
+    attempt_scope: record.attemptScope,
+    status: record.status,
+    content_hash: record.contentHash,
+    dedupe_key: record.dedupeKey,
+    object_key: record.objectKey,
+    object_refs: cloneJsonArray(record.objectRefs),
+    locator: JSON.parse(JSON.stringify(record.locator)) as Record<string, unknown>,
+    counters: JSON.parse(JSON.stringify(record.counters)) as Record<string, unknown>,
+    warnings: cloneJsonArray(record.warnings),
+    safe_error:
+      record.safeError === null
+        ? null
+        : (JSON.parse(JSON.stringify(record.safeError)) as Record<string, unknown>),
+    metadata: JSON.parse(JSON.stringify(record.metadata)) as Record<string, unknown>,
+    retry_eligible: record.retryEligible,
+    completed_at: record.completedAt,
+    updated_at: record.updatedAt,
+  };
 }
 
 function parseUploadData(value: unknown): UploadDataField {
@@ -3358,6 +3768,30 @@ function readLifecycleHistory(value: unknown): Record<string, unknown>[] {
   return Array.isArray(value)
     ? (JSON.parse(JSON.stringify(value)) as Record<string, unknown>[])
     : [];
+}
+
+function readSourceDocumentCleanupOperationId(metadata: Record<string, unknown>): string | null {
+  const lifecycleHistory = metadata.lifecycle_history;
+
+  if (!Array.isArray(lifecycleHistory)) {
+    return null;
+  }
+
+  for (let index = lifecycleHistory.length - 1; index >= 0; index -= 1) {
+    const event = lifecycleHistory[index];
+
+    if (!isJsonObject(event) || event.type !== "deleted") {
+      continue;
+    }
+
+    const cleanupOperationId = event.cleanup_operation_id;
+
+    if (typeof cleanupOperationId === "string" && cleanupOperationId.length > 0) {
+      return cleanupOperationId;
+    }
+  }
+
+  return null;
 }
 
 function readRequiredString(value: string | undefined, field: string): string {
@@ -3433,12 +3867,19 @@ function createObjectStorageValidationMetadata(input: {
   };
 }
 
-function readValidUrl(value: string | undefined): string {
+function readValidUrl(value: string | undefined, config: RuntimeConfig): string {
   const rawUrl = readRequiredString(value, "url");
 
   try {
-    return new URL(rawUrl).toString();
+    return validateRemoteSourceUrl(
+      rawUrl,
+      createRemoteSourceSecurityPolicy(config, ["http", "https"]),
+    ).toString();
   } catch (error) {
+    if (error instanceof ApiError) {
+      throw error;
+    }
+
     throw new ApiError("invalid_request", {
       messageKey: "api.validation.source_url_invalid",
       details: {
@@ -3537,17 +3978,29 @@ function createRetentionTimestamp(now: string, days: number | null): string | nu
   return timestamp.toISOString();
 }
 
-function sanitizeObjectKeySegment(value: string): string {
-  return value.replaceAll("\\", "/").split("/").filter(Boolean).join("-") || "upload.bin";
+function toOperationalListError(error: unknown): ApiError {
+  return error instanceof ApiError ? error : new ApiError("internal_error");
 }
 
-function compareUpdatedAtDesc(
-  leftUpdatedAt: string,
-  leftId: string,
-  rightUpdatedAt: string,
-  rightId: string,
-): number {
-  const updatedAtOrder = rightUpdatedAt.localeCompare(leftUpdatedAt);
+function toSafeQueueError(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    return {
+      message: error.message,
+      name: error.name,
+    };
+  }
 
-  return updatedAtOrder === 0 ? rightId.localeCompare(leftId) : updatedAtOrder;
+  return {
+    message: "Unknown queue error.",
+  };
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}
+
+function sanitizeObjectKeySegment(value: string): string {
+  return value.replaceAll("\\", "/").split("/").filter(Boolean).join("-") || "upload.bin";
 }

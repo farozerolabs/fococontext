@@ -88,6 +88,8 @@ const wikiExplorerCategories: WikiExplorerCategory[] = [
   "wiki_pages",
   "system_pages",
 ]
+const pageVersionPreviewLimit = 20
+const relatedPagePreviewLimit = 20
 
 export function KnowledgeBasePagesPage() {
   const { knowledgeBaseId } = useParams()
@@ -136,8 +138,14 @@ export function KnowledgeBasePagesPage() {
       const pageDetails = await Promise.all(
         pages.data.map(async (page) => {
           const [related, versions] = await Promise.all([
-            apiClient.listRelatedPages(page.id),
-            apiClient.listPageVersions(page.id, { page: 1, pageSize: 100 }),
+            apiClient.listRelatedPages(page.id, {
+              page: 1,
+              pageSize: relatedPagePreviewLimit,
+            }),
+            apiClient.listPageVersions(page.id, {
+              page: 1,
+              pageSize: pageVersionPreviewLimit,
+            }),
           ])
 
           return normalizeWikiPage(page, related.data, versions.data)

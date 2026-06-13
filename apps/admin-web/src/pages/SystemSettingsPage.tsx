@@ -133,7 +133,20 @@ export function SystemSettingsPage() {
         <LoadingState label={t("state.loading")} />
       ) : null}
       {settingsQuery.isError ? (
-        <ErrorAlert title={t("state.loadFailed")} />
+        <ErrorAlert
+          action={
+            <Button
+              onClick={() => void settingsQuery.refetch()}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              {t("action.retry")}
+            </Button>
+          }
+          description={t("systemSettings.loadFailedDescription")}
+          title={t("state.loadFailed")}
+        />
       ) : null}
       {settings === undefined ? null : (
         <IdeWorkspace
@@ -197,6 +210,7 @@ function SystemSettingsSectionPanel({
   if (section === "runtime") {
     const pressure = readRecord(settings.dependencies, "pressure")
     const metrics = readRecord(settings.dependencies, "metrics")
+    const migration = readRecord(settings.dependencies, "migration")
     const operationPressure = readRecord(pressure, "objectStorageOperations")
     const operationMetrics = readRecord(metrics, "objectStorageOperations")
     const worker = readRecord(settings.dependencies, "worker")
@@ -255,6 +269,7 @@ function SystemSettingsSectionPanel({
         <KeyValue label={t("systemSettings.defaultContext")}>
           <JsonBlock value={settings.runtime.defaultContext} />
         </KeyValue>
+        <MigrationStatusPanel migration={migration} />
         <KeyValue label={t("systemSettings.pressureStatus")}>
           {formatStatus(t, pressure?.status)}
         </KeyValue>
@@ -503,6 +518,9 @@ function SystemSettingsSectionPanel({
   }
 
   if (section === "storageIndexes") {
+    const runtimeState = readRecord(settings.dependencies, "runtimeState")
+    const retrieval = readRecord(settings.dependencies, "retrieval")
+
     return (
       <div className="flex flex-col gap-4">
         <KeyValue label={t("systemSettings.databaseStatus")}>
@@ -537,6 +555,21 @@ function SystemSettingsSectionPanel({
         </KeyValue>
         <KeyValue label={t("systemSettings.queueConcurrency")}>
           {readPrimitive(settings.dependencies, "queue", "concurrency")}
+        </KeyValue>
+        <KeyValue label={t("systemSettings.sessionStore")}>
+          <JsonBlock value={runtimeState?.sessionStore ?? {}} />
+        </KeyValue>
+        <KeyValue label={t("systemSettings.runtimeMetricsStore")}>
+          <JsonBlock value={runtimeState?.metricsStore ?? {}} />
+        </KeyValue>
+        <KeyValue label={t("systemSettings.boundedRetrieval")}>
+          <JsonBlock value={retrieval?.boundedRetrieval ?? {}} />
+        </KeyValue>
+        <KeyValue label={t("systemSettings.graphReadiness")}>
+          <JsonBlock value={retrieval?.graphReadiness ?? {}} />
+        </KeyValue>
+        <KeyValue label={t("systemSettings.sourceEvidenceReadiness")}>
+          <JsonBlock value={retrieval?.sourceEvidence ?? {}} />
         </KeyValue>
         <KeyValue label={t("systemSettings.storageProvider")}>
           {displayPrimitive(t, settings.storage.providerName)}
@@ -611,6 +644,42 @@ function SystemSettingsSectionPanel({
   return (
     <div className="text-sm text-muted-foreground">
       {t("systemSettings.envFirstBoundary")}
+    </div>
+  )
+}
+
+function MigrationStatusPanel({
+  migration,
+}: {
+  migration: Record<string, unknown> | undefined
+}) {
+  const { t } = useTranslation()
+
+  if (migration === undefined) {
+    return (
+      <Alert>
+        <AlertTitle>{t("systemSettings.migrationStatus")}</AlertTitle>
+        <AlertDescription>
+          {t("systemSettings.migrationManagedByStartup")}
+        </AlertDescription>
+      </Alert>
+    )
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <KeyValue label={t("systemSettings.migrationStatus")}>
+        {formatStatus(t, migration.status)}
+      </KeyValue>
+      <KeyValue label={t("systemSettings.migrationMode")}>
+        {displayPrimitive(t, migration.mode)}
+      </KeyValue>
+      <KeyValue label={t("systemSettings.migrationPendingCount")}>
+        {displayPrimitive(t, migration.pendingCount)}
+      </KeyValue>
+      <KeyValue label={t("systemSettings.migrationLastOutcome")}>
+        {displayPrimitive(t, migration.lastOutcome)}
+      </KeyValue>
     </div>
   )
 }

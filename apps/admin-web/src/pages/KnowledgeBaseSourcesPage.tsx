@@ -1,4 +1,9 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import {
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query"
 import { FileUp, Plus, RefreshCw, Trash2 } from "lucide-react"
 import {
   useEffect,
@@ -22,6 +27,8 @@ import {
   type SourceDocumentDetail,
   type SourceDocumentStatus,
   type ScheduledImportJob,
+  type SourceWatchScanItem,
+  type SourceWatchScanItemKind,
   type SourceWatchRule,
   type SourceWatchSourceKind,
   type SystemSettingsStatus,
@@ -140,6 +147,14 @@ const sourceExplorerCategories: SourceExplorerCategory[] = [
   "source_documents",
   "source_watch_rules",
 ]
+const sourceWatchScanHistoryPreviewLimit = 5
+const sourceWatchScanItemPreviewLimit = 20
+const sourceWatchPreviewKinds = [
+  "new",
+  "changed",
+  "delete_candidate",
+  "skipped",
+] as const satisfies readonly SourceWatchScanItemKind[]
 
 export function KnowledgeBaseSourcesPage() {
   const { knowledgeBaseId } = useParams()
@@ -231,16 +246,26 @@ export function KnowledgeBaseSourcesPage() {
   })
   const selectedSourceWatchRuleId =
     selectedItem?.kind === "source_watch" ? selectedItem.rule.id : null
+  const sourceWatchScansListOptions = {
+    page: 1,
+    pageSize: sourceWatchScanHistoryPreviewLimit,
+  }
   const sourceWatchScansQuery = useQuery({
     enabled: selectedSourceWatchRuleId !== null,
     queryKey:
       selectedSourceWatchRuleId === null
         ? adminQueryKeys.sourceWatchScans("")
-        : adminQueryKeys.sourceWatchScans(selectedSourceWatchRuleId),
+        : adminQueryKeys.sourceWatchScans(
+            selectedSourceWatchRuleId,
+            sourceWatchScansListOptions
+          ),
     queryFn: async () =>
       selectedSourceWatchRuleId === null
         ? { data: [] }
-        : apiClient.listSourceWatchScans(selectedSourceWatchRuleId),
+        : apiClient.listSourceWatchScans(
+            selectedSourceWatchRuleId,
+            sourceWatchScansListOptions
+          ),
     refetchInterval: (query) =>
       (query.state.data?.data ?? []).some(
         (scan) => scan.status !== "completed" && scan.status !== "disabled"
@@ -1297,7 +1322,7 @@ function SourceInspector({
                           </TableRow>
                         </TableHeader>
                         <TableBody>
-                          {sourceWatchScans.slice(0, 5).map((scan) => (
+                          {sourceWatchScans.map((scan) => (
                             <TableRow key={scan.id}>
                               <TableCell>
                                 {t(
@@ -2177,6 +2202,43 @@ function SourceWatchImportPreviewDialog({
   onOpenChange: (open: boolean) => void
 }) {
   const { t } = useTranslation()
+  const apiClient = useApiClient()
+  const itemQueries = useQueries({
+    queries: sourceWatchPreviewKinds.map((itemKind) => ({
+      enabled: job !== null,
+      queryKey:
+        job === null
+          ? adminQueryKeys.sourceWatchScanItems("", { itemKind })
+          : adminQueryKeys.sourceWatchScanItems(job.id, {
+              itemKind,
+              page: 1,
+              pageSize: sourceWatchScanItemPreviewLimit,
+            }),
+      queryFn: () => {
+        if (job === null) {
+          return Promise.resolve({
+            data: [],
+            pagination: createEmptyPagination(1),
+          })
+        }
+
+        return apiClient.listScheduledImportJobItems(job.id, {
+          itemKind,
+          page: 1,
+          pageSize: sourceWatchScanItemPreviewLimit,
+        })
+      },
+    })),
+  })
+  const previewByKind = Object.fromEntries(
+    sourceWatchPreviewKinds.map((itemKind, index) => [
+      itemKind,
+      itemQueries[index]?.data ?? null,
+    ])
+  ) as Record<
+    (typeof sourceWatchPreviewKinds)[number],
+    Awaited<ReturnType<typeof apiClient.listScheduledImportJobItems>> | null
+  >
 
   return (
     <Dialog
@@ -2206,41 +2268,49 @@ function SourceWatchImportPreviewDialog({
             />
             <PreviewMetric
               label={t("sourceWatch.newSources")}
-              value={String(job.scan_result.new_sources.length)}
+              value={formatSourceWatchPreviewCount(
+                previewByKind.new?.pagination.total,
+                job.scan_result.new_sources.length
+              )}
             />
             <PreviewMetric
               label={t("sourceWatch.changedSources")}
-              value={String(job.scan_result.changed_sources.length)}
+              value={formatSourceWatchPreviewCount(
+                previewByKind.changed?.pagination.total,
+                job.scan_result.changed_sources.length
+              )}
             />
             <PreviewMetric
               label={t("sourceWatch.deleteCandidates")}
-              value={String(job.scan_result.delete_candidates.length)}
+              value={formatSourceWatchPreviewCount(
+                previewByKind.delete_candidate?.pagination.total,
+                job.scan_result.delete_candidates.length
+              )}
             />
             <PreviewMetric
               label={t("sourceWatch.skippedSources")}
-              value={String(job.scan_result.skipped.length)}
+              value={formatSourceWatchPreviewCount(
+                previewByKind.skipped?.pagination.total,
+                job.scan_result.skipped.length
+              )}
             />
           </div>
           <SourceWatchPreviewList
-            items={job.scan_result.new_sources.map(
-              formatSourceWatchPreviewItem
-            )}
+            items={formatSourceWatchScanItems(previewByKind.new?.data)}
             title={t("sourceWatch.newSources")}
           />
           <SourceWatchPreviewList
-            items={job.scan_result.changed_sources.map(
-              formatSourceWatchPreviewItem
-            )}
+            items={formatSourceWatchScanItems(previewByKind.changed?.data)}
             title={t("sourceWatch.changedSources")}
           />
           <SourceWatchPreviewList
-            items={job.scan_result.delete_candidates.map(
-              formatSourceWatchPreviewItem
+            items={formatSourceWatchScanItems(
+              previewByKind.delete_candidate?.data
             )}
             title={t("sourceWatch.deleteCandidates")}
           />
           <SourceWatchPreviewList
-            items={job.scan_result.skipped.map(formatSourceWatchPreviewItem)}
+            items={formatSourceWatchScanItems(previewByKind.skipped?.data)}
             title={t("sourceWatch.skippedSources")}
           />
         </div>
@@ -2705,6 +2775,48 @@ function formatSourceWatchFilters(
   ]
 
   return parts.join(" | ")
+}
+
+function formatSourceWatchPreviewCount(
+  persistedTotal: number | undefined,
+  previewCount: number
+) {
+  return String(persistedTotal ?? previewCount)
+}
+
+function formatSourceWatchScanItems(
+  items: readonly SourceWatchScanItem[] = []
+) {
+  return items.map((item) => {
+    const payload = item.payload
+    const sourcePath =
+      typeof payload.source_path === "string"
+        ? payload.source_path
+        : item.source_path
+    const sourceUrl =
+      typeof payload.source_url === "string"
+        ? payload.source_url
+        : item.source_url
+    const metadata =
+      typeof payload.metadata === "object" &&
+      payload.metadata !== null &&
+      !Array.isArray(payload.metadata)
+        ? payload.metadata
+        : undefined
+
+    return formatSourceWatchPreviewItem({
+      ...(typeof payload.document_id === "string"
+        ? { document_id: payload.document_id }
+        : {}),
+      ...(metadata === undefined
+        ? {}
+        : { metadata: metadata as Record<string, unknown> }),
+      ...(typeof payload.name === "string" ? { name: payload.name } : {}),
+      ...(typeof payload.reason === "string" ? { reason: payload.reason } : {}),
+      ...(sourcePath === undefined ? {} : { source_path: sourcePath }),
+      ...(sourceUrl === undefined ? {} : { source_url: sourceUrl }),
+    })
+  })
 }
 
 function formatSourceWatchPreviewItem(item: {

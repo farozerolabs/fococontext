@@ -19,6 +19,7 @@ export interface ParserInput extends ParserRouteRequest {
   objectKey: string;
   contentHash: string;
   content: Buffer | string;
+  limits?: ParserLimitConfig;
   visualExtraction?: ParserVisualExtractionOptions;
 }
 
@@ -407,6 +408,26 @@ export interface ParserLimitContext {
   mimeType: string;
 }
 
+export function createParserLimitError(
+  limitName: ParserLimitName,
+  actual: number,
+  limit: number,
+  context: ParserLimitContext,
+): ParserFatalError {
+  return {
+    kind: "parser_limit_exceeded",
+    parserName: context.parserName,
+    parserVersion: context.parserVersion,
+    fileExtension: normalizeExtension(context.fileName),
+    mimeType: normalizeMimeType(context.mimeType),
+    message: `Parser limit exceeded: ${limitName}.`,
+    retryable: false,
+    limitName,
+    actual,
+    limit,
+  };
+}
+
 export interface ZipExpansionSummary {
   entryCount: number;
   totalExpandedBytes: number;
@@ -480,18 +501,12 @@ export function createDefaultParserRegistry(): ParserRegistry {
   return registry;
 }
 
-export function createInMemoryParserCache(): ParserCache {
-  const records = new Map<string, ParsedContent>();
-
+export function createNoopParserCache(): ParserCache {
   return {
-    async get(key) {
-      const record = records.get(createParserCacheKey(key));
-
-      return record === undefined ? undefined : cloneParsedContent(record);
+    async get() {
+      return undefined;
     },
-    async set(key, value) {
-      records.set(createParserCacheKey(key), cloneParsedContent(value));
-    },
+    async set() {},
   };
 }
 
@@ -1227,13 +1242,14 @@ export async function parseWithLimits(
   if (contentSize > limits.maxFileSizeBytes) {
     return {
       kind: "fatal",
-      error: createLimitError("file_size", contentSize, limits.maxFileSizeBytes, context),
+      error: createParserLimitError("file_size", contentSize, limits.maxFileSizeBytes, context),
     };
   }
 
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   const parserInput = {
     ...input,
+    limits,
     visualExtraction: createVisualExtractionOptions(limits),
   };
   const parserResult = parser.parse(parserInput).catch((error): ParserResult => {
@@ -1289,6 +1305,20 @@ export async function parseWithLimits(
   return result;
 }
 
+export async function parseWithErrorBoundary(
+  parser: DocumentParser,
+  input: ParserInput,
+): Promise<ParserResult> {
+  try {
+    return await parser.parse(input);
+  } catch (error) {
+    return {
+      kind: "fatal",
+      error: createParserFailedError(parser, input, error),
+    };
+  }
+}
+
 export function enforceZipExpansionLimits(
   summary: ZipExpansionSummary,
   limits: ParserLimitConfig,
@@ -1317,6 +1347,114 @@ export function enforceZipExpansionLimits(
   }
 
   return undefined;
+}
+
+async function loadZipWithRuntimeLimits(
+  content: Buffer,
+  input: ParserInput,
+  parserName: string,
+): Promise<{ kind: "success"; zip: JSZip } | { kind: "fatal"; error: ParserFatalError }> {
+  const zip = await JSZip.loadAsync(content);
+
+  if (input.limits === undefined) {
+    return {
+      kind: "success",
+      zip,
+    };
+  }
+
+  const error = enforceZipExpansionLimits(
+    createZipExpansionSummary(zip),
+    input.limits,
+    createParserLimitContextForName(parserName, input),
+  );
+
+  if (error !== undefined) {
+    return {
+      kind: "fatal",
+      error,
+    };
+  }
+
+  return {
+    kind: "success",
+    zip,
+  };
+}
+
+function createZipExpansionSummary(zip: JSZip): ZipExpansionSummary {
+  let entryCount = 0;
+  let totalExpandedBytes = 0;
+  let largestEntryBytes = 0;
+
+  for (const file of Object.values(zip.files)) {
+    entryCount += 1;
+
+    if (file.dir) {
+      continue;
+    }
+
+    const uncompressedSize = readZipEntryUncompressedSize(file);
+
+    totalExpandedBytes += uncompressedSize;
+    largestEntryBytes = Math.max(largestEntryBytes, uncompressedSize);
+  }
+
+  return {
+    entryCount,
+    totalExpandedBytes,
+    largestEntryBytes,
+  };
+}
+
+interface JsZipObjectWithPrivateData {
+  _data?: {
+    uncompressedSize?: unknown;
+  };
+}
+
+function readZipEntryUncompressedSize(file: JSZip.JSZipObject): number {
+  const value = (file as JsZipObjectWithPrivateData)._data?.uncompressedSize;
+
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function createParserLimitContextForName(
+  parserName: string,
+  input: ParserInput,
+): ParserLimitContext {
+  return {
+    parserName,
+    parserVersion: parserRuntimeVersion,
+    fileName: input.fileName,
+    mimeType: input.mimeType,
+  };
+}
+
+function createParserFailedError(
+  parser: DocumentParser,
+  input: ParserInput,
+  error: unknown,
+): ParserFatalError {
+  return {
+    kind: "parser_failed",
+    parserName: parser.name,
+    parserVersion: parser.version,
+    fileExtension: normalizeExtension(input.fileName),
+    mimeType: normalizeMimeType(input.mimeType),
+    message: error instanceof Error ? error.message : "Parser failed.",
+    retryable: false,
+  };
+}
+
+function isZipContent(content: Buffer): boolean {
+  return (
+    content.length >= 4 &&
+    content[0] === 0x50 &&
+    content[1] === 0x4b &&
+    (content[2] === 0x03 || content[2] === 0x05 || content[2] === 0x07) &&
+    (content[3] === 0x04 || content[3] === 0x06 || content[3] === 0x08)
+  );
 }
 
 export function enforceMediaAssetLimits(
@@ -1414,6 +1552,11 @@ const defaultParsers: readonly DocumentParser[] = [
     name: "ts-json",
     mimeTypes: ["application/json"],
     extensions: [".json"],
+  }),
+  createTextParser({
+    name: "ts-jsonl",
+    mimeTypes: ["application/jsonl", "application/ndjson", "application/x-ndjson"],
+    extensions: [".jsonl", ".ndjson"],
   }),
   createTextParser({
     name: "ts-yaml",
@@ -2207,6 +2350,12 @@ function createDocxParser(): DocumentParser {
     async parse(input) {
       try {
         const content = readBinaryContent(input.content);
+        const zipResult = await loadZipWithRuntimeLimits(content, input, parserName);
+
+        if (zipResult.kind === "fatal") {
+          return zipResult;
+        }
+
         const result = await mammoth.convertToHtml({
           buffer: content,
         });
@@ -2216,8 +2365,7 @@ function createDocxParser(): DocumentParser {
           return createParserOutputEmptyResult(parserName, input);
         }
 
-        const zip = await JSZip.loadAsync(content);
-        const mediaAssets = await extractZipMediaAssets(zip, input, {
+        const mediaAssets = await extractZipMediaAssets(zipResult.zip, input, {
           prefix: "word/media/",
           sourceFormat: "docx",
           assetKind: "embedded_image",
@@ -2280,7 +2428,17 @@ function createPptxParser(): DocumentParser {
     extensions: [".pptx"],
     async parse(input) {
       try {
-        const zip = await JSZip.loadAsync(readBinaryContent(input.content));
+        const zipResult = await loadZipWithRuntimeLimits(
+          readBinaryContent(input.content),
+          input,
+          parserName,
+        );
+
+        if (zipResult.kind === "fatal") {
+          return zipResult;
+        }
+
+        const zip = zipResult.zip;
         const xmlParser = new XMLParser({
           ignoreAttributes: false,
         });
@@ -2381,6 +2539,14 @@ function createSpreadsheetParser(): DocumentParser {
     async parse(input) {
       try {
         const content = readBinaryContent(input.content);
+        const zipResult = isZipContent(content)
+          ? await loadZipWithRuntimeLimits(content, input, parserName)
+          : undefined;
+
+        if (zipResult?.kind === "fatal") {
+          return zipResult;
+        }
+
         const workbook = read(content, {
           type: "buffer",
         });
@@ -2422,7 +2588,12 @@ function createSpreadsheetParser(): DocumentParser {
         }
 
         const normalizedMarkdown = sections.join("\n\n").trim();
-        const mediaAssets = await extractSpreadsheetMediaAssets(content, input, locators[0]);
+        const mediaAssets = await extractSpreadsheetMediaAssets(
+          content,
+          input,
+          locators[0],
+          zipResult?.zip,
+        );
 
         if (normalizedMarkdown.length === 0) {
           return createParserOutputEmptyResult(parserName, input);
@@ -2534,7 +2705,17 @@ function createOpenDocumentParser(options: {
     extensions: options.extensions,
     async parse(input) {
       try {
-        const zip = await JSZip.loadAsync(readBinaryContent(input.content));
+        const zipResult = await loadZipWithRuntimeLimits(
+          readBinaryContent(input.content),
+          input,
+          options.name,
+        );
+
+        if (zipResult.kind === "fatal") {
+          return zipResult;
+        }
+
+        const zip = zipResult.zip;
         const contentXml = await zip.file("content.xml")?.async("string");
 
         if (contentXml === undefined) {
@@ -2658,10 +2839,6 @@ function createParserCacheMetadata(
     parser_name: key.parserName,
     parser_version: key.parserVersion,
   };
-}
-
-function createParserCacheKey(key: ParserCacheKey): string {
-  return `${key.parserName}:${key.parserVersion}:${key.contentHash}`;
 }
 
 function cloneParsedContent(value: ParsedContent): ParsedContent {
@@ -3075,13 +3252,14 @@ async function extractSpreadsheetMediaAssets(
   content: Buffer,
   input: ParserInput,
   firstSheetLocator: ParserLocator | undefined,
+  preloadedZip?: JSZip,
 ): Promise<ParserMediaAsset[]> {
   if (normalizeExtension(input.fileName) !== ".xlsx") {
     return [];
   }
 
   try {
-    const zip = await JSZip.loadAsync(content);
+    const zip = preloadedZip ?? (await JSZip.loadAsync(content));
 
     return await extractZipMediaAssets(zip, input, {
       prefix: "xl/media/",

@@ -65,6 +65,7 @@ export interface KnowledgeCheckRecord {
   progress: number;
   checks: KnowledgeCheckType[];
   pageIds: string[];
+  sourceDocumentIds: string[];
   findings: KnowledgeCheckFinding[];
   semanticRun: KnowledgeCheckSemanticRun;
   configurationSnapshot: Record<string, unknown>;
@@ -95,4 +96,12 @@ export interface KnowledgeCheckResponse {
   configuration_snapshot: Record<string, unknown>;
   created_at: string;
   updated_at: string;
+}
+
+export interface ListKnowledgeCheckFindingsResult {
+  items: readonly KnowledgeCheckFinding[];
+  page: number;
+  pageSize: number;
+  total: number;
+  hasMore: boolean;
 }

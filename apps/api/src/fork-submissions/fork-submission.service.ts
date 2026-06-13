@@ -1,9 +1,12 @@
-import { Injectable } from "@nestjs/common";
+import { Inject, Injectable } from "@nestjs/common";
 import { ApiError, type ApiMessageKey } from "@fococontext/contracts";
 
-import { DeletionCleanupRepository } from "../deletion-cleanup/deletion-cleanup.repository.js";
+import {
+  operationalReadStoreToken,
+  type OperationalReadStore,
+} from "../database/operational-read-store.js";
 import { DocumentService } from "../documents/document.service.js";
-import type { ApiResourceScope } from "../auth/api-key.guard.js";
+import { defaultApiResourceScope, type ApiResourceScope } from "../auth/api-key.guard.js";
 import { KnowledgeBaseService } from "../knowledge-bases/knowledge-base.service.js";
 import type {
   CreateForkSubmissionInput,
@@ -19,7 +22,7 @@ export class ForkSubmissionService {
   constructor(
     private readonly knowledgeBaseService: KnowledgeBaseService,
     private readonly documentService: DocumentService,
-    private readonly deletionCleanupRepository: DeletionCleanupRepository,
+    @Inject(operationalReadStoreToken) private readonly operationalReadStore: OperationalReadStore,
   ) {}
 
   async create(
@@ -28,7 +31,7 @@ export class ForkSubmissionService {
     idempotencyKey?: string,
     scope?: ApiResourceScope,
   ): Promise<ForkSubmissionResponse> {
-    const fork = this.knowledgeBaseService.get(forkId, scope);
+    const fork = await this.knowledgeBaseService.get(forkId, scope);
 
     if (fork.knowledge_base_type !== "fork") {
       throw new ApiError("fork_submission_requires_fork", {
@@ -39,7 +42,7 @@ export class ForkSubmissionService {
       });
     }
 
-    this.rejectCleanupPendingFork(forkId);
+    await this.rejectCleanupPendingFork(forkId, scope);
 
     const title = readRequiredText(
       input.title,
@@ -89,10 +92,20 @@ export class ForkSubmissionService {
     };
   }
 
-  private rejectCleanupPendingFork(forkId: string): void {
-    const cleanupOperation = this.deletionCleanupRepository.findLatestOperationForTarget({
-      targetId: forkId,
-      targetType: "knowledge_base",
+  private async rejectCleanupPendingFork(
+    forkId: string,
+    scope: ApiResourceScope | undefined,
+  ): Promise<void> {
+    const result = await this.operationalReadStore.listDeletionCleanupOperations(
+      scope ?? defaultApiResourceScope,
+      {
+        knowledgeBaseId: forkId,
+        page: 1,
+        pageSize: 50,
+      },
+    );
+    const cleanupOperation = result?.items.find((operation) => {
+      return operation.targetId === forkId && operation.targetType === "knowledge_base";
     });
 
     if (

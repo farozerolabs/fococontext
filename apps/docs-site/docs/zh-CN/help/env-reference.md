@@ -23,14 +23,48 @@
 
 ## 管理员和 OpenAPI 访问
 
-| 字段                             | 说明                       | 建议值                                                                    |
-| -------------------------------- | -------------------------- | ------------------------------------------------------------------------- |
-| `FOCOCONTEXT_ADMIN_USERNAME`     | 管理员用户名               | 本地可用 `admin`；生产使用不易猜的管理员名                                |
-| `FOCOCONTEXT_ADMIN_PASSWORD`     | 管理员密码                 | 至少 16 位随机密码，不要提交到 Git                                        |
-| `FOCOCONTEXT_API_KEY`            | Bearer API Key             | 使用 32 位以上随机值，只保存在服务端                                      |
-| `FOCOCONTEXT_CORS_ORIGINS`       | 逗号分隔 origin            | 本地填 `http://localhost:18081,http://127.0.0.1:18081`；生产只填可信域名  |
-| `FOCOCONTEXT_ADMIN_API_BASE_URL` | Admin 调用 API 的 base URL | Compose 内本地用 `http://localhost:18080/v1`；反向代理部署填公开 API 路径 |
-| `FOCOCONTEXT_ADMIN_BASE_URL`     | Admin 自身访问地址         | 本地用 `http://localhost:18081`；生产填 HTTPS 域名                        |
+| 字段                                             | 说明                       | 建议值                                                                    |
+| ------------------------------------------------ | -------------------------- | ------------------------------------------------------------------------- |
+| `FOCOCONTEXT_ADMIN_USERNAME`                     | 管理员用户名               | 本地可用 `admin`；生产使用不易猜的管理员名                                |
+| `FOCOCONTEXT_ADMIN_PASSWORD`                     | 管理员密码                 | 至少 16 位随机密码，不要提交到 Git                                        |
+| `FOCOCONTEXT_ADMIN_SESSION_TTL_SECONDS`          | 管理后台会话 TTL 秒数      | 默认 `604800`，即 7 天                                                    |
+| `FOCOCONTEXT_ADMIN_LOGIN_FAILURE_LIMIT`          | 登录失败阈值               | 默认 `5`；重复失败会限流且不暴露账号是否存在                              |
+| `FOCOCONTEXT_ADMIN_LOGIN_FAILURE_WINDOW_SECONDS` | 登录失败统计窗口秒数       | 默认 `300`                                                                |
+| `FOCOCONTEXT_ADMIN_LOGIN_LOCKOUT_SECONDS`        | 登录锁定秒数               | 默认 `900`                                                                |
+| `FOCOCONTEXT_ADMIN_COOKIE_SECURE`                | Admin Cookie Secure 属性   | HTTPS 生产环境使用 `true`                                                 |
+| `FOCOCONTEXT_ADMIN_COOKIE_SAMESITE`              | Admin Cookie SameSite 模式 | 默认 `lax`；按反向代理和域名部署方式调整                                  |
+| `FOCOCONTEXT_API_KEY`                            | Bearer API Key             | 使用 32 位以上随机值，只保存在服务端                                      |
+| `FOCOCONTEXT_CORS_ORIGINS`                       | 逗号分隔 origin            | 本地填 `http://localhost:18081,http://127.0.0.1:18081`；生产只填可信域名  |
+| `FOCOCONTEXT_ADMIN_API_BASE_URL`                 | Admin 调用 API 的 base URL | Compose 内本地用 `http://localhost:18080/v1`；反向代理部署填公开 API 路径 |
+| `FOCOCONTEXT_ADMIN_BASE_URL`                     | Admin 自身访问地址         | 本地用 `http://localhost:18081`；生产填 HTTPS 域名                        |
+
+## 安全响应头、审计与限流
+
+| 字段                                      | 说明                     | 建议值                          |
+| ----------------------------------------- | ------------------------ | ------------------------------- |
+| `SECURITY_HEADERS_ENABLED`                | 是否启用安全响应头       | 默认 `true`                     |
+| `SECURITY_HSTS_ENABLED`                   | 是否启用 HSTS            | HTTPS 稳定后再开启              |
+| `SECURITY_HSTS_MAX_AGE_SECONDS`           | HSTS max age             | 默认 `15552000`                 |
+| `SECURITY_AUDIT_ENABLED`                  | 是否持久化安全审计事件   | 默认 `true`                     |
+| `SECURITY_AUDIT_RETENTION_DAYS`           | 安全审计保留天数         | 默认 `90`                       |
+| `SECURITY_AUDIT_MAX_METADATA_BYTES`       | 审计 metadata 大小上限   | 默认 `4096`                     |
+| `SECURITY_AUDIT_COUNTER_WINDOW_SECONDS`   | Redis 审计计数窗口       | 默认 `300`                      |
+| `SECURITY_AUDIT_COUNTER_TTL_SECONDS`      | Redis 审计计数 TTL       | 默认 `3600`                     |
+| `SECURITY_RATE_LIMIT_ENABLED`             | 是否启用路由限流         | 默认 `true`                     |
+| `SECURITY_RATE_LIMIT_WINDOW_SECONDS`      | 限流窗口秒数             | 默认 `60`                       |
+| `SECURITY_RATE_LIMIT_PUBLIC_HEALTH_MAX`   | public health 窗口上限   | 默认 `120`                      |
+| `SECURITY_RATE_LIMIT_OPENAPI_MAX`         | OpenAPI JSON 窗口上限    | 默认 `30`                       |
+| `SECURITY_RATE_LIMIT_LOGIN_MAX`           | 登录窗口上限             | 默认 `10`                       |
+| `SECURITY_RATE_LIMIT_DIAGNOSTICS_MAX`     | 诊断接口窗口上限         | 默认 `30`                       |
+| `SECURITY_RATE_LIMIT_DEFAULT_API_MAX`     | 默认受保护 API 窗口上限  | 默认 `300`                      |
+| `SECURITY_RATE_LIMIT_RETRIEVE_MAX`        | Retrieve 窗口上限        | 默认 `60`                       |
+| `SECURITY_RATE_LIMIT_SOURCE_EVIDENCE_MAX` | Source Evidence 窗口上限 | 默认 `120`                      |
+| `SECURITY_RATE_LIMIT_UPLOAD_MAX`          | 内置上传窗口上限         | 默认 `30`                       |
+| `SECURITY_RATE_LIMIT_DIRECT_UPLOAD_MAX`   | 直传窗口上限             | 默认 `30`                       |
+| `SECURITY_RATE_LIMIT_EXPORT_MAX`          | 导出窗口上限             | 默认 `10`                       |
+| `SECURITY_RATE_LIMIT_CLEANUP_MAX`         | 清理窗口上限             | 默认 `10`                       |
+| `SECURITY_RATE_LIMIT_WEBHOOK_MAX`         | Webhook 窗口上限         | 默认 `60`                       |
+| `SECURITY_RATE_LIMIT_ADMIN_EXPENSIVE_MAX` | 管理后台昂贵操作窗口上限 | 默认 `30`；可信运维场景谨慎调高 |
 
 ## Source Watch 挂载目录
 
@@ -38,6 +72,14 @@
 | ---------------------------------------- | ---------- | ------------------------------------------------------ |
 | `FOCOCONTEXT_SOURCE_WATCH_HOST_DIR`      | 宿主机目录 | 本地用 `./examples/source-watch`；生产填专门的数据目录 |
 | `FOCOCONTEXT_SOURCE_WATCH_CONTAINER_DIR` | 容器内目录 | 保持 `/source-watch`，创建规则时填该路径或子路径       |
+
+## Source Watch 远程网络安全
+
+| 字段                                     | 说明                     | 建议值                                   |
+| ---------------------------------------- | ------------------------ | ---------------------------------------- |
+| `SOURCE_WATCH_PRIVATE_NETWORK_ENABLED`   | 是否允许私网目标         | 默认 `false`；只在可信内网资料源场景开启 |
+| `SOURCE_WATCH_PRIVATE_NETWORK_ALLOWLIST` | host、IP 或 CIDR 白名单  | 默认留空；开启私网目标时必须显式配置     |
+| `PARSER_REMOTE_IMAGE_FETCHING_ENABLED`   | 是否抓取输入中的远程图片 | 默认 `false`；只有明确出口控制时才开启   |
 
 ## Source Watch URL 列表
 
@@ -203,65 +245,123 @@ Rerank 使用全有或全无配置规则。所有 `RERANK_*` 都留空时禁用 
 
 ## 上传、运行压力和解析器
 
-| 字段                                         | 说明                        | 建议值                               |
-| -------------------------------------------- | --------------------------- | ------------------------------------ |
-| `UPLOAD_MAX_FILE_SIZE_MB`                    | 上传文件大小上限 MB         | 默认 `50`；生产按 API 网关和 S3 调整 |
-| `UPLOAD_MAX_CONCURRENT_FILES`                | 浏览器并发上传数            | 默认 `3`                             |
-| `UPLOAD_DIRECT_ENABLED`                      | `true` / `false`            | 有直传能力后开启                     |
-| `UPLOAD_DIRECT_THRESHOLD_MB`                 | 超过多少 MB 走直传          | 默认 `50`                            |
-| `UPLOAD_SESSION_EXPIRES_SECONDS`             | 上传会话过期秒数            | 默认 `900`                           |
-| `UPLOAD_MULTIPART_FALLBACK_MODE`             | `enabled` / `disabled`      | 默认 `enabled`                       |
-| `UPLOAD_MULTIPART_TIMEOUT_SECONDS`           | multipart 超时              | 默认 `300`                           |
-| `UPLOAD_PRESSURE_DEGRADED_THRESHOLD`         | 上传压力 degraded 阈值      | 默认 `3`                             |
-| `RUNTIME_QUEUE_DEPTH_DEGRADED_THRESHOLD`     | 总队列 degraded 阈值        | 默认 `20`                            |
-| `RUNTIME_QUEUE_DEPTH_SATURATED_THRESHOLD`    | 总队列 saturated 阈值       | 默认 `100`                           |
-| `COMPILE_QUEUE_DEPTH_DEGRADED_THRESHOLD`     | 编译队列 degraded 阈值      | 默认 `10`                            |
-| `COMPILE_QUEUE_DEPTH_SATURATED_THRESHOLD`    | 编译队列 saturated 阈值     | 默认 `50`                            |
-| `PROVIDER_FAILURE_DEGRADED_THRESHOLD`        | provider 失败 degraded 阈值 | 默认 `3`                             |
-| `EXPENSIVE_VALIDATION_ENABLED`               | 是否执行昂贵外部探测        | 默认 `false`                         |
-| `PARSER_MAX_FILE_SIZE_MB`                    | parser 接受文件大小上限     | 默认 `50`                            |
-| `PARSER_TIMEOUT_SECONDS`                     | parser 超时秒数             | 默认 `120`                           |
-| `PARSER_CONCURRENCY`                         | 解析并发兼容回退            | 默认 `2`                             |
-| `SOURCE_PARSE_CONCURRENCY`                   | 资料解析阶段并发            | 默认 `2`                             |
-| `PARSER_MAX_IMAGES_PER_DOCUMENT`             | 单文档视觉资产抽取上限      | 默认 `50`                            |
-| `PARSER_MAX_RENDERED_SNAPSHOTS_PER_DOCUMENT` | 单文档渲染页/表快照上限     | 默认 `10`                            |
-| `PARSER_MAX_IMAGE_PIXELS`                    | 单张抽取图片像素上限        | 默认 `16000000`                      |
-| `PARSER_MAX_IMAGE_BYTES`                     | 单张抽取图片字节上限        | 默认 `10485760`                      |
-| `PARSER_MIN_IMAGE_WIDTH`                     | 最小图片宽度                | 默认 `64`                            |
-| `PARSER_MIN_IMAGE_HEIGHT`                    | 最小图片高度                | 默认 `64`                            |
-| `PARSER_VISUAL_EXTRACTION_CONCURRENCY`       | 单文档视觉抽取并发          | 默认 `2`                             |
-| `PARSER_REMOTE_IMAGE_FETCHING_ENABLED`       | Markdown/HTML 远程图片抓取  | 默认 `false`                         |
-| `PARSER_PDF_SNAPSHOT_MIN_TEXT_CHARS`         | PDF 低文本页快照阈值        | 默认 `80`                            |
+| 字段                                         | 说明                           | 建议值                               |
+| -------------------------------------------- | ------------------------------ | ------------------------------------ |
+| `UPLOAD_MAX_FILE_SIZE_MB`                    | 上传文件大小上限 MB            | 默认 `50`；生产按 API 网关和 S3 调整 |
+| `UPLOAD_MAX_CONCURRENT_FILES`                | 浏览器并发上传数               | 默认 `3`                             |
+| `UPLOAD_DIRECT_ENABLED`                      | `true` / `false`               | 有直传能力后开启                     |
+| `UPLOAD_DIRECT_THRESHOLD_MB`                 | 超过多少 MB 走直传             | 默认 `50`                            |
+| `UPLOAD_SESSION_EXPIRES_SECONDS`             | 上传会话过期秒数               | 默认 `900`                           |
+| `UPLOAD_MULTIPART_FALLBACK_MODE`             | `enabled` / `disabled`         | 默认 `enabled`                       |
+| `UPLOAD_MULTIPART_TIMEOUT_SECONDS`           | multipart 超时                 | 默认 `300`                           |
+| `UPLOAD_PRESSURE_DEGRADED_THRESHOLD`         | 上传压力 degraded 阈值         | 默认 `3`                             |
+| `RUNTIME_QUEUE_DEPTH_DEGRADED_THRESHOLD`     | 总队列 degraded 阈值           | 默认 `20`                            |
+| `RUNTIME_QUEUE_DEPTH_SATURATED_THRESHOLD`    | 总队列 saturated 阈值          | 默认 `100`                           |
+| `COMPILE_QUEUE_DEPTH_DEGRADED_THRESHOLD`     | 编译队列 degraded 阈值         | 默认 `10`                            |
+| `COMPILE_QUEUE_DEPTH_SATURATED_THRESHOLD`    | 编译队列 saturated 阈值        | 默认 `50`                            |
+| `PROVIDER_FAILURE_DEGRADED_THRESHOLD`        | provider 失败 degraded 阈值    | 默认 `3`                             |
+| `PARSER_MAX_FILE_SIZE_MB`                    | parser 接受文件大小上限        | 默认 `50`                            |
+| `PARSER_TIMEOUT_SECONDS`                     | parser 超时秒数                | 默认 `120`                           |
+| `PARSER_CONCURRENCY`                         | 解析并发兼容回退               | 默认 `2`                             |
+| `SOURCE_PARSE_CONCURRENCY`                   | 资料解析阶段并发               | 默认 `2`                             |
+| `PARSER_ZIP_MAX_ENTRIES`                     | archive entry 数量上限         | 默认 `10000`                         |
+| `PARSER_ZIP_MAX_EXPANDED_MB`                 | archive 解压后总大小上限 MB    | 默认 `1000`                          |
+| `PARSER_ZIP_MAX_ENTRY_MB`                    | 单个 archive entry 大小上限 MB | 默认 `50`                            |
+| `PARSER_MEDIA_UPLOAD_CONCURRENCY`            | 抽取媒体上传并发               | 默认 `2`                             |
+| `PARSER_MAX_IMAGES_PER_DOCUMENT`             | 单文档视觉资产抽取上限         | 默认 `50`                            |
+| `PARSER_MAX_RENDERED_SNAPSHOTS_PER_DOCUMENT` | 单文档渲染页/表快照上限        | 默认 `10`                            |
+| `PARSER_MAX_IMAGE_PIXELS`                    | 单张抽取图片像素上限           | 默认 `16000000`                      |
+| `PARSER_MAX_IMAGE_BYTES`                     | 单张抽取图片字节上限           | 默认 `10485760`                      |
+| `PARSER_MIN_IMAGE_WIDTH`                     | 最小图片宽度                   | 默认 `64`                            |
+| `PARSER_MIN_IMAGE_HEIGHT`                    | 最小图片高度                   | 默认 `64`                            |
+| `PARSER_VISUAL_EXTRACTION_CONCURRENCY`       | 单文档视觉抽取并发             | 默认 `2`                             |
+| `PARSER_REMOTE_IMAGE_FETCHING_ENABLED`       | Markdown/HTML 远程图片抓取     | 默认 `false`                         |
+| `PARSER_PDF_SNAPSHOT_MIN_TEXT_CHARS`         | PDF 低文本页快照阈值           | 默认 `80`                            |
+
+## 文档处理中间状态
+
+| 字段                                           | 说明                            | 建议值       |
+| ---------------------------------------------- | ------------------------------- | ------------ |
+| `DOCUMENT_PROCESSING_MARKDOWN_WINDOW_CHARS`    | Markdown window artifact 字符数 | 默认 `64000` |
+| `DOCUMENT_PROCESSING_DETAIL_DEFAULT_PAGE_SIZE` | processing detail 默认分页大小  | 默认 `50`    |
+| `DOCUMENT_PROCESSING_DETAIL_MAX_PAGE_SIZE`     | processing detail 最大分页大小  | 默认 `200`   |
+| `DOCUMENT_PROCESSING_CLEANUP_BATCH_SIZE`       | 过期中间状态清理批大小          | 默认 `500`   |
+| `DOCUMENT_PROCESSING_SUCCESS_RETENTION_DAYS`   | 成功中间状态保留天数            | 默认 `7`     |
+| `DOCUMENT_PROCESSING_FAILURE_RETENTION_DAYS`   | 失败中间状态保留天数            | 默认 `30`    |
 
 ## 队列、编译和 Retrieve
 
-| 字段                                           | 说明                  | 建议值                                 |
-| ---------------------------------------------- | --------------------- | -------------------------------------- |
-| `FOCOCONTEXT_QUEUE_CONCURRENCY`                | 默认队列并发          | 默认 `2`                               |
-| `BATCH_IMPORT_CONCURRENCY`                     | 批量导入并发          | 默认 `2`                               |
-| `SOURCE_WATCH_SCAN_CONCURRENCY`                | Source Watch 扫描并发 | 默认 `2`                               |
-| `SOURCE_WATCH_SCHEDULER_ENABLED`               | 是否启用定时扫描      | 默认 `true`                            |
-| `SOURCE_WATCH_SCAN_INTERVAL_SECONDS`           | 定时扫描间隔          | 默认 `3600`                            |
-| `SOURCE_WATCH_SCAN_MAX_RETRIES`                | 扫描失败重试次数      | 默认 `2`                               |
-| `SOURCE_WATCH_SCAN_RETRY_BASE_DELAY_MS`        | 扫描重试基础延迟      | 默认 `1000`                            |
-| `WIKI_ANALYZE_CONCURRENCY`                     | 分析阶段并发          | 默认 `2`；受 Chat provider 限流影响    |
-| `WIKI_GENERATE_CONCURRENCY`                    | 生成阶段并发          | 默认 `2`                               |
-| `WIKI_MERGE_CONCURRENCY`                       | 合并阶段并发          | 默认 `2`                               |
-| `COMPILE_MAX_CONTEXT_CHARS`                    | 编译 prompt 字符预算  | 默认 `24000`；大文档可按模型上下文调高 |
-| `RETRIEVE_DEFAULT_TOP_K`                       | 默认候选数            | 默认 `10`                              |
-| `RETRIEVE_MAX_TOP_K`                           | 最大候选数            | 默认 `20`                              |
-| `RETRIEVE_DEFAULT_GRAPH_DEPTH`                 | 默认图谱深度          | 默认 `1`                               |
-| `RETRIEVE_MAX_GRAPH_DEPTH`                     | 最大图谱深度          | 默认 `3`                               |
-| `RETRIEVE_DEFAULT_GRAPH_LIMIT_PER_RESULT`      | 每结果默认图谱扩展数  | 默认 `5`                               |
-| `RETRIEVE_MAX_GRAPH_LIMIT_PER_RESULT`          | 每结果最大图谱扩展数  | 默认 `10`                              |
-| `RETRIEVE_DEFAULT_CONTEXT_BUDGET_TOKENS`       | 默认上下文预算        | 默认 `4000`                            |
-| `RETRIEVE_MAX_CONTEXT_BUDGET_TOKENS`           | 最大上下文预算        | 默认 `12000`                           |
-| `SOURCE_EVIDENCE_DEFAULT_MAX_CHARS`            | 默认资料证据文本上限  | 默认 `4000`                            |
-| `SOURCE_EVIDENCE_MAX_CHARS`                    | 最大资料证据文本上限  | 默认 `12000`                           |
-| `SOURCE_EVIDENCE_DEFAULT_CONTEXT_CHARS`        | 默认资料证据上下文    | 默认 `800`                             |
-| `SOURCE_EVIDENCE_MAX_CONTEXT_CHARS`            | 最大资料证据上下文    | 默认 `2000`                            |
-| `SOURCE_EVIDENCE_BATCH_MAX_ITEMS`              | 批量证据最大条数      | 默认 `20`                              |
-| `SOURCE_EVIDENCE_BATCH_TOTAL_OUTPUT_MAX_CHARS` | 批量证据总输出上限    | 默认 `40000`                           |
+| 字段                                             | 说明                              | 建议值                                    |
+| ------------------------------------------------ | --------------------------------- | ----------------------------------------- |
+| `FOCOCONTEXT_QUEUE_CONCURRENCY`                  | 默认队列并发                      | 默认 `2`                                  |
+| `BATCH_IMPORT_CONCURRENCY`                       | 批量导入并发                      | 默认 `2`                                  |
+| `SOURCE_WATCH_SCAN_CONCURRENCY`                  | Source Watch 扫描并发             | 默认 `2`                                  |
+| `BACKGROUND_REINDEX_BATCH_SIZE`                  | 重建索引批大小                    | 默认 `100`                                |
+| `BACKGROUND_REINDEX_CURSOR_WINDOW_SIZE`          | 重建索引游标窗口                  | 默认 `100`                                |
+| `BACKGROUND_REINDEX_CHECKPOINT_INTERVAL`         | 重建索引 checkpoint 间隔          | 默认 `1`                                  |
+| `BACKGROUND_REINDEX_RETRY_BASE_DELAY_MS`         | 重建索引重试基础延迟              | 默认 `1000`                               |
+| `BACKGROUND_REINDEX_CONCURRENCY`                 | 重建索引并发                      | 默认继承 `FOCOCONTEXT_QUEUE_CONCURRENCY`  |
+| `BACKGROUND_GRAPH_INSIGHTS_BATCH_SIZE`           | 图谱洞察批大小                    | 默认 `100`                                |
+| `BACKGROUND_GRAPH_INSIGHTS_CURSOR_WINDOW_SIZE`   | 图谱洞察游标窗口                  | 默认 `100`                                |
+| `BACKGROUND_GRAPH_INSIGHTS_CHECKPOINT_INTERVAL`  | 图谱洞察 checkpoint 间隔          | 默认 `1`                                  |
+| `BACKGROUND_GRAPH_INSIGHTS_RETRY_BASE_DELAY_MS`  | 图谱洞察重试基础延迟              | 默认 `1000`                               |
+| `BACKGROUND_GRAPH_INSIGHTS_CONCURRENCY`          | 图谱洞察并发                      | 默认继承 `FOCOCONTEXT_QUEUE_CONCURRENCY`  |
+| `BACKGROUND_KNOWLEDGE_CHECK_BATCH_SIZE`          | Knowledge Check 批大小            | 默认 `100`                                |
+| `BACKGROUND_KNOWLEDGE_CHECK_CURSOR_WINDOW_SIZE`  | Knowledge Check 游标窗口          | 默认 `100`                                |
+| `BACKGROUND_KNOWLEDGE_CHECK_CHECKPOINT_INTERVAL` | Knowledge Check checkpoint 间隔   | 默认 `1`                                  |
+| `BACKGROUND_KNOWLEDGE_CHECK_RETRY_BASE_DELAY_MS` | Knowledge Check 重试基础延迟      | 默认 `1000`                               |
+| `BACKGROUND_KNOWLEDGE_CHECK_CONCURRENCY`         | Knowledge Check 并发              | 默认继承 `FOCOCONTEXT_QUEUE_CONCURRENCY`  |
+| `BACKGROUND_SOURCE_WATCH_BATCH_SIZE`             | Source Watch 后台批大小           | 默认 `100`                                |
+| `BACKGROUND_SOURCE_WATCH_CURSOR_WINDOW_SIZE`     | Source Watch 后台游标窗口         | 默认 `100`                                |
+| `BACKGROUND_SOURCE_WATCH_CHECKPOINT_INTERVAL`    | Source Watch 后台 checkpoint 间隔 | 默认 `1`                                  |
+| `BACKGROUND_SOURCE_WATCH_RETRY_BASE_DELAY_MS`    | Source Watch 后台重试基础延迟     | 默认 `1000`                               |
+| `BACKGROUND_SOURCE_WATCH_CONCURRENCY`            | Source Watch 后台并发             | 默认继承 `FOCOCONTEXT_QUEUE_CONCURRENCY`  |
+| `BACKGROUND_OCR_BATCH_SIZE`                      | OCR 后台批大小                    | 默认 `100`                                |
+| `BACKGROUND_OCR_CURSOR_WINDOW_SIZE`              | OCR 后台游标窗口                  | 默认 `100`                                |
+| `BACKGROUND_OCR_CHECKPOINT_INTERVAL`             | OCR 后台 checkpoint 间隔          | 默认 `1`                                  |
+| `BACKGROUND_OCR_RETRY_BASE_DELAY_MS`             | OCR 后台重试基础延迟              | 默认 `1000`                               |
+| `BACKGROUND_OCR_CONCURRENCY`                     | OCR 后台并发                      | 默认继承 `FOCOCONTEXT_QUEUE_CONCURRENCY`  |
+| `BACKGROUND_MEDIA_CAPTION_BATCH_SIZE`            | 媒体 caption 后台批大小           | 默认 `100`                                |
+| `BACKGROUND_MEDIA_CAPTION_CURSOR_WINDOW_SIZE`    | 媒体 caption 后台游标窗口         | 默认 `100`                                |
+| `BACKGROUND_MEDIA_CAPTION_CHECKPOINT_INTERVAL`   | 媒体 caption 后台 checkpoint 间隔 | 默认 `1`                                  |
+| `BACKGROUND_MEDIA_CAPTION_RETRY_BASE_DELAY_MS`   | 媒体 caption 后台重试基础延迟     | 默认 `1000`                               |
+| `BACKGROUND_MEDIA_CAPTION_CONCURRENCY`           | 媒体 caption 后台并发             | 默认继承 `FOCOCONTEXT_QUEUE_CONCURRENCY`  |
+| `BACKGROUND_CLEANUP_BATCH_SIZE`                  | 清理批大小                        | 默认 `100`                                |
+| `BACKGROUND_CLEANUP_CURSOR_WINDOW_SIZE`          | 清理游标窗口                      | 默认 `100`                                |
+| `BACKGROUND_CLEANUP_CHECKPOINT_INTERVAL`         | 清理 checkpoint 间隔              | 默认 `1`                                  |
+| `BACKGROUND_CLEANUP_RETRY_BASE_DELAY_MS`         | 清理重试基础延迟                  | 默认 `1000`                               |
+| `BACKGROUND_CLEANUP_CONCURRENCY`                 | 清理并发                          | 默认继承 `FOCOCONTEXT_QUEUE_CONCURRENCY`  |
+| `RESIDUAL_GRAPH_INSIGHTS_SUMMARY_WINDOW_SIZE`    | 图谱洞察残余 summary 窗口         | 默认 `100`                                |
+| `RESIDUAL_GRAPH_INSIGHTS_CHECKPOINT_INTERVAL`    | 图谱洞察残余 checkpoint 间隔      | 默认 `1`                                  |
+| `RESIDUAL_SOURCE_WATCH_COMPARISON_WINDOW_SIZE`   | Source Watch 残余对比窗口         | 默认 `100`                                |
+| `RESIDUAL_SOURCE_WATCH_CHECKPOINT_INTERVAL`      | Source Watch 残余 checkpoint 间隔 | 默认 `1`                                  |
+| `RESIDUAL_SOURCE_WATCH_SMALL_URL_LIST_LIMIT`     | Source Watch 小 URL 列表上限      | 默认继承 `SOURCE_WATCH_URL_LIST_MAX_URLS` |
+| `RESIDUAL_OCR_PAGE_WINDOW_SIZE`                  | OCR 残余页窗口                    | 默认 `100`                                |
+| `RESIDUAL_OCR_CHECKPOINT_INTERVAL`               | OCR 残余 checkpoint 间隔          | 默认 `1`                                  |
+| `RESIDUAL_MEDIA_CAPTION_ASSET_WINDOW_SIZE`       | 媒体 caption 残余资产窗口         | 默认 `100`                                |
+| `RESIDUAL_MEDIA_CAPTION_CHECKPOINT_INTERVAL`     | 媒体 caption 残余 checkpoint 间隔 | 默认 `1`                                  |
+| `SOURCE_WATCH_SCHEDULER_ENABLED`                 | 是否启用定时扫描                  | 默认 `true`                               |
+| `SOURCE_WATCH_SCAN_INTERVAL_SECONDS`             | 定时扫描间隔                      | 默认 `3600`                               |
+| `SOURCE_WATCH_SCAN_MAX_RETRIES`                  | 扫描失败重试次数                  | 默认 `2`                                  |
+| `SOURCE_WATCH_SCAN_RETRY_BASE_DELAY_MS`          | 扫描重试基础延迟                  | 默认 `1000`                               |
+| `WIKI_ANALYZE_CONCURRENCY`                       | 分析阶段并发                      | 默认 `2`；受 Chat provider 限流影响       |
+| `WIKI_GENERATE_CONCURRENCY`                      | 生成阶段并发                      | 默认 `2`                                  |
+| `WIKI_MERGE_CONCURRENCY`                         | 合并阶段并发                      | 默认 `2`                                  |
+| `COMPILE_MAX_CONTEXT_CHARS`                      | 编译 prompt 字符预算              | 默认 `24000`；大文档可按模型上下文调高    |
+| `RETRIEVE_DEFAULT_TOP_K`                         | 默认候选数                        | 默认 `10`                                 |
+| `RETRIEVE_MAX_TOP_K`                             | 最大候选数                        | 默认 `20`                                 |
+| `RETRIEVE_DEFAULT_GRAPH_DEPTH`                   | 默认图谱深度                      | 默认 `1`                                  |
+| `RETRIEVE_MAX_GRAPH_DEPTH`                       | 最大图谱深度                      | 默认 `3`                                  |
+| `RETRIEVE_DEFAULT_GRAPH_LIMIT_PER_RESULT`        | 每结果默认图谱扩展数              | 默认 `5`                                  |
+| `RETRIEVE_MAX_GRAPH_LIMIT_PER_RESULT`            | 每结果最大图谱扩展数              | 默认 `10`                                 |
+| `RETRIEVE_DEFAULT_CONTEXT_BUDGET_TOKENS`         | 默认上下文预算                    | 默认 `4000`                               |
+| `RETRIEVE_MAX_CONTEXT_BUDGET_TOKENS`             | 最大上下文预算                    | 默认 `12000`                              |
+| `SOURCE_EVIDENCE_DEFAULT_MAX_CHARS`              | 默认资料证据文本上限              | 默认 `4000`                               |
+| `SOURCE_EVIDENCE_MAX_CHARS`                      | 最大资料证据文本上限              | 默认 `12000`                              |
+| `SOURCE_EVIDENCE_DEFAULT_CONTEXT_CHARS`          | 默认资料证据上下文                | 默认 `800`                                |
+| `SOURCE_EVIDENCE_MAX_CONTEXT_CHARS`              | 最大资料证据上下文                | 默认 `2000`                               |
+| `SOURCE_EVIDENCE_BATCH_MAX_ITEMS`                | 批量证据最大条数                  | 默认 `20`                                 |
+| `SOURCE_EVIDENCE_BATCH_TOTAL_OUTPUT_MAX_CHARS`   | 批量证据总输出上限                | 默认 `40000`                              |
 
 ## Webhook
 

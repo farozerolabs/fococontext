@@ -10,6 +10,21 @@ export const sourceDocumentStatuses = [
 ] as const;
 export const sourceTypes = ["file", "text", "url", "wiki_draft"] as const;
 export const sourceEvidenceKinds = ["text", "image_caption", "ocr"] as const;
+export const documentProcessingStages = [
+  "parsing",
+  "ocr",
+  "media_extraction",
+  "captioning",
+  "parsed_artifact",
+] as const;
+export const documentProcessingUnitStatuses = [
+  "pending",
+  "running",
+  "succeeded",
+  "failed",
+  "skipped",
+  "canceled",
+] as const;
 export const sourceEvidenceLocatorStatuses = [
   "resolved",
   "not_provided",
@@ -25,6 +40,19 @@ export type SourceEvidenceLocatorStatus = (typeof sourceEvidenceLocatorStatuses)
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "canceled";
 export type UploadSessionStatus = "created" | "finalized" | "expired" | "canceled";
 export type SourceVisibilityOrigin = "canonical" | "upstream_inherited" | "fork_owned";
+export type DocumentProcessingStage =
+  | "parsing"
+  | "ocr"
+  | "media_extraction"
+  | "captioning"
+  | "parsed_artifact";
+export type DocumentProcessingUnitStatus =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "skipped"
+  | "canceled";
 
 export interface DocumentKnowledgeBaseScopeRecord {
   knowledgeBaseId: string;
@@ -45,6 +73,8 @@ export type JobStage =
 
 export interface SourceDocumentRecord {
   id: string;
+  tenantId: string;
+  projectId: string;
   knowledgeBaseId: string;
   name: string;
   displayName: string;
@@ -69,6 +99,12 @@ export interface SourceDocumentRecord {
 
 export interface UploadSessionRecord {
   id: string;
+  tenantId: string;
+  projectId: string;
+  actorType: "api_key" | "admin_session" | "system" | "unknown";
+  actorId: string;
+  actorSource: string;
+  actorAccountId: string | null;
   knowledgeBaseId: string;
   documentId: string;
   objectKey: string;
@@ -173,6 +209,31 @@ export interface MediaAssetRecord {
   updatedAt: string;
 }
 
+export interface DocumentProcessingUnitRecord {
+  id: string;
+  sourceDocumentId: string;
+  jobId: string;
+  parsedContentId: string | null;
+  stage: DocumentProcessingStage;
+  unitType: string;
+  unitKey: string;
+  unitIndex: number | null;
+  attemptScope: string;
+  status: DocumentProcessingUnitStatus;
+  contentHash: string | null;
+  dedupeKey: string;
+  objectKey: string | null;
+  objectRefs: readonly Record<string, unknown>[];
+  locator: Record<string, unknown>;
+  counters: Record<string, unknown>;
+  warnings: readonly Record<string, unknown>[];
+  safeError: Record<string, unknown> | null;
+  metadata: Record<string, unknown>;
+  retryEligible: boolean;
+  completedAt: string | null;
+  updatedAt: string;
+}
+
 export interface SourceDocumentResponse {
   id: string;
   knowledge_base_id: string;
@@ -194,6 +255,31 @@ export interface SourceDocumentResponse {
   upstream_resource_id?: string | null;
   fork_tombstoned_at?: string | null;
   created_at: string;
+  updated_at: string;
+}
+
+export interface DocumentProcessingUnitResponse {
+  id: string;
+  source_document_id: string;
+  job_id: string;
+  parsed_content_id: string | null;
+  stage: DocumentProcessingStage;
+  unit_type: string;
+  unit_key: string;
+  unit_index: number | null;
+  attempt_scope: string;
+  status: DocumentProcessingUnitStatus;
+  content_hash: string | null;
+  dedupe_key: string;
+  object_key: string | null;
+  object_refs: readonly Record<string, unknown>[];
+  locator: Record<string, unknown>;
+  counters: Record<string, unknown>;
+  warnings: readonly Record<string, unknown>[];
+  safe_error: Record<string, unknown> | null;
+  metadata: Record<string, unknown>;
+  retry_eligible: boolean;
+  completed_at: string | null;
   updated_at: string;
 }
 
@@ -227,7 +313,44 @@ export interface JobEventResponse {
   created_at: string;
 }
 
+export interface BackgroundOperationRecord {
+  id: string;
+  jobId: string | null;
+  knowledgeBaseId: string | null;
+  operationKind: string;
+  stage: string;
+  status: string;
+  cursor: Record<string, unknown>;
+  processedCount: number;
+  failedCount: number;
+  totalCount: number | null;
+  lastItemId: string | null;
+  safeError: Record<string, unknown> | null;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface BackgroundOperationResponse {
+  id: string;
+  job_id: string | null;
+  knowledge_base_id: string | null;
+  operation_kind: string;
+  stage: string;
+  status: string;
+  cursor: Record<string, unknown>;
+  processed_count: number;
+  failed_count: number;
+  total_count: number | null;
+  last_item_id: string | null;
+  safe_error: Record<string, unknown> | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface JobDetailResponse extends JobResponse {
+  background_operations: readonly BackgroundOperationResponse[];
   events: readonly JobEventResponse[];
 }
 

@@ -6,6 +6,8 @@ import { useTranslation } from "react-i18next"
 import { useParams, useSearchParams } from "react-router"
 
 import {
+  type BackgroundOperation,
+  type DocumentProcessingUnit,
   type Job,
   type JobDetail,
   type JobEvent,
@@ -258,9 +260,35 @@ export function KnowledgeBaseJobsPage() {
       <h1 className="sr-only">{t("nav.jobs")}</h1>
 
       {jobsQuery.isLoading ? <LoadingState label={t("state.loading")} /> : null}
-      {jobsQuery.isError ? <ErrorAlert title={t("state.loadFailed")} /> : null}
+      {jobsQuery.isError ? (
+        <ErrorAlert
+          action={
+            <Button
+              onClick={() => void jobsQuery.refetch()}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              {t("action.retry")}
+            </Button>
+          }
+          description={t("job.loadFailedDescription")}
+          title={t("state.loadFailed")}
+        />
+      ) : null}
       {jobsQuery.isSuccess && jobsPagination.total === 0 ? (
-        <EmptyState title={t("empty.noJobs")} />
+        <EmptyState
+          description={t("job.emptyDescription")}
+          title={t("empty.noJobs")}
+        />
+      ) : null}
+      {systemSettingsQuery.isError ? (
+        <Alert>
+          <AlertTitle>{t("job.runtimeStatusUnavailable")}</AlertTitle>
+          <AlertDescription>
+            {t("job.runtimeStatusUnavailableDescription")}
+          </AlertDescription>
+        </Alert>
       ) : null}
       {pressureWarnings.length === 0 ? null : (
         <Alert variant="destructive">
@@ -292,7 +320,10 @@ export function KnowledgeBaseJobsPage() {
                 : t("job.retrieveNotReady")}
             </Badge>
           </div>
-          <Progress value={ingestProgress.overall_progress} />
+          <Progress
+            label={t("job.stageAverageProgress")}
+            value={ingestProgress.overall_progress}
+          />
         </div>
       ) : null}
       {jobsQuery.isSuccess && jobsPagination.total > 0 ? (
@@ -523,6 +554,34 @@ function JobDetailsDialog({
     refetchOnMount: "always",
     refetchOnWindowFocus: true,
   })
+  const processingUnitsQuery = useQuery({
+    enabled: item.document !== null,
+    queryKey:
+      item.document === null
+        ? adminQueryKeys.documentProcessingUnits("")
+        : adminQueryKeys.documentProcessingUnits(item.document.id, {
+            jobId: item.job.id,
+            page: 1,
+            pageSize: 50,
+          }),
+    queryFn: async () => {
+      if (item.document === null) {
+        return {
+          data: [],
+          pagination: createEmptyPagination(1),
+        }
+      }
+
+      return apiClient.listDocumentProcessingUnits(item.document.id, {
+        jobId: item.job.id,
+        page: 1,
+        pageSize: 50,
+      })
+    },
+    refetchInterval: () =>
+      getActiveRefetchInterval(isActiveJobStatus(item.job.status)),
+    refetchIntervalInBackground: true,
+  })
   const selectedJobId = item.job.id
   const selectedJobUpdatedAt = item.job.updated_at
   const jobDetailUpdatedAt = jobDetailQuery.data?.updated_at
@@ -543,6 +602,7 @@ function JobDetailsDialog({
 
   const job = pickLatestJob(jobDetailQuery.data, item.job)
   const events = jobDetailQuery.data?.events ?? []
+  const backgroundOperations = jobDetailQuery.data?.background_operations ?? []
   const parsedContent = item.detail?.parsed_content ?? null
   const captionSummary = createCaptionStageSummary(events)
   const ocrSummary = createOcrStageSummary(events, parsedContent)
@@ -633,6 +693,17 @@ function JobDetailsDialog({
                         {job.progress_message}
                       </div>
                     </InspectorSection>
+                    {backgroundOperations.length === 0 ? null : (
+                      <InspectorSection
+                        title={t("job.section.backgroundOperations")}
+                      >
+                        <BackgroundOperationTable
+                          formatDate={formatDate}
+                          operations={backgroundOperations}
+                          t={t}
+                        />
+                      </InspectorSection>
+                    )}
                     {readErrorSummary(job.error) === null ? null : (
                       <InspectorSection title={t("job.section.error")}>
                         <div className="text-sm text-muted-foreground">
@@ -741,6 +812,26 @@ function JobDetailsDialog({
                 label: t("job.section.artifacts"),
               },
               {
+                content: (
+                  <InspectorSection title={t("job.section.processingUnits")}>
+                    {processingUnitsQuery.isLoading ? (
+                      <LoadingState label={t("state.loading")} />
+                    ) : null}
+                    {processingUnitsQuery.isError ? (
+                      <ErrorAlert title={t("state.loadFailed")} />
+                    ) : null}
+                    {processingUnitsQuery.isSuccess ? (
+                      <DocumentProcessingUnitTable
+                        formatDate={formatDate}
+                        units={processingUnitsQuery.data.data}
+                      />
+                    ) : null}
+                  </InspectorSection>
+                ),
+                id: "processing",
+                label: t("job.section.processingUnits"),
+              },
+              {
                 content: <InspectorJson value={jobDetailQuery.data ?? job} />,
                 id: "data",
                 label: t("ide.rawData"),
@@ -750,6 +841,125 @@ function JobDetailsDialog({
         </div>
       </DialogContent>
     </Dialog>
+  )
+}
+
+function BackgroundOperationTable({
+  formatDate,
+  operations,
+  t,
+}: {
+  formatDate: (value: string) => string
+  operations: readonly BackgroundOperation[]
+  t: TFunction
+}) {
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>{t("job.backgroundOperation.kind")}</TableHead>
+          <TableHead>{t("job.backgroundOperation.stage")}</TableHead>
+          <TableHead>{t("job.backgroundOperation.status")}</TableHead>
+          <TableHead className="text-right">
+            {t("job.backgroundOperation.progress")}
+          </TableHead>
+          <TableHead className="text-right">
+            {t("job.backgroundOperation.failed")}
+          </TableHead>
+          <TableHead>{t("job.backgroundOperation.updated")}</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {operations.map((operation) => (
+          <TableRow key={operation.id}>
+            <TableCell className="font-medium">
+              {operation.operation_kind}
+            </TableCell>
+            <TableCell>{operation.stage}</TableCell>
+            <TableCell>
+              <Badge variant="outline">{operation.status}</Badge>
+            </TableCell>
+            <TableCell className="text-right">
+              {formatBackgroundOperationProgress(operation, t)}
+            </TableCell>
+            <TableCell className="text-right">
+              {operation.failed_count}
+            </TableCell>
+            <TableCell>
+              <time dateTime={operation.updated_at}>
+                {formatDate(operation.updated_at)}
+              </time>
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  )
+}
+
+function DocumentProcessingUnitTable({
+  formatDate,
+  units,
+}: {
+  formatDate: (value: string) => string
+  units: readonly DocumentProcessingUnit[]
+}) {
+  const { t } = useTranslation()
+
+  if (units.length === 0) {
+    return (
+      <div className="text-sm text-muted-foreground">
+        {t("job.processing.empty")}
+      </div>
+    )
+  }
+
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>{t("job.processing.unit")}</TableHead>
+          <TableHead>{t("job.processing.stage")}</TableHead>
+          <TableHead>{t("job.processing.status")}</TableHead>
+          <TableHead>{t("job.processing.updated")}</TableHead>
+          <TableHead>{t("job.processing.error")}</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {units.map((unit) => (
+          <TableRow key={unit.id}>
+            <TableCell className="align-top">
+              <div className="flex flex-col gap-1">
+                <span className="font-medium break-words">
+                  {unit.unit_type}
+                </span>
+                <span className="text-xs break-words text-muted-foreground">
+                  {unit.unit_key}
+                </span>
+              </div>
+            </TableCell>
+            <TableCell className="align-top">{unit.stage}</TableCell>
+            <TableCell className="align-top">
+              <Badge variant="outline">{unit.status}</Badge>
+            </TableCell>
+            <TableCell className="align-top">
+              <time dateTime={unit.updated_at}>
+                {formatDate(unit.updated_at)}
+              </time>
+            </TableCell>
+            <TableCell className="align-top">
+              {unit.safe_error === null ? (
+                <span className="text-muted-foreground">
+                  {t("source.notAvailable")}
+                </span>
+              ) : (
+                <InspectorJson value={unit.safe_error} />
+              )}
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
   )
 }
 
@@ -1144,6 +1354,22 @@ function mergeNumberArrays(
 
 function formatNullableNumber(value: number | null) {
   return value === null ? null : String(value)
+}
+
+function formatBackgroundOperationProgress(
+  operation: BackgroundOperation,
+  t: TFunction
+) {
+  if (operation.total_count === null) {
+    return t("job.backgroundOperation.processedOnly", {
+      processed: operation.processed_count,
+    })
+  }
+
+  return t("job.backgroundOperation.processedTotal", {
+    processed: operation.processed_count,
+    total: operation.total_count,
+  })
 }
 
 function getJobDisplayName(item: JobListItem, t: TFunction) {

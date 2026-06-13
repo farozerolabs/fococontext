@@ -31,13 +31,23 @@
 
 ## 字段说明
 
-| 字段                | 说明                                                                            |
-| ------------------- | ------------------------------------------------------------------------------- |
-| `page_type`         | `source`、`entity`、`concept`、`synthesis`、`comparison`、`query` 或 `system`。 |
-| `source_refs`       | 指向 text、OCR 或 image caption 证据的可追溯记录。                              |
-| `relation_type`     | `wikilink`、`shared_source`、`common_neighbor`、`type_affinity` 或 `manual`。   |
-| `visibility_origin` | 区分 canonical、上游继承和 fork-owned 记录。                                    |
-| `graph_insights`    | 社区、桥接点、孤立页面、稀疏区域、知识空白和意外连接。                          |
+| 字段                | 说明                                                                                            |
+| ------------------- | ----------------------------------------------------------------------------------------------- |
+| `page_type`         | `source`、`entity`、`concept`、`synthesis`、`comparison`、`query` 或 `system`。                 |
+| `source_refs`       | 指向 text、OCR 或 image caption 证据的可追溯记录。                                              |
+| `relation_type`     | `wikilink`、`shared_source`、`common_neighbor`、`type_affinity` 或 `manual`。                   |
+| `visibility_origin` | 区分 canonical、上游继承和 fork-owned 记录。                                                    |
+| `graph_insights`    | 社区、桥接点、孤立页面、稀疏区域、知识空白和意外连接。                                          |
+| `graph_readiness`   | 图谱相关 API 返回的物化图谱洞察状态。                                                           |
+| `warnings`          | 非致命图谱 warning code，例如 `graph.readiness.updating` 或 `graph.limit.edge_budget_reached`。 |
+
+## 图谱就绪状态
+
+Graph API 和 Retrieve 响应可以包含 `graph_readiness`，用于区分直接 Wiki 检索结果和物化图谱洞察是否就绪。状态值包括 `queued`、`updating`、`ready`、`failed`、`partial` 或 `stale`。
+
+`ready` 适合用于图谱洞察看板和重度依赖图谱的 Agent 展开。`queued` 或 `updating` 表示可以展示进度并稍后重试。`partial`、`stale` 或 `failed` 表示直接 Wiki 结果仍可使用，图谱洞察区域应标记为受限。非 ready 状态也会以 `graph.readiness.<state>` 形式进入请求级 warnings。
+
+大型知识库应通过列表 API 分页读取 Wiki 页面和系统页面，不要为了前端过滤一次性请求所有节点。当前视图用 graph endpoints，层层深入用 Retrieve Expand，运行压力用 runtime metrics 查看。
 
 ## OpenAPI
 

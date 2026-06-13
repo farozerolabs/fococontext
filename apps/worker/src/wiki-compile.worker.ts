@@ -10,6 +10,8 @@ export const wikiMergeJobName = "wiki.merge.page";
 
 export interface WikiAnalyzePayload {
   job_id: string;
+  tenant_id: string;
+  project_id: string;
   knowledge_base_id: string;
   document_id: string;
   parsed_content_id: string;
@@ -30,6 +32,8 @@ export interface DatasetConfigurationSnapshotPayload {
 
 export interface WikiGeneratePayload {
   job_id: string;
+  tenant_id: string;
+  project_id: string;
   knowledge_base_id: string;
   analysis_result_id: string;
   source_document_ids: readonly string[];
@@ -42,6 +46,8 @@ export interface WikiGeneratePayload {
 
 export interface WikiMergePayload {
   job_id: string;
+  tenant_id: string;
+  project_id: string;
   knowledge_base_id: string;
   wiki_draft_id: string;
   target_page_id: string | null;

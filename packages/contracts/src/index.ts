@@ -64,6 +64,7 @@ export const resourceIdPrefixes = {
   datasetConfiguration: "kbcfg_",
   datasetConfigurationSnapshot: "kbcfgs_",
   cleanupOperation: "cleanup_",
+  backgroundOperation: "bgop_",
 } as const;
 
 export const webhookEventTypes = [
@@ -187,6 +188,10 @@ export const apiErrorDefinitions = {
     httpStatus: 422,
     message: "Parser output empty.",
   },
+  parser_limit_exceeded: {
+    httpStatus: 413,
+    message: "Parser limit exceeded.",
+  },
   invalid_request: {
     httpStatus: 400,
     message: "Invalid request.",
@@ -222,6 +227,22 @@ export const apiErrorDefinitions = {
   retrieve_index_not_ready: {
     httpStatus: 409,
     message: "Retrieve index not ready.",
+  },
+  durable_backend_unavailable: {
+    httpStatus: 503,
+    message: "Durable backend unavailable.",
+  },
+  bounded_retrieval_unavailable: {
+    httpStatus: 503,
+    message: "Bounded retrieval backend unavailable.",
+  },
+  graph_index_unavailable: {
+    httpStatus: 503,
+    message: "Graph index unavailable.",
+  },
+  redis_metrics_degraded: {
+    httpStatus: 503,
+    message: "Redis metrics degraded.",
   },
   fork_target_invalid: {
     httpStatus: 400,
@@ -262,6 +283,22 @@ export const apiErrorDefinitions = {
   rate_limited: {
     httpStatus: 429,
     message: "Rate limited.",
+  },
+  admission_limited: {
+    httpStatus: 429,
+    message: "Admission limited.",
+  },
+  request_size_limit_exceeded: {
+    httpStatus: 413,
+    message: "Request size limit exceeded.",
+  },
+  retrieve_limit_exceeded: {
+    httpStatus: 413,
+    message: "Retrieve limit exceeded.",
+  },
+  export_limit_exceeded: {
+    httpStatus: 413,
+    message: "Export limit exceeded.",
   },
   internal_error: {
     httpStatus: 500,
@@ -443,6 +480,7 @@ export interface Pagination {
   page_size: number;
   total: number;
   has_more: boolean;
+  next_cursor?: string | null;
 }
 
 export interface SuccessEnvelope<TData> {
@@ -562,16 +600,21 @@ export function createListEnvelope<TItem>(
   data: readonly TItem[],
   input: ListEnvelopeInput,
 ): ListEnvelope<TItem> {
-  const { page, page_size, total, has_more, requestId } = input;
+  const { page, page_size, total, has_more, next_cursor, requestId } = input;
+  const pagination: Pagination = {
+    page,
+    page_size,
+    total,
+    has_more,
+  };
+
+  if (next_cursor !== undefined) {
+    pagination.next_cursor = next_cursor;
+  }
 
   return {
     data,
-    pagination: {
-      page,
-      page_size,
-      total,
-      has_more,
-    },
+    pagination,
     request_id: requestId,
   };
 }
@@ -646,10 +689,42 @@ function createLocalizedApiErrorPayload(
   }
 
   if (error.details !== undefined) {
-    payload.details = error.details;
+    payload.details = redactSensitiveDetails(error.details);
   }
 
   return payload;
+}
+
+const redactedValue = "[redacted]";
+const sensitiveDetailKeyPattern =
+  /(?:api[_-]?key|authorization|cookie|password|secret|session|token|credential|private[_-]?key)/iu;
+
+function redactSensitiveDetails(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (Array.isArray(value)) {
+    if (seen.has(value)) {
+      return "[circular]";
+    }
+
+    seen.add(value);
+    return value.map((item) => redactSensitiveDetails(item, seen));
+  }
+
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+
+  if (seen.has(value)) {
+    return "[circular]";
+  }
+
+  seen.add(value);
+
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+      key,
+      sensitiveDetailKeyPattern.test(key) ? redactedValue : redactSensitiveDetails(item, seen),
+    ]),
+  );
 }
 
 export function mapUnknownErrorToResponse(
@@ -766,6 +841,15 @@ const standardErrorResponses = {
   "409": {
     $ref: "#/components/responses/Conflict",
   },
+  "413": {
+    $ref: "#/components/responses/PayloadTooLarge",
+  },
+  "429": {
+    $ref: "#/components/responses/TooManyRequests",
+  },
+  "503": {
+    $ref: "#/components/responses/ServiceUnavailable",
+  },
   "500": {
     $ref: "#/components/responses/InternalServerError",
   },
@@ -774,6 +858,13 @@ const standardErrorResponses = {
 const paginationParameters = [
   { $ref: "#/components/parameters/Page" },
   { $ref: "#/components/parameters/PageSize" },
+] as const;
+
+const cursorPaginationParameters = [
+  { $ref: "#/components/parameters/Page" },
+  { $ref: "#/components/parameters/PageSize" },
+  { $ref: "#/components/parameters/Cursor" },
+  { $ref: "#/components/parameters/Limit" },
 ] as const;
 
 export const openApiComponents = {
@@ -830,6 +921,51 @@ export const openApiComponents = {
         type: "integer",
       },
     },
+    Cursor: {
+      name: "cursor",
+      in: "query",
+      required: false,
+      description: "Opaque cursor returned in `pagination.next_cursor` by cursor-enabled lists.",
+      schema: {
+        type: "string",
+      },
+    },
+    Limit: {
+      name: "limit",
+      in: "query",
+      required: false,
+      description:
+        "Cursor page size alias for cursor-enabled lists. When both `limit` and `page_size` are provided, `limit` is used.",
+      schema: {
+        default: 20,
+        maximum: 100,
+        minimum: 1,
+        type: "integer",
+      },
+    },
+    CleanupItemsPage: {
+      name: "items_page",
+      in: "query",
+      required: false,
+      description: "Page number for cleanup operation items. Values start at 1.",
+      schema: {
+        default: 1,
+        minimum: 1,
+        type: "integer",
+      },
+    },
+    CleanupItemsPageSize: {
+      name: "items_page_size",
+      in: "query",
+      required: false,
+      description: "Number of cleanup operation items to return per page.",
+      schema: {
+        default: 100,
+        maximum: 500,
+        minimum: 1,
+        type: "integer",
+      },
+    },
   },
   responses: {
     BadRequest: {
@@ -866,6 +1002,39 @@ export const openApiComponents = {
     Conflict: {
       description:
         "A scoped uniqueness constraint or idempotency boundary rejected the request. Duplicate natural keys use `resource_conflict` with structured `error.details`.",
+      content: {
+        "application/json": {
+          schema: {
+            $ref: "#/components/schemas/ErrorEnvelope",
+          },
+        },
+      },
+    },
+    PayloadTooLarge: {
+      description:
+        "The request, upload, retrieve response, source evidence response, parser output, or export exceeds a configured request or output limit.",
+      content: {
+        "application/json": {
+          schema: {
+            $ref: "#/components/schemas/ErrorEnvelope",
+          },
+        },
+      },
+    },
+    TooManyRequests: {
+      description:
+        "The caller exceeded a configured route, admission, queue, upload, retrieve, source evidence, or export limit. `error.details` may include safe retry metadata.",
+      content: {
+        "application/json": {
+          schema: {
+            $ref: "#/components/schemas/ErrorEnvelope",
+          },
+        },
+      },
+    },
+    ServiceUnavailable: {
+      description:
+        "A durable backend, queue or provider dependency is unavailable or over pressure. Use `request_id` and retry metadata for support correlation.",
       content: {
         "application/json": {
           schema: {
@@ -2031,6 +2200,108 @@ export const openApiComponents = {
         },
         caption_generated_at: {
           oneOf: [{ $ref: "#/components/schemas/Timestamp" }, { type: "null" }],
+        },
+      },
+      additionalProperties: true,
+    },
+    DocumentProcessingUnit: {
+      type: "object",
+      required: [
+        "id",
+        "source_document_id",
+        "job_id",
+        "stage",
+        "unit_type",
+        "unit_key",
+        "attempt_scope",
+        "status",
+        "locator",
+        "counters",
+        "warnings",
+        "metadata",
+        "retry_eligible",
+        "updated_at",
+      ],
+      properties: {
+        id: {
+          type: "string",
+          pattern: "^dpu_[a-zA-Z0-9]+$",
+        },
+        source_document_id: {
+          $ref: "#/components/schemas/SourceDocumentId",
+        },
+        job_id: {
+          $ref: "#/components/schemas/IngestJobId",
+        },
+        parsed_content_id: {
+          oneOf: [{ $ref: "#/components/schemas/ParsedContentId" }, { type: "null" }],
+        },
+        stage: {
+          type: "string",
+          enum: ["parsing", "ocr", "media_extraction", "captioning", "parsed_artifact"],
+        },
+        unit_type: {
+          type: "string",
+        },
+        unit_key: {
+          type: "string",
+        },
+        unit_index: {
+          type: ["integer", "null"],
+        },
+        attempt_scope: {
+          type: "string",
+        },
+        status: {
+          type: "string",
+          enum: ["pending", "running", "succeeded", "failed", "skipped", "canceled"],
+        },
+        content_hash: {
+          type: ["string", "null"],
+        },
+        dedupe_key: {
+          type: "string",
+        },
+        object_key: {
+          type: ["string", "null"],
+        },
+        object_refs: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: true,
+          },
+        },
+        locator: {
+          type: "object",
+          additionalProperties: true,
+        },
+        counters: {
+          type: "object",
+          additionalProperties: true,
+        },
+        warnings: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: true,
+          },
+        },
+        safe_error: {
+          oneOf: [{ type: "object", additionalProperties: true }, { type: "null" }],
+        },
+        metadata: {
+          type: "object",
+          additionalProperties: true,
+        },
+        retry_eligible: {
+          type: "boolean",
+        },
+        completed_at: {
+          oneOf: [{ $ref: "#/components/schemas/Timestamp" }, { type: "null" }],
+        },
+        updated_at: {
+          $ref: "#/components/schemas/Timestamp",
         },
       },
       additionalProperties: true,
@@ -3281,6 +3552,54 @@ export const openApiComponents = {
       additionalProperties: true,
       description: "Source Watch scan history and import preview record.",
     },
+    SourceWatchScanItem: {
+      type: "object",
+      additionalProperties: true,
+      description:
+        "Persisted Source Watch staging item for scan details and large-scan pagination.",
+      required: ["item_kind", "payload", "source_identity"],
+      properties: {
+        item_kind: {
+          type: "string",
+          enum: [
+            "discovered",
+            "skipped",
+            "new",
+            "changed",
+            "unchanged",
+            "delete_candidate",
+            "failed",
+          ],
+        },
+        source_identity: {
+          type: "string",
+        },
+        source_path: {
+          type: "string",
+        },
+        source_url: {
+          type: "string",
+        },
+        content_hash: {
+          type: "string",
+        },
+        comparison_status: {
+          type: "string",
+        },
+        cursor: {
+          type: "object",
+          additionalProperties: true,
+        },
+        payload: {
+          type: "object",
+          additionalProperties: true,
+        },
+        safe_error: {
+          type: ["object", "null"],
+          additionalProperties: true,
+        },
+      },
+    },
     GraphNode: {
       type: "object",
       required: ["page_id", "title", "type", "source_refs"],
@@ -3368,6 +3687,9 @@ export const openApiComponents = {
       properties: {
         knowledge_base_id: {
           $ref: "#/components/schemas/KnowledgeBaseId",
+        },
+        graph_readiness: {
+          $ref: "#/components/schemas/GraphInsightStatus",
         },
         nodes: {
           type: "array",
@@ -3774,6 +4096,9 @@ export const openApiComponents = {
             },
           },
           additionalProperties: false,
+        },
+        graph_readiness: {
+          $ref: "#/components/schemas/GraphInsightStatus",
         },
         results: {
           type: "array",
@@ -4593,6 +4918,17 @@ export const openApiComponents = {
         item_counts: {
           $ref: "#/components/schemas/CleanupItemCounts",
         },
+        items: {
+          type: "array",
+          description:
+            "Bounded cleanup item page returned by operation detail and retry responses. Cleanup operation list responses return summaries and item counts without this section.",
+          items: {
+            $ref: "#/components/schemas/CleanupItemSummary",
+          },
+        },
+        items_pagination: {
+          $ref: "#/components/schemas/CleanupItemPagination",
+        },
         settled_state: {
           $ref: "#/components/schemas/CleanupSettledState",
         },
@@ -4604,6 +4940,33 @@ export const openApiComponents = {
         },
       },
       additionalProperties: true,
+    },
+    CleanupItemPagination: {
+      type: "object",
+      required: ["page", "page_size", "total", "has_more"],
+      properties: {
+        page: {
+          type: "integer",
+          minimum: 1,
+        },
+        page_size: {
+          type: "integer",
+          minimum: 1,
+          maximum: 500,
+        },
+        total: {
+          type: "integer",
+          minimum: 0,
+        },
+        has_more: {
+          type: "boolean",
+        },
+        next_cursor: {
+          oneOf: [{ type: "string" }, { type: "null" }],
+          description: "Opaque cursor for the next page when cursor pagination is available.",
+        },
+      },
+      additionalProperties: false,
     },
     CleanupItemSummary: {
       type: "object",
@@ -4625,6 +4988,70 @@ export const openApiComponents = {
         },
         phase: {
           $ref: "#/components/schemas/CleanupPhase",
+        },
+      },
+      additionalProperties: true,
+    },
+    ChangeSet: {
+      type: "object",
+      required: [
+        "id",
+        "knowledge_base_id",
+        "status",
+        "trigger_type",
+        "title",
+        "description",
+        "metadata",
+        "created_at",
+      ],
+      properties: {
+        id: {
+          $ref: "#/components/schemas/ChangeSetId",
+        },
+        knowledge_base_id: {
+          $ref: "#/components/schemas/KnowledgeBaseId",
+        },
+        base_version_id: {
+          oneOf: [{ $ref: "#/components/schemas/KnowledgeVersionId" }, { type: "null" }],
+        },
+        target_version_id: {
+          oneOf: [{ $ref: "#/components/schemas/KnowledgeVersionId" }, { type: "null" }],
+        },
+        status: {
+          type: "string",
+        },
+        trigger_type: {
+          type: "string",
+        },
+        title: {
+          type: "string",
+        },
+        description: {
+          type: ["string", "null"],
+        },
+        diff: {
+          type: "object",
+          additionalProperties: true,
+        },
+        items: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: true,
+          },
+        },
+        metadata: {
+          type: "object",
+          additionalProperties: true,
+        },
+        created_at: {
+          $ref: "#/components/schemas/Timestamp",
+        },
+        applied_at: {
+          oneOf: [{ $ref: "#/components/schemas/Timestamp" }, { type: "null" }],
+        },
+        discarded_at: {
+          oneOf: [{ $ref: "#/components/schemas/Timestamp" }, { type: "null" }],
         },
       },
       additionalProperties: true,
@@ -4701,6 +5128,11 @@ export const openApiComponents = {
         has_more: {
           type: "boolean",
         },
+        next_cursor: {
+          oneOf: [{ type: "string" }, { type: "null" }],
+          description:
+            "Opaque cursor for the next page on cursor-enabled lists. Omitted or null when no next page is available.",
+        },
       },
     },
     ApiError: {
@@ -4772,7 +5204,7 @@ export const openApiComponents = {
   },
 } as const;
 
-export const openApiPaths = {
+const openApiPathDefinitions = {
   "/dataset-configuration-presets": {
     get: {
       summary: "List dataset configuration presets",
@@ -4924,7 +5356,7 @@ export const openApiPaths = {
     get: {
       summary: "List system pages",
       operationId: "listSystemPages",
-      parameters: paginationParameters,
+      parameters: cursorPaginationParameters,
       responses: {
         "200": listJsonResponse("System pages.", "#/components/schemas/SystemPage"),
       },
@@ -5216,6 +5648,76 @@ export const openApiPaths = {
       },
     },
   },
+  "/documents/{document_id}/processing-units": {
+    get: {
+      summary: "List source document processing units",
+      description:
+        "Returns paginated parser, OCR, media extraction, caption, and parsed artifact processing details for diagnostics and Admin progress views.",
+      operationId: "listSourceDocumentProcessingUnits",
+      parameters: [
+        {
+          name: "document_id",
+          in: "path",
+          required: true,
+          schema: {
+            $ref: "#/components/schemas/SourceDocumentId",
+          },
+        },
+        {
+          name: "job_id",
+          in: "query",
+          required: false,
+          schema: {
+            $ref: "#/components/schemas/IngestJobId",
+          },
+        },
+        {
+          name: "stage",
+          in: "query",
+          required: false,
+          schema: {
+            type: "string",
+            enum: ["parsing", "ocr", "media_extraction", "captioning", "parsed_artifact"],
+          },
+        },
+        {
+          name: "status",
+          in: "query",
+          required: false,
+          schema: {
+            type: "string",
+            enum: ["pending", "running", "succeeded", "failed", "skipped", "canceled"],
+          },
+        },
+        {
+          name: "page",
+          in: "query",
+          required: false,
+          schema: {
+            type: "integer",
+            minimum: 1,
+          },
+        },
+        {
+          name: "page_size",
+          in: "query",
+          required: false,
+          schema: {
+            type: "integer",
+            minimum: 1,
+            maximum: 100,
+          },
+        },
+      ],
+      responses: {
+        "200": listJsonResponse(
+          "Source document processing units.",
+          "#/components/schemas/DocumentProcessingUnit",
+        ),
+        ...standardErrorResponses,
+      },
+    },
+  },
   "/documents/{document_id}/media-assets": {
     get: {
       summary: "List source document media assets",
@@ -5346,7 +5848,7 @@ export const openApiPaths = {
     get: {
       summary: "List deletion cleanup operations",
       description:
-        "Returns asynchronous cleanup operations for visible deletion, object cleanup, database cleanup, and retry status.",
+        "Returns asynchronous cleanup operation summaries for visible deletion, object cleanup, database cleanup, and retry status. Operation items are loaded through the detail endpoint with item pagination.",
       operationId: "listCleanupOperations",
       parameters: paginationParameters,
       responses: {
@@ -5362,8 +5864,12 @@ export const openApiPaths = {
     get: {
       summary: "Get deletion cleanup operation",
       description:
-        "Returns cleanup phase, item counts, retry eligibility, and safe error summaries without provider secrets.",
+        "Returns cleanup phase, item counts, a bounded cleanup item page, retry eligibility, and safe error summaries without provider secrets.",
       operationId: "getCleanupOperation",
+      parameters: [
+        { $ref: "#/components/parameters/CleanupItemsPage" },
+        { $ref: "#/components/parameters/CleanupItemsPageSize" },
+      ],
       responses: {
         "200": jsonResponse("Deletion cleanup operation.", "#/components/schemas/CleanupOperation"),
         ...standardErrorResponses,
@@ -5373,8 +5879,13 @@ export const openApiPaths = {
   "/cleanup-operations/{cleanup_operation_id}/retry": {
     post: {
       summary: "Retry deletion cleanup operation",
-      description: "Queues retry work for retryable failed or pending cleanup items.",
+      description:
+        "Queues retry work for retryable failed or pending cleanup items and returns the operation with a bounded cleanup item page.",
       operationId: "retryCleanupOperation",
+      parameters: [
+        { $ref: "#/components/parameters/CleanupItemsPage" },
+        { $ref: "#/components/parameters/CleanupItemsPageSize" },
+      ],
       responses: {
         "200": jsonResponse(
           "Deletion cleanup retry accepted.",
@@ -5419,6 +5930,37 @@ export const openApiPaths = {
       operationId: "createBatchImport",
       responses: {
         "202": standardJsonResponse,
+      },
+    },
+  },
+  "/knowledge-bases/{knowledge_base_id}/imports/{import_job_id}": {
+    get: {
+      summary: "Get batch import status",
+      description:
+        "Returns durable batch import aggregate status and paginated item states for retry and progress polling.",
+      operationId: "getBatchImportStatus",
+      parameters: [
+        {
+          name: "knowledge_base_id",
+          in: "path",
+          required: true,
+          schema: {
+            $ref: "#/components/schemas/KnowledgeBaseId",
+          },
+        },
+        {
+          name: "import_job_id",
+          in: "path",
+          required: true,
+          schema: {
+            $ref: "#/components/schemas/JobId",
+          },
+        },
+        ...paginationParameters,
+      ],
+      responses: {
+        "200": standardJsonResponse,
+        ...standardErrorResponses,
       },
     },
   },
@@ -5657,11 +6199,23 @@ export const openApiPaths = {
       },
     },
   },
+  "/knowledge-bases/{knowledge_base_id}/graph/insights/refresh": {
+    post: {
+      summary: "Refresh graph insights",
+      description:
+        "Queues graph insight recomputation for the current Knowledge Base version and returns the durable hidden ingest job. Poll the graph insights endpoint for refresh status.",
+      operationId: "refreshGraphInsights",
+      responses: {
+        "202": jsonResponse("Graph insight refresh queued.", "#/components/schemas/IngestJob"),
+        ...standardErrorResponses,
+      },
+    },
+  },
   "/knowledge-bases/{knowledge_base_id}/pages": {
     get: {
       summary: "List wiki pages",
       operationId: "listWikiPages",
-      parameters: paginationParameters,
+      parameters: cursorPaginationParameters,
       responses: {
         "200": listJsonResponse("Wiki pages.", "#/components/schemas/WikiPage"),
       },
@@ -5697,7 +6251,7 @@ export const openApiPaths = {
     get: {
       summary: "List wiki page versions",
       operationId: "listWikiPageVersions",
-      parameters: paginationParameters,
+      parameters: cursorPaginationParameters,
       responses: {
         "200": listJsonResponse("Wiki page versions.", "#/components/schemas/WikiPageVersion"),
       },
@@ -5707,7 +6261,7 @@ export const openApiPaths = {
     get: {
       summary: "List knowledge base page versions",
       operationId: "listKnowledgeBasePageVersions",
-      parameters: paginationParameters,
+      parameters: cursorPaginationParameters,
       responses: {
         "200": listJsonResponse(
           "Knowledge Base-scoped wiki page versions.",
@@ -5798,6 +6352,42 @@ export const openApiPaths = {
       },
     },
   },
+  "/scheduled-import-jobs/{scheduled_import_job_id}/items": {
+    get: {
+      summary: "List scheduled import job scan items",
+      description:
+        "Returns persisted Source Watch scan staging items with pagination for large discovery and comparison runs.",
+      operationId: "listScheduledImportJobScanItems",
+      parameters: [
+        ...paginationParameters,
+        {
+          name: "item_kind",
+          in: "query",
+          required: false,
+          description: "Optional Source Watch staging item kind filter.",
+          schema: {
+            type: "string",
+            enum: [
+              "discovered",
+              "skipped",
+              "new",
+              "changed",
+              "unchanged",
+              "delete_candidate",
+              "failed",
+            ],
+          },
+        },
+      ],
+      responses: {
+        "200": listJsonResponse(
+          "Source Watch scan staging items.",
+          "#/components/schemas/SourceWatchScanItem",
+        ),
+        ...standardErrorResponses,
+      },
+    },
+  },
   "/knowledge-bases/{knowledge_base_id}/knowledge-checks": {
     post: {
       summary: "Create a knowledge check",
@@ -5826,11 +6416,27 @@ export const openApiPaths = {
       },
     },
   },
+  "/knowledge-checks/{check_id}/findings": {
+    get: {
+      summary: "List knowledge check findings",
+      description:
+        "Returns persisted Knowledge Check findings through stable pagination while the Knowledge Check detail response keeps a bounded preview.",
+      operationId: "listKnowledgeCheckFindings",
+      parameters: paginationParameters,
+      responses: {
+        "200": listJsonResponse(
+          "Knowledge Check findings.",
+          "#/components/schemas/KnowledgeCheckFinding",
+        ),
+        ...standardErrorResponses,
+      },
+    },
+  },
   "/knowledge-bases/{knowledge_base_id}/versions": {
     get: {
       summary: "List knowledge base versions",
       operationId: "listKnowledgeBaseVersions",
-      parameters: paginationParameters,
+      parameters: cursorPaginationParameters,
       responses: {
         "200": listJsonResponse(
           "Knowledge Base versions.",
@@ -5839,12 +6445,25 @@ export const openApiPaths = {
       },
     },
   },
+  "/knowledge-bases/{knowledge_base_id}/change-sets": {
+    get: {
+      summary: "List knowledge base change sets",
+      description:
+        "Returns Knowledge Base-scoped Change Set summaries with stable ordering and standard pagination. Use the Change Set detail endpoint for full diff and item payloads.",
+      operationId: "listKnowledgeBaseChangeSets",
+      parameters: cursorPaginationParameters,
+      responses: {
+        "200": listJsonResponse("Knowledge Base Change Sets.", "#/components/schemas/ChangeSet"),
+        ...standardErrorResponses,
+      },
+    },
+  },
   "/change-sets/{change_set_id}": {
     get: {
       summary: "Get a change set",
       operationId: "getChangeSet",
       responses: {
-        "200": standardJsonResponse,
+        "200": jsonResponse("Change Set detail.", "#/components/schemas/ChangeSet"),
       },
     },
   },
@@ -5978,6 +6597,40 @@ export const openApiPaths = {
   },
 } as const;
 
+type OpenApiHttpMethod = "delete" | "get" | "patch" | "post" | "put";
+
+export interface OpenApiSecurityMetadata {
+  auditClass: string;
+  authMode: "bearer_api_key";
+  permission: string;
+  rateLimitClass: string;
+  redactionClass: string;
+  tier: "developer-api";
+}
+
+type OpenApiOperationLike = {
+  operationId: string;
+  [key: string]: unknown;
+};
+
+type OpenApiPathDefinitions = Record<
+  string,
+  Partial<Record<OpenApiHttpMethod, OpenApiOperationLike>>
+>;
+
+type SecuredOpenApiPaths<T extends OpenApiPathDefinitions> = {
+  readonly [Path in keyof T]: {
+    readonly [Method in keyof T[Path]]: T[Path][Method] extends OpenApiOperationLike
+      ? T[Path][Method] & {
+          readonly security: readonly [{ readonly bearerAuth: readonly [] }];
+          readonly "x-fococontext-security": OpenApiSecurityMetadata;
+        }
+      : T[Path][Method];
+  };
+};
+
+export const openApiPaths = withOpenApiSecurityMetadata(openApiPathDefinitions);
+
 export const openApiDocument = {
   openapi: "3.1.0",
   info: {
@@ -6025,3 +6678,125 @@ export const openApiDocument = {
     },
   ],
 } as const;
+
+function withOpenApiSecurityMetadata<T extends OpenApiPathDefinitions>(
+  paths: T,
+): SecuredOpenApiPaths<T> {
+  const securedEntries = Object.entries(paths).map(([path, pathItem]) => [
+    path,
+    Object.fromEntries(
+      Object.entries(pathItem).map(([method, operation]) => {
+        if (operation === undefined) {
+          return [method, operation];
+        }
+
+        const normalizedMethod = method as OpenApiHttpMethod;
+        const security = classifyOpenApiOperation(normalizedMethod, path);
+
+        return [
+          method,
+          {
+            ...operation,
+            security: [{ bearerAuth: [] }],
+            "x-fococontext-security": security,
+          },
+        ];
+      }),
+    ),
+  ]);
+
+  return Object.fromEntries(securedEntries) as SecuredOpenApiPaths<T>;
+}
+
+function classifyOpenApiOperation(
+  method: OpenApiHttpMethod,
+  path: string,
+): OpenApiSecurityMetadata {
+  const access = method === "get" ? "read" : "write";
+
+  if (path === "/dataset-configuration-presets") {
+    return developerApiSecurity("dataset_configuration:read", "standard_read", "standard", "read");
+  }
+  if (path === "/api-keys") {
+    return developerApiSecurity("api_keys:write", "admin_mutation", "secret_masked", "security");
+  }
+  if (path.includes("/retrieve")) {
+    return developerApiSecurity("retrieve:read", "retrieve", "source_evidence", "read");
+  }
+  if (path.startsWith("/source-evidence")) {
+    return developerApiSecurity("documents:read", "source_evidence", "source_evidence", "read");
+  }
+  if (path.includes("/upload-sessions")) {
+    return developerApiSecurity("documents:write", "upload_session", "storage_scoped", "write");
+  }
+  if (path.startsWith("/documents") || path.includes("/documents")) {
+    return developerApiSecurity(`documents:${access}`, "document", "source_scoped", access);
+  }
+  if (path.startsWith("/media-assets")) {
+    return developerApiSecurity(`documents:${access}`, "media_preview", "source_scoped", access);
+  }
+  if (path.startsWith("/jobs") || path.includes("/jobs")) {
+    return developerApiSecurity(
+      path === "/jobs/batch" ? "jobs:read" : method === "post" ? "jobs:write" : "jobs:read",
+      "job",
+      "standard",
+      access,
+    );
+  }
+  if (path.includes("/graph")) {
+    return developerApiSecurity("graph:read", "graph", "standard", "read");
+  }
+  if (path.includes("/source-watch-rules") || path.includes("/scheduled-import-jobs")) {
+    return developerApiSecurity(`source_watch:${access}`, "source_watch", "source_scoped", access);
+  }
+  if (path.startsWith("/webhooks")) {
+    return developerApiSecurity(`webhooks:${access}`, "webhook", "secret_masked", access);
+  }
+  if (path.startsWith("/cleanup-operations")) {
+    return developerApiSecurity(`cleanup:${access}`, "cleanup", "source_scoped", access);
+  }
+  if (path.includes("/imports")) {
+    return developerApiSecurity(`imports:${access}`, "import", "source_scoped", access);
+  }
+  if (path.includes("/knowledge-checks")) {
+    return developerApiSecurity(
+      `knowledge_checks:${access}`,
+      "knowledge_check",
+      "standard",
+      access,
+    );
+  }
+  if (
+    path.includes("/wiki-drafts") ||
+    path.includes("/pages") ||
+    path.includes("/versions") ||
+    path.includes("/change-sets") ||
+    path.includes("/rollback")
+  ) {
+    return developerApiSecurity(`wiki:${access}`, "wiki", "source_scoped", access);
+  }
+  if (path.startsWith("/forks") || path.includes("/forks")) {
+    return developerApiSecurity(`forks:${access}`, "fork", "standard", access);
+  }
+  if (path.startsWith("/knowledge-bases")) {
+    return developerApiSecurity(`knowledge_bases:${access}`, "knowledge_base", "standard", access);
+  }
+
+  throw new Error(`Unclassified OpenAPI route security metadata: ${method.toUpperCase()} ${path}`);
+}
+
+function developerApiSecurity(
+  permission: string,
+  rateLimitClass: string,
+  redactionClass: string,
+  auditClass: string,
+): OpenApiSecurityMetadata {
+  return {
+    auditClass,
+    authMode: "bearer_api_key",
+    permission,
+    rateLimitClass,
+    redactionClass,
+    tier: "developer-api",
+  };
+}

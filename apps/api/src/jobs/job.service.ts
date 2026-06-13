@@ -3,40 +3,52 @@ import { ApiError, createResourceId, normalizeJobTimelineEvents } from "@fococon
 
 import { apiDatabaseMirrorToken, type ApiDatabaseMirror } from "../database/api-database-mirror.js";
 import {
-  apiDatabaseHydratorToken,
-  type ApiDatabaseHydrator,
-} from "../database/api-database-hydrator.js";
-import type { ApiResourceScope } from "../auth/api-key.guard.js";
-import { DocumentRepository } from "../documents/document.repository.js";
-import { KnowledgeBaseService } from "../knowledge-bases/knowledge-base.service.js";
+  operationalReadStoreToken,
+  type OperationalReadStore,
+} from "../database/operational-read-store.js";
+import { defaultApiResourceScope, type ApiResourceScope } from "../auth/api-key.guard.js";
 import { toJobResponse } from "../documents/document.service.js";
 import {
+  type DatasetConfigurationSnapshotPayload,
   sourceParseQueueToken,
   type SourceParseQueue,
   type SourceParseQueueJobSnapshot,
 } from "../queues/source-parse.queue.js";
 import { WebhookService } from "../webhooks/webhook.service.js";
-import { isHiddenFromKnowledgeBaseJobList } from "./job-visibility.js";
 import type {
   BatchIngestJobStatusInput,
   BatchIngestJobStatusResponse,
   BatchIngestJobStatusResultResponse,
+  BackgroundOperationRecord,
+  BackgroundOperationResponse,
   JobDetailResponse,
   JobEventRecord,
   JobEventResponse,
   JobRecord,
-  JobStage,
   KnowledgeBaseIngestProgressResponse,
+  SourceDocumentRecord,
 } from "../documents/document.types.js";
+
+type ResolvedBatchJobStatusResult =
+  | {
+      index: number;
+      job_id: string;
+      status: "resolved";
+      job: JobRecord;
+    }
+  | {
+      index: number;
+      job_id: string;
+      status: "error";
+      error: NonNullable<BatchIngestJobStatusResultResponse["error"]>;
+    };
 
 @Injectable()
 export class JobService {
   constructor(
-    private readonly repository: DocumentRepository,
-    private readonly knowledgeBaseService: KnowledgeBaseService,
     @Inject(sourceParseQueueToken) private readonly sourceParseQueue: SourceParseQueue,
     @Inject(apiDatabaseMirrorToken) private readonly databaseMirror: ApiDatabaseMirror,
-    @Inject(apiDatabaseHydratorToken) private readonly databaseHydrator: ApiDatabaseHydrator,
+    @Inject(operationalReadStoreToken) private readonly operationalReadStore: OperationalReadStore,
     private readonly webhookService: WebhookService,
   ) {}
 
@@ -51,38 +63,57 @@ export class JobService {
     total: number;
     hasMore: boolean;
   }> {
-    await this.databaseHydrator.refresh();
-    this.assertReadableKnowledgeBase(
+    await this.assertReadableKnowledgeBase(
       knowledgeBaseId,
       scope,
       () => new ApiError("knowledge_base_not_found"),
     );
-    const jobs = (
-      await Promise.all(
-        this.repository
-          .listJobs(knowledgeBaseId)
-          .filter((job) => !isHiddenFromKnowledgeBaseJobList(job))
-          .map((job) => this.reconcileSourceParseState(job)),
-      )
-    ).sort((left, right) =>
-      compareUpdatedAtDesc(left.updatedAt, left.id, right.updatedAt, right.id),
-    );
-    const start = (input.page - 1) * input.pageSize;
-    const end = start + input.pageSize;
+    try {
+      const dbResult = await this.operationalReadStore.listJobs({
+        knowledgeBaseId,
+        page: input.page,
+        pageSize: input.pageSize,
+      });
 
-    return {
-      items: jobs.slice(start, end).map((job) => this.toJobDetailResponse(job)),
-      page: input.page,
-      pageSize: input.pageSize,
-      total: jobs.length,
-      hasMore: end < jobs.length,
-    };
+      if (dbResult !== null) {
+        const jobs = await Promise.all(
+          dbResult.items.map((job) => this.reconcileSourceParseState(job)),
+        );
+        const eventsByJobId = await this.operationalReadStore.listJobEventsByJobIds(
+          jobs.map((job) => job.id),
+        );
+        const operationsByJobId = await this.operationalReadStore.listBackgroundOperationsByJobIds(
+          jobs.map((job) => job.id),
+        );
+
+        return {
+          items: jobs.map((job) =>
+            this.toJobDetailResponse(
+              job,
+              eventsByJobId.get(job.id) ?? [],
+              operationsByJobId.get(job.id) ?? [],
+            ),
+          ),
+          page: input.page,
+          pageSize: input.pageSize,
+          total: dbResult.total,
+          hasMore: dbResult.hasMore,
+        };
+      }
+    } catch (error) {
+      throw toOperationalListError(error);
+    }
+
+    throw new ApiError("internal_error");
   }
 
   async get(jobId: string, scope?: ApiResourceScope): Promise<JobDetailResponse> {
-    await this.databaseHydrator.refresh();
+    const job = await this.reconcileSourceParseState(await this.requireJob(jobId, scope));
+
     return this.toJobDetailResponse(
-      await this.reconcileSourceParseState(this.requireJob(jobId, scope)),
+      job,
+      await this.getJobEvents(job.id),
+      await this.getBackgroundOperations(job.id),
     );
   }
 
@@ -90,7 +121,6 @@ export class JobService {
     input: BatchIngestJobStatusInput,
     scope?: ApiResourceScope,
   ): Promise<BatchIngestJobStatusResponse> {
-    await this.databaseHydrator.refresh();
     const jobIds = readBatchJobIds(input);
 
     if (jobIds.length > batchJobStatusMaxItems) {
@@ -103,16 +133,19 @@ export class JobService {
       });
     }
 
-    const items = await Promise.all(
-      jobIds.map(async (jobId, index): Promise<BatchIngestJobStatusResultResponse> => {
+    const jobsById = await this.operationalReadStore.listJobsByIds(jobIds);
+    const resolved = await Promise.all(
+      jobIds.map(async (jobId, index): Promise<ResolvedBatchJobStatusResult> => {
         try {
-          const job = await this.reconcileSourceParseState(this.requireJob(jobId, scope));
+          const job = await this.reconcileSourceParseState(
+            await this.requireLoadedJob(jobId, jobsById.get(jobId), scope),
+          );
 
           return {
             index,
             job_id: jobId,
             status: "resolved",
-            job: this.toJobDetailResponse(job),
+            job,
           };
         } catch (error) {
           if (error instanceof ApiError && error.code === "job_not_found") {
@@ -134,6 +167,28 @@ export class JobService {
         }
       }),
     );
+    const eventsByJobId = await this.operationalReadStore.listJobEventsByJobIds(
+      resolved.flatMap((item) => (item.status === "resolved" ? [item.job.id] : [])),
+    );
+    const operationsByJobId = await this.operationalReadStore.listBackgroundOperationsByJobIds(
+      resolved.flatMap((item) => (item.status === "resolved" ? [item.job.id] : [])),
+    );
+    const items = resolved.map((item): BatchIngestJobStatusResultResponse => {
+      if (item.status === "error") {
+        return item;
+      }
+
+      return {
+        index: item.index,
+        job_id: item.job_id,
+        status: "resolved",
+        job: this.toJobDetailResponse(
+          item.job,
+          eventsByJobId.get(item.job.id) ?? [],
+          operationsByJobId.get(item.job.id) ?? [],
+        ),
+      };
+    });
 
     return {
       items,
@@ -147,94 +202,85 @@ export class JobService {
     knowledgeBaseId: string,
     scope?: ApiResourceScope,
   ): Promise<KnowledgeBaseIngestProgressResponse> {
-    await this.databaseHydrator.refresh();
-    this.assertReadableKnowledgeBase(
+    await this.assertReadableKnowledgeBase(
       knowledgeBaseId,
       scope,
       () => new ApiError("knowledge_base_not_found"),
     );
-    const jobs = (
-      await Promise.all(
-        this.repository
-          .listJobs(knowledgeBaseId)
-          .filter((job) => !isHiddenFromKnowledgeBaseJobList(job))
-          .map((job) => this.reconcileSourceParseState(job)),
-      )
-    ).sort((left, right) =>
-      compareUpdatedAtDesc(left.updatedAt, left.id, right.updatedAt, right.id),
-    );
-    const counts = {
-      total: jobs.length,
-      queued: 0,
-      running: 0,
-      completed: 0,
-      failed: 0,
-      canceled: 0,
-    };
-    const stageCounts = createEmptyStageCounts();
-    let progressSum = 0;
+    try {
+      const dbProgress = await this.operationalReadStore.getKnowledgeBaseIngestProgress(
+        knowledgeBaseId,
+        ingestProgressRepresentativeJobLimit,
+      );
 
-    for (const job of jobs) {
-      counts[job.status] += 1;
-      stageCounts[job.stage] += 1;
-      progressSum += toJobResponse(job).progress;
+      if (dbProgress !== null) {
+        const jobs = await Promise.all(
+          dbProgress.representativeJobs.map((job) => this.reconcileSourceParseState(job)),
+        );
+        const eventsByJobId = await this.operationalReadStore.listJobEventsByJobIds(
+          jobs.map((job) => job.id),
+        );
+
+        return {
+          knowledge_base_id: knowledgeBaseId,
+          overall_progress: dbProgress.overallProgress,
+          retrieve_ready: dbProgress.counts.running === 0 && dbProgress.counts.queued === 0,
+          latest_job_created_at: dbProgress.latestJobCreatedAt,
+          latest_job_updated_at: dbProgress.latestJobUpdatedAt,
+          counts: {
+            total:
+              dbProgress.counts.queued +
+              dbProgress.counts.running +
+              dbProgress.counts.completed +
+              dbProgress.counts.failed +
+              dbProgress.counts.canceled,
+            queued: dbProgress.counts.queued,
+            running: dbProgress.counts.running,
+            completed: dbProgress.counts.completed,
+            failed: dbProgress.counts.failed,
+            canceled: dbProgress.counts.canceled,
+          },
+          stage_counts: dbProgress.stageCounts,
+          jobs: jobs.map((job) => this.toJobDetailResponse(job, eventsByJobId.get(job.id) ?? [])),
+          links: createIngestProgressLinks(knowledgeBaseId),
+        };
+      }
+    } catch (error) {
+      throw toOperationalListError(error);
     }
 
-    const latestJob = jobs[0];
-    const latestCreatedJob = [...jobs].sort((left, right) =>
-      compareUpdatedAtDesc(left.createdAt, left.id, right.createdAt, right.id),
-    )[0];
-
-    return {
-      knowledge_base_id: knowledgeBaseId,
-      overall_progress:
-        jobs.length === 0 ? 100 : Math.min(100, Math.max(0, Math.round(progressSum / jobs.length))),
-      retrieve_ready: jobs.length === 0 || (counts.running === 0 && counts.queued === 0),
-      latest_job_created_at: latestCreatedJob?.createdAt ?? null,
-      latest_job_updated_at: latestJob?.updatedAt ?? null,
-      counts,
-      stage_counts: stageCounts,
-      jobs: jobs
-        .slice(0, ingestProgressRepresentativeJobLimit)
-        .map((job) => this.toJobDetailResponse(job)),
-      links: [
-        {
-          rel: "knowledge_base_jobs",
-          method: "GET",
-          href: `/v1/knowledge-bases/${knowledgeBaseId}/jobs`,
-          resource_type: "job_list",
-        },
-        {
-          rel: "retrieve_readiness",
-          method: "GET",
-          href: `/v1/knowledge-bases/${knowledgeBaseId}/ingest-progress`,
-          resource_type: "retrieve_readiness",
-        },
-      ],
-    };
+    throw new ApiError("internal_error");
   }
 
   async cancel(jobId: string, scope?: ApiResourceScope): Promise<JobDetailResponse> {
-    await this.databaseHydrator.refresh();
-    const job = this.requireJob(jobId, scope);
+    const job = await this.requireJob(jobId, scope);
 
     if (job.status === "canceled") {
-      return this.toJobDetailResponse(job);
+      return this.toJobDetailResponse(
+        job,
+        await this.getJobEvents(job.id),
+        await this.getBackgroundOperations(job.id),
+      );
     }
     if (job.status === "completed") {
       throw new ApiError("invalid_request", {
         messageKey: "api.validation.completed_job_cancel",
       });
     }
+    if (job.status === "failed") {
+      throw new ApiError("invalid_request", {
+        messageKey: "api.validation.terminal_job_cancel",
+      });
+    }
 
     const now = new Date().toISOString();
-    const updated = this.repository.updateJob({
+    const updated: JobRecord = {
       ...job,
       status: "canceled",
       progressMessage: "Canceled before parsing completed.",
       updatedAt: now,
-    });
-    const event = this.repository.appendJobEvent({
+    };
+    const event: JobEventRecord = {
       jobId: updated.id,
       type: "job.canceled",
       stage: updated.stage,
@@ -242,25 +288,54 @@ export class JobService {
       message: updated.progressMessage,
       metadata: {},
       createdAt: now,
-    });
+    };
     await this.databaseMirror.updateJob(updated);
     await this.databaseMirror.appendJobEvent(event);
 
-    return this.toJobDetailResponse(updated);
+    return this.toJobDetailResponse(
+      updated,
+      await this.getJobEvents(updated.id),
+      await this.getBackgroundOperations(updated.id),
+    );
   }
 
   async retry(jobId: string, scope?: ApiResourceScope): Promise<JobDetailResponse> {
-    await this.databaseHydrator.refresh();
-    const original = this.requireJob(jobId, scope);
+    const original = await this.requireJob(jobId, scope);
 
-    if (original.status === "running") {
+    if (original.status === "queued" || original.status === "running") {
       throw new ApiError("invalid_request", {
         messageKey: "api.validation.running_job_retry",
       });
     }
+    if (original.status === "completed") {
+      throw new ApiError("invalid_request", {
+        messageKey: "api.validation.completed_job_retry",
+      });
+    }
+    if (original.status === "failed" && original.error?.retryable === false) {
+      throw new ApiError("invalid_request", {
+        messageKey: "api.validation.non_retryable_job_retry",
+      });
+    }
+    if (original.documentId === null) {
+      throw new ApiError("invalid_request", {
+        messageKey: "api.validation.job_retry_document_required",
+      });
+    }
+
+    const document = await this.requireRetryDocument(original.documentId, original, scope);
+    const datasetConfiguration =
+      await this.operationalReadStore.getDatasetConfigurationByKnowledgeBaseId(
+        scope ?? defaultApiResourceScope,
+        original.knowledgeBaseId,
+      );
+
+    if (datasetConfiguration === null) {
+      throw new ApiError("internal_error");
+    }
 
     const now = new Date().toISOString();
-    const retried = this.repository.createJob({
+    const retried: JobRecord = {
       ...original,
       id: createResourceId("ingestJob"),
       stage: "parsing",
@@ -273,7 +348,7 @@ export class JobService {
       error: null,
       createdAt: now,
       updatedAt: now,
-    });
+    };
     await this.databaseMirror.saveJob(retried);
     await this.databaseMirror.appendJobEvent({
       jobId: retried.id,
@@ -284,17 +359,84 @@ export class JobService {
       metadata: {},
       createdAt: retried.createdAt,
     });
+    const queueScope = scope ?? defaultApiResourceScope;
+    await this.sourceParseQueue.enqueueSourceParseJob({
+      job_id: retried.id,
+      tenant_id: queueScope.tenantId,
+      project_id: queueScope.projectId,
+      knowledge_base_id: retried.knowledgeBaseId,
+      document_id: document.id,
+      content_hash: retried.contentHash,
+      object_key: document.objectKey,
+      mime_type: document.mimeType,
+      source_type: document.sourceType,
+      input_snapshot_id: retried.inputSnapshotId,
+      dataset_configuration_snapshot: toDatasetConfigurationSnapshotPayload(datasetConfiguration),
+      ocr_policy: datasetConfiguration.values.ocr_policy,
+    });
+    await this.webhookService.emit({
+      eventType: "document.ingest.started",
+      knowledgeBaseId: retried.knowledgeBaseId,
+      payload: {
+        document_id: document.id,
+        job_id: retried.id,
+        retry_of_job_id: original.id,
+        source_type: document.sourceType,
+      },
+      requestTrace: {
+        event_source: "job.retry",
+      },
+      ...(scope === undefined ? {} : { scope }),
+    });
 
-    return this.toJobDetailResponse(retried);
+    return this.toJobDetailResponse(
+      retried,
+      await this.getJobEvents(retried.id),
+      await this.getBackgroundOperations(retried.id),
+    );
   }
 
-  private requireJob(jobId: string, scope?: ApiResourceScope): JobRecord {
-    const job = this.repository.findJobById(jobId);
+  private async requireRetryDocument(
+    documentId: string,
+    job: JobRecord,
+    scope?: ApiResourceScope,
+  ): Promise<SourceDocumentRecord> {
+    const document = await this.operationalReadStore.getSourceDocumentById(documentId);
 
-    if (job === undefined) {
+    if (
+      document === null ||
+      document.knowledgeBaseId !== job.knowledgeBaseId ||
+      document.status === "deleted"
+    ) {
+      throw new ApiError("document_not_found");
+    }
+
+    await this.assertReadableKnowledgeBase(
+      document.knowledgeBaseId,
+      scope,
+      () => new ApiError("knowledge_base_not_found"),
+    );
+
+    return document;
+  }
+
+  private async requireJob(jobId: string, scope?: ApiResourceScope): Promise<JobRecord> {
+    try {
+      return this.requireLoadedJob(jobId, await this.operationalReadStore.getJobById(jobId), scope);
+    } catch (error) {
+      throw toOperationalListError(error);
+    }
+  }
+
+  private async requireLoadedJob(
+    jobId: string,
+    job: JobRecord | null | undefined,
+    scope?: ApiResourceScope,
+  ): Promise<JobRecord> {
+    if (job === null || job === undefined) {
       throw new ApiError("job_not_found");
     }
-    this.assertReadableKnowledgeBase(
+    await this.assertReadableKnowledgeBase(
       job.knowledgeBaseId,
       scope,
       () => new ApiError("job_not_found"),
@@ -303,23 +445,19 @@ export class JobService {
     return job;
   }
 
-  private assertReadableKnowledgeBase(
+  private async assertReadableKnowledgeBase(
     knowledgeBaseId: string,
     scope: ApiResourceScope | undefined,
     notFoundFactory: () => ApiError,
-  ): void {
-    if (scope === undefined) {
-      return;
-    }
+  ): Promise<void> {
+    const resolvedScope = scope ?? defaultApiResourceScope;
+    const knowledgeBase = await this.operationalReadStore.getKnowledgeBaseById(
+      resolvedScope,
+      knowledgeBaseId,
+    );
 
-    try {
-      this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
-    } catch (error) {
-      if (error instanceof ApiError && error.code === "knowledge_base_not_found") {
-        throw notFoundFactory();
-      }
-
-      throw error;
+    if (knowledgeBase === null) {
+      throw notFoundFactory();
     }
   }
 
@@ -340,9 +478,9 @@ export class JobService {
       return job;
     }
 
-    const updated = this.repository.updateJob(reconciled);
+    const updated = reconciled;
 
-    const event = this.repository.appendJobEvent({
+    const event: JobEventRecord = {
       jobId: updated.id,
       type: toJobEventType(updated.status),
       stage: updated.stage,
@@ -350,7 +488,7 @@ export class JobService {
       message: updated.progressMessage,
       metadata: readSourceParseResultMetadata(snapshot.result),
       createdAt: updated.updatedAt,
-    });
+    };
     await this.databaseMirror.updateJob(updated);
     await this.databaseMirror.appendJobEvent(event);
     if (updated.status === "failed") {
@@ -372,14 +510,52 @@ export class JobService {
     return updated;
   }
 
-  private toJobDetailResponse(job: JobRecord): JobDetailResponse {
+  private toJobDetailResponse(
+    job: JobRecord,
+    events: readonly JobEventRecord[],
+    backgroundOperations: readonly BackgroundOperationRecord[] = [],
+  ): JobDetailResponse {
     return {
       ...toJobResponse(job),
-      events: normalizeJobTimelineEvents(this.repository.listJobEvents(job.id)).map(
-        toJobEventResponse,
-      ),
+      background_operations: backgroundOperations.map(toBackgroundOperationResponse),
+      events: normalizeJobTimelineEvents(events).map(toJobEventResponse),
     };
   }
+
+  private async getJobEvents(jobId: string): Promise<readonly JobEventRecord[]> {
+    const eventsByJobId = await this.operationalReadStore.listJobEventsByJobIds([jobId]);
+
+    return eventsByJobId.get(jobId) ?? [];
+  }
+
+  private async getBackgroundOperations(
+    jobId: string,
+  ): Promise<readonly BackgroundOperationRecord[]> {
+    const operationsByJobId = await this.operationalReadStore.listBackgroundOperationsByJobIds([
+      jobId,
+    ]);
+
+    return operationsByJobId.get(jobId) ?? [];
+  }
+}
+
+function createIngestProgressLinks(
+  knowledgeBaseId: string,
+): KnowledgeBaseIngestProgressResponse["links"] {
+  return [
+    {
+      rel: "knowledge_base_jobs",
+      method: "GET",
+      href: `/v1/knowledge-bases/${knowledgeBaseId}/jobs`,
+      resource_type: "job_list",
+    },
+    {
+      rel: "retrieve_readiness",
+      method: "GET",
+      href: `/v1/knowledge-bases/${knowledgeBaseId}/ingest-progress`,
+      resource_type: "retrieve_readiness",
+    },
+  ];
 }
 
 function toReconciledJob(job: JobRecord, snapshot: SourceParseQueueJobSnapshot): JobRecord {
@@ -470,6 +646,20 @@ function readSourceParseResultMetadata(
   };
 }
 
+function toDatasetConfigurationSnapshotPayload(configuration: {
+  latest_snapshot_id: string;
+  preset_id: string;
+  values: Record<string, unknown>;
+  version: number;
+}): DatasetConfigurationSnapshotPayload {
+  return {
+    id: configuration.latest_snapshot_id,
+    preset_id: configuration.preset_id,
+    values: JSON.parse(JSON.stringify(configuration.values)) as Record<string, unknown>,
+    version: configuration.version,
+  };
+}
+
 function toJobEventResponse(record: JobEventRecord): JobEventResponse {
   return {
     type: record.type,
@@ -481,30 +671,37 @@ function toJobEventResponse(record: JobEventRecord): JobEventResponse {
   };
 }
 
-function compareUpdatedAtDesc(
-  leftUpdatedAt: string,
-  leftId: string,
-  rightUpdatedAt: string,
-  rightId: string,
-): number {
-  const updatedAtOrder = rightUpdatedAt.localeCompare(leftUpdatedAt);
+function toBackgroundOperationResponse(
+  record: BackgroundOperationRecord,
+): BackgroundOperationResponse {
+  return {
+    id: record.id,
+    job_id: record.jobId,
+    knowledge_base_id: record.knowledgeBaseId,
+    operation_kind: record.operationKind,
+    stage: record.stage,
+    status: record.status,
+    cursor: JSON.parse(JSON.stringify(record.cursor)) as Record<string, unknown>,
+    processed_count: record.processedCount,
+    failed_count: record.failedCount,
+    total_count: record.totalCount,
+    last_item_id: record.lastItemId,
+    safe_error:
+      record.safeError === null
+        ? null
+        : (JSON.parse(JSON.stringify(record.safeError)) as Record<string, unknown>),
+    metadata: JSON.parse(JSON.stringify(record.metadata)) as Record<string, unknown>,
+    created_at: record.createdAt,
+    updated_at: record.updatedAt,
+  };
+}
 
-  return updatedAtOrder === 0 ? rightId.localeCompare(leftId) : updatedAtOrder;
+function toOperationalListError(error: unknown): ApiError {
+  return error instanceof ApiError ? error : new ApiError("internal_error");
 }
 
 const batchJobStatusMaxItems = 50;
 const ingestProgressRepresentativeJobLimit = 20;
-
-const jobStages: readonly JobStage[] = [
-  "uploading",
-  "parsing",
-  "ocr",
-  "captioning",
-  "analyzing",
-  "generating",
-  "merging",
-  "indexing",
-];
 
 function readBatchJobIds(input: BatchIngestJobStatusInput): string[] {
   if (!Array.isArray(input.job_ids)) {
@@ -537,8 +734,4 @@ function readBatchJobIds(input: BatchIngestJobStatusInput): string[] {
 
     return value.trim();
   });
-}
-
-function createEmptyStageCounts(): Record<JobStage, number> {
-  return Object.fromEntries(jobStages.map((stage) => [stage, 0])) as Record<JobStage, number>;
 }

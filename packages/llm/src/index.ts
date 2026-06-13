@@ -1,5 +1,3 @@
-import { randomUUID } from "node:crypto";
-
 import type { PromptVersionRecord } from "./prompt-templates.js";
 import type { ChatCompletionResponseFormat } from "./structured-json.js";
 
@@ -328,58 +326,6 @@ export class PromptCallRecorder {
   }
 }
 
-export class InMemoryModelCallRecorder implements ModelCallRecorder {
-  private readonly storedRecords: ModelCallMetadataRecord[] = [];
-
-  get records(): readonly ModelCallMetadataRecord[] {
-    return [...this.storedRecords];
-  }
-
-  async record(input: ModelCallMetadataInput): Promise<ModelCallMetadataRecord> {
-    const record: ModelCallMetadataRecord = {
-      id: `llm_call_${randomUUID()}`,
-      createdAt: new Date(),
-      providerName: input.providerName,
-      model: input.model,
-      promptVersion: input.promptVersion,
-      inputSummary: input.inputSummary,
-      outputStatus: input.outputStatus,
-    };
-
-    if (input.knowledgeBaseId !== undefined) {
-      record.knowledgeBaseId = input.knowledgeBaseId;
-    }
-    if (input.sourceDocumentId !== undefined) {
-      record.sourceDocumentId = input.sourceDocumentId;
-    }
-    if (input.parsedContentId !== undefined) {
-      record.parsedContentId = input.parsedContentId;
-    }
-    if (input.jobId !== undefined) {
-      record.jobId = input.jobId;
-    }
-    if (input.changeSetId !== undefined) {
-      record.changeSetId = input.changeSetId;
-    }
-    if (input.outputSummary !== undefined) {
-      record.outputSummary = input.outputSummary;
-    }
-    if (input.usage !== undefined) {
-      record.usage = { ...input.usage };
-    }
-    if (input.costEstimateUsd !== undefined) {
-      record.costEstimateUsd = input.costEstimateUsd;
-    }
-    if (input.metadata !== undefined) {
-      record.metadata = JSON.parse(JSON.stringify(input.metadata)) as Record<string, unknown>;
-    }
-
-    this.storedRecords.push(record);
-
-    return record;
-  }
-}
-
 export function resolveModelProviderProfiles(
   config: RuntimeModelProviderConfig,
 ): ResolvedModelProviderProfiles {
@@ -532,10 +478,6 @@ export function createOpenAICompatibleVisionCaptionProvider(
       return result;
     },
   };
-}
-
-export function createInMemoryModelCallRecorder(): InMemoryModelCallRecorder {
-  return new InMemoryModelCallRecorder();
 }
 
 export function createPromptCallRecorder(

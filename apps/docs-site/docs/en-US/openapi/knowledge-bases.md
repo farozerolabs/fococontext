@@ -531,7 +531,7 @@ curl -X POST "http://127.0.0.1:18080/v1/knowledge-bases" \
   -d '{
     "name": "Product Docs",
     "slug": "product-docs",
-    "description": "Developer documentation and release notes",
+    "description": "Developer documentation and changelog",
     "output_language": "en-US"
   }'
 ```

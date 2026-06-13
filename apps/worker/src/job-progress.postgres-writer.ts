@@ -4,7 +4,14 @@ import {
   resolveJobProgressState,
   type JobProgressEventType,
 } from "@fococontext/contracts";
+import {
+  recordRuntimeQueuePressureEvent,
+  type RuntimeQueuePressureEvent,
+  type RuntimeQueuePressureRecorder,
+  type RuntimeQueueWorkKind,
+} from "@fococontext/core";
 import type { DatabaseSchema } from "@fococontext/db";
+import { createStageTimingMetadata } from "./compile-stage-reuse.js";
 import type { WorkerWebhookEventEmitter } from "./webhook-dispatch.worker.js";
 
 export type WorkerJobStatus = "queued" | "running" | "completed" | "failed" | "canceled";
@@ -41,13 +48,16 @@ export type WorkerJobGuardReason =
   | "job_canceled"
   | "stale_input_snapshot"
   | "knowledge_base_deleted"
-  | "source_deleted";
+  | "source_deleted"
+  | "scope_mismatch";
 
 export interface WorkerJobGuardInput {
   jobId: string;
   knowledgeBaseId: string;
   inputSnapshotId: string;
+  projectId?: string;
   sourceDocumentId?: string | null;
+  tenantId?: string;
 }
 
 export interface WorkerJobGuardResult {
@@ -65,23 +75,36 @@ export class PostgresWorkerJobProgressWriter
   constructor(
     private readonly db: Kysely<DatabaseSchema>,
     private readonly webhookEvents?: WorkerWebhookEventEmitter,
+    private readonly queuePressureRecorder?: RuntimeQueuePressureRecorder,
   ) {}
 
   async canContinueJob(input: WorkerJobGuardInput): Promise<WorkerJobGuardResult> {
     const result = await sql<{
+      jobProjectId: string | null;
+      jobTenantId: string | null;
       status: string;
       inputSnapshotId: string | null;
+      knowledgeBaseProjectId: string | null;
       knowledgeBaseStatus: string | null;
+      knowledgeBaseTenantId: string | null;
       knowledgeBaseDeletedAt: Date | string | null;
+      sourceProjectId: string | null;
       sourceStatus: string | null;
+      sourceTenantId: string | null;
       sourceLifecycleStatus: string | null;
     }>`
       select
+        jobs.project_id as "jobProjectId",
+        jobs.tenant_id as "jobTenantId",
         jobs.status,
         jobs.metadata ->> 'input_snapshot_id' as "inputSnapshotId",
+        knowledge_bases.project_id as "knowledgeBaseProjectId",
         knowledge_bases.status as "knowledgeBaseStatus",
+        knowledge_bases.tenant_id as "knowledgeBaseTenantId",
         knowledge_bases.deleted_at as "knowledgeBaseDeletedAt",
+        source_documents.project_id as "sourceProjectId",
         source_documents.status as "sourceStatus",
+        source_documents.tenant_id as "sourceTenantId",
         source_documents.lifecycle_status as "sourceLifecycleStatus"
       from jobs
       left join knowledge_bases on knowledge_bases.id = jobs.knowledge_base_id
@@ -96,6 +119,19 @@ export class PostgresWorkerJobProgressWriter
     }
     if (row.status === "canceled") {
       return { canContinue: false, reason: "job_canceled" };
+    }
+    if (
+      input.tenantId !== undefined &&
+      input.projectId !== undefined &&
+      (row.jobTenantId !== input.tenantId ||
+        row.jobProjectId !== input.projectId ||
+        row.knowledgeBaseTenantId !== input.tenantId ||
+        row.knowledgeBaseProjectId !== input.projectId ||
+        (input.sourceDocumentId !== undefined &&
+          input.sourceDocumentId !== null &&
+          (row.sourceTenantId !== input.tenantId || row.sourceProjectId !== input.projectId)))
+    ) {
+      return { canContinue: false, reason: "scope_mismatch" };
     }
     if (row.inputSnapshotId !== input.inputSnapshotId) {
       return { canContinue: false, reason: "stale_input_snapshot" };
@@ -165,6 +201,8 @@ export class PostgresWorkerJobProgressWriter
     if (updated.rows[0] === undefined) {
       return;
     }
+
+    await this.recordQueuePressure(input);
 
     await sql`
       insert into job_events (
@@ -279,6 +317,23 @@ export class PostgresWorkerJobProgressWriter
     }
   }
 
+  private async recordQueuePressure(input: WorkerJobProgressUpdate): Promise<void> {
+    const event = toRuntimeQueuePressureEvent(input.status);
+
+    if (event === null) {
+      return;
+    }
+
+    await recordRuntimeQueuePressureEvent(this.queuePressureRecorder, {
+      event,
+      now: new Date(input.now ?? Date.now()),
+      scopeId: input.knowledgeBaseId,
+      workKind: toRuntimeQueueWorkKind(input.stage),
+    }).catch((error: unknown) => {
+      console.warn("Runtime queue pressure recording failed.", error);
+    });
+  }
+
   private async readProgressTimingMetadata(
     jobId: string,
     stage: WorkerJobStage,
@@ -286,9 +341,11 @@ export class PostgresWorkerJobProgressWriter
   ): Promise<Record<string, unknown>> {
     const result = await sql<{
       lastCreatedAt: Date | string | null;
+      queuedAt: Date | string | null;
       stageStartedAt: Date | string | null;
     }>`
       select
+        (select queued_at from jobs where id = ${jobId}) as "queuedAt",
         (
           select created_at
           from job_events
@@ -304,29 +361,18 @@ export class PostgresWorkerJobProgressWriter
         ) as "stageStartedAt"
     `.execute(this.db);
     const row = result.rows[0];
-    const nowMs = new Date(now).getTime();
-    const lastEventMs = readTimestampMs(row?.lastCreatedAt);
-    const stageStartedMs = readTimestampMs(row?.stageStartedAt) ?? nowMs;
 
-    return {
-      duration_since_previous_event_ms: lastEventMs === null ? 0 : Math.max(0, nowMs - lastEventMs),
-      stage_duration_ms: Math.max(0, nowMs - stageStartedMs),
-    };
+    return createStageTimingMetadata({
+      now,
+      previousEventAt: row?.lastCreatedAt,
+      queuedAt: row?.queuedAt,
+      stageStartedAt: row?.stageStartedAt,
+    });
   }
 }
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
-}
-
-function readTimestampMs(value: Date | string | null | undefined): number | null {
-  if (value === undefined || value === null) {
-    return null;
-  }
-
-  const timestamp = value instanceof Date ? value.getTime() : new Date(value).getTime();
-
-  return Number.isFinite(timestamp) ? timestamp : null;
 }
 
 function toJobEventType(status: WorkerJobStatus): JobProgressEventType {
@@ -344,4 +390,29 @@ function toJobEventType(status: WorkerJobStatus): JobProgressEventType {
   }
 
   return "job.queued";
+}
+
+function toRuntimeQueuePressureEvent(status: WorkerJobStatus): RuntimeQueuePressureEvent | null {
+  if (status === "queued") {
+    return "queued";
+  }
+  if (status === "running") {
+    return "started";
+  }
+  if (status === "completed") {
+    return "completed";
+  }
+  if (status === "failed" || status === "canceled") {
+    return "failed";
+  }
+
+  return null;
+}
+
+function toRuntimeQueueWorkKind(stage: WorkerJobStage): RuntimeQueueWorkKind {
+  if (stage === "parsing" || stage === "ocr" || stage === "captioning") {
+    return "source-parse";
+  }
+
+  return "wiki-compile";
 }

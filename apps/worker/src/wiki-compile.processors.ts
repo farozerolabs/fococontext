@@ -1,7 +1,12 @@
 import { createHash } from "node:crypto";
 import { sql, type Kysely, type Transaction } from "kysely";
 import type { CompilePromptLimits, RuntimeConfig } from "@fococontext/core";
-import type { CompileArtifactRepository, DatabaseSchema } from "@fococontext/db";
+import type {
+  CompileArtifactRepository,
+  DatabaseSchema,
+  WikiAnalysisResultRecord,
+  WikiDraftCandidateRecord,
+} from "@fococontext/db";
 import type {
   ChatMessage,
   ChatProvider,
@@ -21,6 +26,13 @@ import {
   resolveChatModel,
   resolveDatasetPromptTemplateFromSnapshot,
 } from "@fococontext/llm";
+import {
+  type GraphAlgorithmMetadata,
+  type GraphInsightItem,
+  type GraphInsightsResponse,
+  type RetrievalRelationType,
+  type RetrievalVisibilityOrigin,
+} from "@fococontext/retrieval";
 import type { ObjectStorageAdapter } from "@fococontext/storage";
 
 import type {
@@ -58,12 +70,35 @@ import {
   type WikiMergeProcessorResult,
   type WikiMergeQueue,
 } from "./wiki-compile.worker.js";
+import {
+  createCompileStageReuseKey,
+  createContentHash,
+  createRuntimeConfigHash,
+  createStableJsonHash,
+} from "./compile-stage-reuse.js";
 
 const analysisStructuredOutputRepairAttempts = 2;
 const generationStructuredOutputRepairAttempts = 3;
+const analysisStageImplementationVersion = "analysis-stage-v2";
+const generationStageImplementationVersion = "generation-stage-v2";
 const sourceFrontmatterMetadataKey = "source_frontmatter";
 const sourceDocumentMetadataKey = "source_document_metadata";
 const systemPageLogMaxEntries = 200;
+
+interface GraphInsightsRefreshProgress {
+  metadata: Record<string, unknown>;
+  processedCount: number;
+  stage:
+    | "graph_signals"
+    | "page"
+    | "edge"
+    | "source_overlap"
+    | "degree"
+    | "community"
+    | "final_summary"
+    | "snapshot";
+  totalCount: number;
+}
 
 export interface WikiAnalyzeContext {
   currentKnowledgeVersionId: string;
@@ -85,6 +120,7 @@ export interface WikiAnalyzeProcessorServiceOptions {
   generateQueue: WikiGenerateQueue;
   jobProgress?: WorkerJobProgressWriter;
   jobGuard?: WorkerJobStateGuard;
+  maxParsedMarkdownBytes?: number;
   objectStorage: ObjectStorageAdapter;
   promptLimits: CompilePromptLimits;
   idFactory?: (scope: string) => string;
@@ -208,6 +244,14 @@ export interface GraphSignalPageRecord extends RelationshipPageRecord {
   sourceDocumentIds: readonly string[];
 }
 
+export interface GraphSignalDerivationLimits {
+  maxCommonNeighborIdsPerPair?: number;
+  maxCommonNeighborPairs?: number;
+  maxPairsPerGroupWindow?: number;
+  maxSharedSourcePairs?: number;
+  maxTypeAffinityPairs?: number;
+}
+
 export interface ResolvedRelationshipEdgeWrite {
   edgeId: string;
   explanation: string;
@@ -219,6 +263,14 @@ export interface ResolvedRelationshipEdgeWrite {
   toPageId: string;
   weight: number;
 }
+
+const defaultGraphSignalDerivationLimits = {
+  maxCommonNeighborIdsPerPair: 16,
+  maxCommonNeighborPairs: 20_000,
+  maxPairsPerGroupWindow: 16,
+  maxSharedSourcePairs: 30_000,
+  maxTypeAffinityPairs: 20_000,
+} satisfies Required<GraphSignalDerivationLimits>;
 
 export function resolveRelationshipEdgesForPages(input: {
   knowledgeBaseId: string;
@@ -279,9 +331,15 @@ export function resolveRelationshipEdgesForPages(input: {
 export function deriveGraphSignalEdgesForPages(input: {
   existingEdges?: readonly ResolvedRelationshipEdgeWrite[];
   knowledgeBaseId: string;
+  limits?: GraphSignalDerivationLimits;
   pages: readonly GraphSignalPageRecord[];
 }): ResolvedRelationshipEdgeWrite[] {
   const pageLookup = createRelationshipPageLookup(input.pages);
+  const pagesById = new Map(input.pages.map((page) => [page.id, page]));
+  const sourceIdsByPageId = createSourceIdsByPageId(input.pages);
+  const pagesBySourceDocumentId = createPagesBySourceDocumentId(input.pages);
+  const pagesByType = createPagesByType(input.pages);
+  const limits = normalizeGraphSignalDerivationLimits(input.limits);
   const edgesByKey = new Map<string, ResolvedRelationshipEdgeWrite>();
 
   for (const page of input.pages) {
@@ -316,21 +374,29 @@ export function deriveGraphSignalEdgesForPages(input: {
     }
   }
 
-  for (let leftIndex = 0; leftIndex < input.pages.length; leftIndex += 1) {
-    for (let rightIndex = leftIndex + 1; rightIndex < input.pages.length; rightIndex += 1) {
-      const leftPage = input.pages[leftIndex];
-      const rightPage = input.pages[rightIndex];
+  const sharedSourcePairKeys = new Set<string>();
+  let sharedSourcePairCount = 0;
 
-      if (leftPage === undefined || rightPage === undefined) {
-        continue;
-      }
+  for (const pages of pagesBySourceDocumentId.values()) {
+    if (sharedSourcePairCount >= limits.maxSharedSourcePairs) {
+      break;
+    }
 
-      const sharedSourceIds = intersectStrings(
-        leftPage.sourceDocumentIds,
-        rightPage.sourceDocumentIds,
-      );
+    sharedSourcePairCount += visitBoundedPagePairs({
+      limit: limits.maxSharedSourcePairs - sharedSourcePairCount,
+      pages,
+      pairKeys: sharedSourcePairKeys,
+      windowSize: limits.maxPairsPerGroupWindow,
+      visit: (leftPage, rightPage) => {
+        const sharedSourceIds = intersectStringSets(
+          sourceIdsByPageId.get(leftPage.id) ?? new Set(),
+          sourceIdsByPageId.get(rightPage.id) ?? new Set(),
+        );
 
-      if (sharedSourceIds.length > 0) {
+        if (sharedSourceIds.length === 0) {
+          return;
+        }
+
         upsertBidirectionalDerivedEdges(edgesByKey, {
           explanation: `${leftPage.title} and ${rightPage.title} cite shared source documents.`,
           knowledgeBaseId: input.knowledgeBaseId,
@@ -348,9 +414,27 @@ export function deriveGraphSignalEdgesForPages(input: {
           })),
           weight: 0.82,
         });
-      }
+      },
+    });
+  }
 
-      if (leftPage.pageType === rightPage.pageType) {
+  let typeAffinityPairCount = 0;
+
+  for (const pages of pagesByType.values()) {
+    if (typeAffinityPairCount >= limits.maxTypeAffinityPairs) {
+      break;
+    }
+
+    typeAffinityPairCount += visitBoundedPagePairs({
+      limit: limits.maxTypeAffinityPairs - typeAffinityPairCount,
+      pages,
+      windowSize: limits.maxPairsPerGroupWindow,
+      visit: (leftPage, rightPage) => {
+        const sharedSourceIds = intersectStringSets(
+          sourceIdsByPageId.get(leftPage.id) ?? new Set(),
+          sourceIdsByPageId.get(rightPage.id) ?? new Set(),
+        );
+
         upsertBidirectionalDerivedEdges(edgesByKey, {
           explanation: `${leftPage.title} and ${rightPage.title} share page type ${leftPage.pageType}.`,
           knowledgeBaseId: input.knowledgeBaseId,
@@ -365,8 +449,8 @@ export function deriveGraphSignalEdgesForPages(input: {
           sourceRefs: [],
           weight: 0.35,
         });
-      }
-    }
+      },
+    });
   }
 
   const baseEdges = [...(input.existingEdges ?? []), ...edgesByKey.values()].filter(
@@ -381,39 +465,66 @@ export function deriveGraphSignalEdgesForPages(input: {
     neighborIdsByPageId.get(edge.toPageId)?.add(edge.fromPageId);
   }
 
-  for (let leftIndex = 0; leftIndex < input.pages.length; leftIndex += 1) {
-    for (let rightIndex = leftIndex + 1; rightIndex < input.pages.length; rightIndex += 1) {
-      const leftPage = input.pages[leftIndex];
-      const rightPage = input.pages[rightIndex];
+  const commonNeighborIdsByPairKey = new Map<string, Set<string>>();
+  let commonNeighborPairCount = 0;
 
-      if (leftPage === undefined || rightPage === undefined) {
-        continue;
-      }
-
-      const commonNeighborIds = intersectStrings(
-        [...(neighborIdsByPageId.get(leftPage.id) ?? [])],
-        [...(neighborIdsByPageId.get(rightPage.id) ?? [])],
-      ).filter((pageId) => pageId !== leftPage.id && pageId !== rightPage.id);
-
-      if (commonNeighborIds.length === 0) {
-        continue;
-      }
-
-      upsertBidirectionalDerivedEdges(edgesByKey, {
-        explanation: `${leftPage.title} and ${rightPage.title} share graph neighbors.`,
-        knowledgeBaseId: input.knowledgeBaseId,
-        leftPage,
-        metadata: {
-          signal: "common_neighbor",
-          common_neighbor_page_ids: commonNeighborIds,
-        },
-        relationType: "common_neighbor",
-        rightPage,
-        sourceDocumentIds: [],
-        sourceRefs: [],
-        weight: 0.5,
-      });
+  for (const [commonNeighborId, neighborIds] of neighborIdsByPageId.entries()) {
+    if (commonNeighborPairCount >= limits.maxCommonNeighborPairs) {
+      break;
     }
+
+    const neighborPages = sortGraphSignalPages(
+      [...neighborIds].flatMap((pageId) => {
+        const page = pagesById.get(pageId);
+
+        return page === undefined ? [] : [page];
+      }),
+    );
+
+    commonNeighborPairCount += visitBoundedPagePairs({
+      limit: limits.maxCommonNeighborPairs - commonNeighborPairCount,
+      pages: neighborPages,
+      windowSize: limits.maxPairsPerGroupWindow,
+      visit: (leftPage, rightPage) => {
+        if (leftPage.id === commonNeighborId || rightPage.id === commonNeighborId) {
+          return;
+        }
+
+        const pairKey = createUndirectedPagePairKey(leftPage.id, rightPage.id);
+        const commonNeighborIds = commonNeighborIdsByPairKey.get(pairKey) ?? new Set<string>();
+
+        if (commonNeighborIds.size < limits.maxCommonNeighborIdsPerPair) {
+          commonNeighborIds.add(commonNeighborId);
+        }
+
+        commonNeighborIdsByPairKey.set(pairKey, commonNeighborIds);
+      },
+    });
+  }
+
+  for (const [pairKey, commonNeighborIds] of commonNeighborIdsByPairKey.entries()) {
+    const [leftPageId, rightPageId] = pairKey.split("\u0000");
+    const leftPage = leftPageId === undefined ? undefined : pagesById.get(leftPageId);
+    const rightPage = rightPageId === undefined ? undefined : pagesById.get(rightPageId);
+
+    if (leftPage === undefined || rightPage === undefined || commonNeighborIds.size === 0) {
+      continue;
+    }
+
+    upsertBidirectionalDerivedEdges(edgesByKey, {
+      explanation: `${leftPage.title} and ${rightPage.title} share graph neighbors.`,
+      knowledgeBaseId: input.knowledgeBaseId,
+      leftPage,
+      metadata: {
+        signal: "common_neighbor",
+        common_neighbor_page_ids: [...commonNeighborIds].sort(),
+      },
+      relationType: "common_neighbor",
+      rightPage,
+      sourceDocumentIds: [],
+      sourceRefs: [],
+      weight: 0.5,
+    });
   }
 
   return [...edgesByKey.values()];
@@ -525,10 +636,160 @@ function extractWikiLinkTitles(markdown: string): string[] {
   return [...new Set(titles)];
 }
 
-function intersectStrings(leftValues: readonly string[], rightValues: readonly string[]): string[] {
-  const rightSet = new Set(rightValues);
+function intersectStringSets(
+  leftValues: ReadonlySet<string>,
+  rightValues: ReadonlySet<string>,
+): string[] {
+  const sharedValues: string[] = [];
+  const smallerSet = leftValues.size <= rightValues.size ? leftValues : rightValues;
+  const largerSet = leftValues.size <= rightValues.size ? rightValues : leftValues;
 
-  return [...new Set(leftValues.filter((value) => rightSet.has(value)))];
+  for (const value of smallerSet) {
+    if (largerSet.has(value)) {
+      sharedValues.push(value);
+    }
+  }
+
+  return sharedValues.sort();
+}
+
+function createSourceIdsByPageId(
+  pages: readonly GraphSignalPageRecord[],
+): Map<string, ReadonlySet<string>> {
+  return new Map(
+    pages.map((page) => [
+      page.id,
+      new Set(page.sourceDocumentIds.filter((sourceDocumentId) => sourceDocumentId.length > 0)),
+    ]),
+  );
+}
+
+function createPagesBySourceDocumentId(
+  pages: readonly GraphSignalPageRecord[],
+): Map<string, GraphSignalPageRecord[]> {
+  const pagesBySourceDocumentId = new Map<string, GraphSignalPageRecord[]>();
+
+  for (const page of pages) {
+    for (const sourceDocumentId of new Set(page.sourceDocumentIds)) {
+      if (sourceDocumentId.length === 0) {
+        continue;
+      }
+
+      const sourcePages = pagesBySourceDocumentId.get(sourceDocumentId) ?? [];
+      sourcePages.push(page);
+      pagesBySourceDocumentId.set(sourceDocumentId, sourcePages);
+    }
+  }
+
+  return sortGraphSignalPageGroups(pagesBySourceDocumentId);
+}
+
+function createPagesByType(
+  pages: readonly GraphSignalPageRecord[],
+): Map<string, GraphSignalPageRecord[]> {
+  const pagesByType = new Map<string, GraphSignalPageRecord[]>();
+
+  for (const page of pages) {
+    const typePages = pagesByType.get(page.pageType) ?? [];
+    typePages.push(page);
+    pagesByType.set(page.pageType, typePages);
+  }
+
+  return sortGraphSignalPageGroups(pagesByType);
+}
+
+function sortGraphSignalPageGroups(
+  groups: Map<string, GraphSignalPageRecord[]>,
+): Map<string, GraphSignalPageRecord[]> {
+  return new Map(
+    [...groups.entries()]
+      .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+      .map(([key, pages]) => [key, sortGraphSignalPages(pages)]),
+  );
+}
+
+function sortGraphSignalPages(pages: readonly GraphSignalPageRecord[]): GraphSignalPageRecord[] {
+  return [...pages].sort((leftPage, rightPage) => {
+    const titleOrder = leftPage.title.localeCompare(rightPage.title);
+
+    return titleOrder === 0 ? leftPage.id.localeCompare(rightPage.id) : titleOrder;
+  });
+}
+
+function normalizeGraphSignalDerivationLimits(
+  limits: GraphSignalDerivationLimits | undefined,
+): Required<GraphSignalDerivationLimits> {
+  return {
+    maxCommonNeighborIdsPerPair: normalizePositiveIntegerLimit(
+      limits?.maxCommonNeighborIdsPerPair,
+      defaultGraphSignalDerivationLimits.maxCommonNeighborIdsPerPair,
+    ),
+    maxCommonNeighborPairs: normalizePositiveIntegerLimit(
+      limits?.maxCommonNeighborPairs,
+      defaultGraphSignalDerivationLimits.maxCommonNeighborPairs,
+    ),
+    maxPairsPerGroupWindow: normalizePositiveIntegerLimit(
+      limits?.maxPairsPerGroupWindow,
+      defaultGraphSignalDerivationLimits.maxPairsPerGroupWindow,
+    ),
+    maxSharedSourcePairs: normalizePositiveIntegerLimit(
+      limits?.maxSharedSourcePairs,
+      defaultGraphSignalDerivationLimits.maxSharedSourcePairs,
+    ),
+    maxTypeAffinityPairs: normalizePositiveIntegerLimit(
+      limits?.maxTypeAffinityPairs,
+      defaultGraphSignalDerivationLimits.maxTypeAffinityPairs,
+    ),
+  };
+}
+
+function normalizePositiveIntegerLimit(value: number | undefined, defaultValue: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : defaultValue;
+}
+
+function visitBoundedPagePairs(input: {
+  limit: number;
+  pages: readonly GraphSignalPageRecord[];
+  pairKeys?: Set<string>;
+  visit: (leftPage: GraphSignalPageRecord, rightPage: GraphSignalPageRecord) => void;
+  windowSize: number;
+}): number {
+  let visitedPairCount = 0;
+
+  for (let leftIndex = 0; leftIndex < input.pages.length; leftIndex += 1) {
+    if (visitedPairCount >= input.limit) {
+      break;
+    }
+
+    for (let offset = 1; offset <= input.windowSize; offset += 1) {
+      if (visitedPairCount >= input.limit) {
+        break;
+      }
+
+      const leftPage = input.pages[leftIndex];
+      const rightPage = input.pages[leftIndex + offset];
+
+      if (leftPage === undefined || rightPage === undefined) {
+        break;
+      }
+
+      const pairKey = createUndirectedPagePairKey(leftPage.id, rightPage.id);
+
+      if (input.pairKeys?.has(pairKey)) {
+        continue;
+      }
+
+      input.pairKeys?.add(pairKey);
+      input.visit(leftPage, rightPage);
+      visitedPairCount += 1;
+    }
+  }
+
+  return visitedPairCount;
+}
+
+function createUndirectedPagePairKey(leftPageId: string, rightPageId: string): string {
+  return [leftPageId, rightPageId].sort().join("\u0000");
 }
 
 export interface WikiMergeProcessorServiceOptions {
@@ -547,6 +808,7 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
   private readonly generateQueue: WikiGenerateQueue;
   private readonly jobProgress: WorkerJobProgressWriter | undefined;
   private readonly jobGuard: WorkerJobStateGuard | undefined;
+  private readonly maxParsedMarkdownBytes: number;
   private readonly objectStorage: ObjectStorageAdapter;
   private readonly promptLimits: CompilePromptLimits;
   private readonly idFactory: (scope: string) => string;
@@ -559,6 +821,7 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
     this.generateQueue = options.generateQueue;
     this.jobProgress = options.jobProgress;
     this.jobGuard = options.jobGuard;
+    this.maxParsedMarkdownBytes = options.maxParsedMarkdownBytes ?? Number.MAX_SAFE_INTEGER;
     this.objectStorage = options.objectStorage;
     this.promptLimits = options.promptLimits;
     this.idFactory = options.idFactory ?? createWorkerId;
@@ -570,6 +833,8 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
       jobId: payload.job_id,
       knowledgeBaseId: payload.knowledge_base_id,
       inputSnapshotId: payload.input_snapshot_id,
+      tenantId: payload.tenant_id,
+      projectId: payload.project_id,
       sourceDocumentId: payload.document_id,
     });
 
@@ -622,7 +887,51 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
       },
     });
 
-    const markdown = await this.readParsedMarkdown(payload.normalized_markdown_object_key);
+    const markdownRead = await this.readParsedMarkdown(payload.normalized_markdown_object_key);
+
+    if (markdownRead.kind === "fatal") {
+      const failure = markdownRead.error;
+
+      await this.artifactRepository.updateStageExecution(stageExecutionId, {
+        status: "failed",
+        error: failure,
+        metadata: {
+          normalized_markdown_object_key: payload.normalized_markdown_object_key,
+        },
+        finishedAt: this.now(),
+      });
+      await this.jobProgress?.updateJobProgress({
+        jobId: payload.job_id,
+        knowledgeBaseId: payload.knowledge_base_id,
+        inputSnapshotId: payload.input_snapshot_id,
+        stage: "analyzing",
+        status: "failed",
+        progress: 35,
+        message: "Analysis failed.",
+        parsedContentId: payload.parsed_content_id,
+        error: failure,
+        metadata: {
+          normalized_markdown_object_key: payload.normalized_markdown_object_key,
+        },
+      });
+
+      return {
+        status: "failed",
+        should_continue: false,
+        knowledge_base_id: payload.knowledge_base_id,
+        document_id: payload.document_id,
+        parsed_content_id: payload.parsed_content_id,
+        analysis_result_id: null,
+        prompt_version_id: prompt.id,
+        model_call_id: null,
+        entities: [],
+        concepts: [],
+        contradictions: [],
+        relationships: [],
+      };
+    }
+
+    const markdown = markdownRead.text;
     const sourceMetadata = createAnalysisSourceMetadata(markdown, context.sourceDocumentMetadata);
     const messages = createAnalysisMessages(
       payload,
@@ -632,6 +941,81 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
       prompt.template,
     );
     const model = resolveChatModel(this.chatProvider.profile, prompt.modelPurpose);
+    const analysisReuseKey = createAnalysisStageReuseKey({
+      datasetConfigurationSnapshot,
+      knowledgeBaseId: payload.knowledge_base_id,
+      markdown,
+      maxParsedMarkdownBytes: this.maxParsedMarkdownBytes,
+      model,
+      payload,
+      promptHash: resolvedPrompt.metadata.effective_prompt_hash,
+      promptLimits: this.promptLimits,
+      promptVersionId: prompt.id,
+      providerName: this.chatProvider.profile.providerName,
+    });
+    const reusableAnalysis = await this.artifactRepository.findReusableAnalysisResult({
+      knowledgeBaseId: payload.knowledge_base_id,
+      reuseKey: analysisReuseKey,
+    });
+
+    if (reusableAnalysis !== null) {
+      await this.artifactRepository.updateStageExecution(stageExecutionId, {
+        status: "completed",
+        analysisResultId: reusableAnalysis.id,
+        metadata: {
+          analysis_result_id: reusableAnalysis.id,
+          compile_reuse: {
+            reused_analysis_result_id: reusableAnalysis.id,
+            reuse_key: analysisReuseKey,
+            status: "hit",
+          },
+          model_call_id: reusableAnalysis.modelCallId,
+          prompt_template: resolvedPrompt.metadata,
+        },
+        finishedAt: this.now(),
+      });
+      await this.generateQueue.enqueueWikiGenerateJob({
+        job_id: payload.job_id,
+        tenant_id: payload.tenant_id,
+        project_id: payload.project_id,
+        knowledge_base_id: payload.knowledge_base_id,
+        analysis_result_id: reusableAnalysis.id,
+        source_document_ids: [payload.document_id],
+        current_knowledge_version_id: context.currentKnowledgeVersionId,
+        dataset_configuration_snapshot: datasetConfigurationSnapshot,
+        purpose: context.purpose,
+        schema: context.schema,
+        input_snapshot_id: payload.input_snapshot_id,
+      });
+      await this.jobProgress?.updateJobProgress({
+        jobId: payload.job_id,
+        knowledgeBaseId: payload.knowledge_base_id,
+        inputSnapshotId: payload.input_snapshot_id,
+        stage: "generating",
+        status: "running",
+        progress: 50,
+        message: "Generating wiki drafts...",
+        parsedContentId: payload.parsed_content_id,
+        metadata: {
+          analysis_result_id: reusableAnalysis.id,
+          compile_reuse: {
+            reused_analysis_result_id: reusableAnalysis.id,
+            reuse_key: analysisReuseKey,
+            status: "hit",
+          },
+          model_call_id: reusableAnalysis.modelCallId,
+          prompt_template: resolvedPrompt.metadata,
+        },
+      });
+
+      return toWikiAnalyzeProcessorResultFromAnalysisResult({
+        analysisResult: reusableAnalysis,
+        documentId: payload.document_id,
+        knowledgeBaseId: payload.knowledge_base_id,
+        parsedContentId: payload.parsed_content_id,
+        promptVersionId: prompt.id,
+      });
+    }
 
     try {
       const analysis = await completeAnalysisWithStructuredOutputRepair({
@@ -688,7 +1072,12 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
         relationships: output.relationships.map(toRecord),
         sourceRefs: collectAnalysisSourceRefs(output),
         locatorRefs: collectAnalysisLocatorRefs(output),
+        reuseKey: analysisReuseKey,
         metadata: {
+          compile_reuse: {
+            reuse_key: analysisReuseKey,
+            status: "miss",
+          },
           dataset_configuration_snapshot: datasetConfigurationSnapshot,
           document_name: context.documentName,
           prompt_template: resolvedPrompt.metadata,
@@ -702,6 +1091,10 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
         analysisResultId: analysisResult.id,
         metadata: {
           analysis_result_id: analysisResult.id,
+          compile_reuse: {
+            reuse_key: analysisReuseKey,
+            status: "miss",
+          },
           model_call_id: modelCall.id,
           structured_output_attempt_count: analysis.attemptCount,
           structured_output_final_status: "succeeded",
@@ -715,6 +1108,8 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
       });
       await this.generateQueue.enqueueWikiGenerateJob({
         job_id: payload.job_id,
+        tenant_id: payload.tenant_id,
+        project_id: payload.project_id,
         knowledge_base_id: payload.knowledge_base_id,
         analysis_result_id: analysisResult.id,
         source_document_ids: [payload.document_id],
@@ -735,6 +1130,10 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
         parsedContentId: payload.parsed_content_id,
         metadata: {
           analysis_result_id: analysisResult.id,
+          compile_reuse: {
+            reuse_key: analysisReuseKey,
+            status: "miss",
+          },
           model_call_id: modelCall.id,
           entity_count: output.entities.length,
           concept_count: output.concepts.length,
@@ -887,7 +1286,12 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
           relationships: output.relationships.map(toRecord),
           sourceRefs: collectAnalysisSourceRefs(output),
           locatorRefs: collectAnalysisLocatorRefs(output),
+          reuseKey: analysisReuseKey,
           metadata: {
+            compile_reuse: {
+              reuse_key: analysisReuseKey,
+              status: "miss",
+            },
             dataset_configuration_snapshot: datasetConfigurationSnapshot,
             document_name: context.documentName,
             prompt_template: resolvedPrompt.metadata,
@@ -902,6 +1306,10 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
           analysisResultId: analysisResult.id,
           metadata: {
             analysis_result_id: analysisResult.id,
+            compile_reuse: {
+              reuse_key: analysisReuseKey,
+              status: "miss",
+            },
             failure_category: failureCategory,
             model_call_id: modelCall.id,
             prompt_template: resolvedPrompt.metadata,
@@ -917,6 +1325,8 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
         });
         await this.generateQueue.enqueueWikiGenerateJob({
           job_id: payload.job_id,
+          tenant_id: payload.tenant_id,
+          project_id: payload.project_id,
           knowledge_base_id: payload.knowledge_base_id,
           analysis_result_id: analysisResult.id,
           source_document_ids: [payload.document_id],
@@ -937,6 +1347,10 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
           parsedContentId: payload.parsed_content_id,
           metadata: {
             analysis_result_id: analysisResult.id,
+            compile_reuse: {
+              reuse_key: analysisReuseKey,
+              status: "miss",
+            },
             entity_count: output.entities.length,
             concept_count: output.concepts.length,
             failure_category: failureCategory,
@@ -1053,12 +1467,37 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
     }
   }
 
-  private async readParsedMarkdown(objectKey: string): Promise<string> {
+  private async readParsedMarkdown(
+    objectKey: string,
+  ): Promise<
+    { kind: "success"; text: string } | { kind: "fatal"; error: Record<string, unknown> }
+  > {
     const object = await this.objectStorage.getObject({
       key: objectKey,
     });
+    const body = await readBodyAsStringWithinLimit(
+      object.body,
+      object.contentLength,
+      this.maxParsedMarkdownBytes,
+      objectKey,
+    );
 
-    return readBodyAsString(object.body);
+    if (body.kind === "fatal") {
+      return {
+        kind: "fatal",
+        error: {
+          code: "wiki_analyze_markdown_limit_exceeded",
+          object_key: objectKey,
+          actual_bytes: body.actualBytes,
+          limit_bytes: body.limitBytes,
+        },
+      };
+    }
+
+    return {
+      kind: "success",
+      text: body.text,
+    };
   }
 
   private async recordModelCall(input: {
@@ -1147,6 +1586,8 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
       jobId: payload.job_id,
       knowledgeBaseId: payload.knowledge_base_id,
       inputSnapshotId: payload.input_snapshot_id,
+      tenantId: payload.tenant_id,
+      projectId: payload.project_id,
       sourceDocumentId: payload.source_document_ids[0] ?? null,
     });
 
@@ -1201,6 +1642,124 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
     });
 
     const model = resolveChatModel(this.chatProvider.profile, prompt.modelPurpose);
+    const generationReuseKey = createGenerationStageReuseKey({
+      analysis,
+      datasetConfigurationSnapshot: payload.dataset_configuration_snapshot,
+      knowledgeBaseId: payload.knowledge_base_id,
+      model,
+      payload,
+      promptHash: resolvedPrompt.metadata.effective_prompt_hash,
+      promptLimits: this.promptLimits,
+      promptVersionId: prompt.id,
+      providerName: this.chatProvider.profile.providerName,
+    });
+    const reusableDrafts = (
+      await this.artifactRepository.listReusableDraftCandidates({
+        knowledgeBaseId: payload.knowledge_base_id,
+        reuseKey: generationReuseKey,
+      })
+    ).filter((draft) => draft.status === "ready_for_merge" || draft.status === "applied");
+
+    if (reusableDrafts.length > 0) {
+      const selectedDrafts: WikiDraftCandidateRecord[] = [];
+
+      for (const reusableDraft of reusableDrafts) {
+        const selectedDraft =
+          reusableDraft.jobId === payload.job_id && reusableDraft.status === "ready_for_merge"
+            ? reusableDraft
+            : await this.artifactRepository.saveDraftCandidate({
+                id: this.idFactory("draft"),
+                knowledgeBaseId: payload.knowledge_base_id,
+                analysisResultId: payload.analysis_result_id,
+                jobId: payload.job_id,
+                modelCallId: reusableDraft.modelCallId,
+                promptVersionId: prompt.id,
+                inputSnapshotId: payload.input_snapshot_id,
+                sourceDocumentIds: payload.source_document_ids,
+                pageType: reusableDraft.pageType,
+                title: reusableDraft.title,
+                slug: reusableDraft.slug,
+                markdown: reusableDraft.markdown,
+                frontmatter: reusableDraft.frontmatter,
+                sourceRefs: reusableDraft.sourceRefs,
+                locatorRefs: reusableDraft.locatorRefs,
+                relationshipCandidates: reusableDraft.relationshipCandidates,
+                confidence: reusableDraft.confidence,
+                status: "ready_for_merge",
+                targetPageId: null,
+                changeSetId: null,
+                reuseKey: generationReuseKey,
+                metadata: {
+                  ...reusableDraft.metadata,
+                  compile_reuse: {
+                    reused_draft_candidate_id: reusableDraft.id,
+                    reuse_key: generationReuseKey,
+                    status: "hit",
+                  },
+                  prompt_template: resolvedPrompt.metadata,
+                },
+              });
+
+        selectedDrafts.push(selectedDraft);
+
+        await this.mergeQueue.enqueueWikiMergeJob({
+          job_id: payload.job_id,
+          tenant_id: payload.tenant_id,
+          project_id: payload.project_id,
+          knowledge_base_id: payload.knowledge_base_id,
+          wiki_draft_id: selectedDraft.id,
+          target_page_id: null,
+          current_knowledge_version_id: payload.current_knowledge_version_id,
+          dataset_configuration_snapshot: payload.dataset_configuration_snapshot ?? null,
+          input_snapshot_id: payload.input_snapshot_id,
+          merge_candidate_count: reusableDrafts.length,
+          merge_candidate_index: selectedDrafts.length - 1,
+        });
+      }
+
+      await this.artifactRepository.updateStageExecution(stageExecutionId, {
+        status: "completed",
+        draftCandidateId: selectedDrafts[0]?.id ?? null,
+        metadata: {
+          compile_reuse: {
+            reused_draft_candidate_ids: reusableDrafts.map((draft) => draft.id),
+            reuse_key: generationReuseKey,
+            status: "hit",
+          },
+          draft_ids: selectedDrafts.map((draft) => draft.id),
+          prompt_template: resolvedPrompt.metadata,
+        },
+        finishedAt: this.now(),
+      });
+      await this.jobProgress?.updateJobProgress({
+        jobId: payload.job_id,
+        knowledgeBaseId: payload.knowledge_base_id,
+        inputSnapshotId: payload.input_snapshot_id,
+        stage: "merging",
+        status: "running",
+        progress: 70,
+        message: "Merging reusable wiki drafts...",
+        metadata: {
+          compile_reuse: {
+            reused_draft_candidate_ids: reusableDrafts.map((draft) => draft.id),
+            reuse_key: generationReuseKey,
+            status: "hit",
+          },
+          draft_count: selectedDrafts.length,
+          prompt_template: resolvedPrompt.metadata,
+        },
+      });
+
+      return {
+        status: "completed",
+        should_continue: selectedDrafts.length > 0,
+        knowledge_base_id: payload.knowledge_base_id,
+        analysis_result_id: payload.analysis_result_id,
+        wiki_draft_ids: selectedDrafts.map((draft) => draft.id),
+        prompt_version_id: prompt.id,
+        model_call_id: selectedDrafts[0]?.modelCallId ?? null,
+      };
+    }
 
     try {
       const generation = await completeGenerationWithStructuredOutputRepair({
@@ -1273,7 +1832,12 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
           status: "ready_for_merge",
           targetPageId: null,
           changeSetId: null,
+          reuseKey: generationReuseKey,
           metadata: {
+            compile_reuse: {
+              reuse_key: generationReuseKey,
+              status: "miss",
+            },
             ...(enrichedDraft.page_type === "source"
               ? {
                   generation_mode: "source_anchor",
@@ -1295,6 +1859,8 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
 
         await this.mergeQueue.enqueueWikiMergeJob({
           job_id: payload.job_id,
+          tenant_id: payload.tenant_id,
+          project_id: payload.project_id,
           knowledge_base_id: payload.knowledge_base_id,
           wiki_draft_id: saved.id,
           target_page_id: null,
@@ -1310,6 +1876,10 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
         status: "completed",
         draftCandidateId: savedDrafts[0]?.id ?? null,
         metadata: {
+          compile_reuse: {
+            reuse_key: generationReuseKey,
+            status: "miss",
+          },
           draft_ids: savedDrafts.map((draft) => draft.id),
           source_anchor_created: sourceAnchorDraft !== null,
           model_call_id: modelCall.id,
@@ -1332,6 +1902,10 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
         progress: 70,
         message: "Merging generated wiki drafts...",
         metadata: {
+          compile_reuse: {
+            reuse_key: generationReuseKey,
+            status: "miss",
+          },
           draft_count: savedDrafts.length,
           source_anchor_created: sourceAnchorDraft !== null,
           structured_output_attempt_count: generation.attemptCount,
@@ -1402,6 +1976,7 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
             payload,
             promptMetadata: resolvedPrompt,
             promptVersionId: prompt.id,
+            reuseKey: generationReuseKey,
             stageExecutionId,
             structuredOutputAttemptCount,
             structuredOutputMode,
@@ -1486,6 +2061,7 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
     payload: WikiGeneratePayload;
     promptMetadata: ResolvedDatasetPromptTemplate;
     promptVersionId: string;
+    reuseKey: string;
     stageExecutionId: string;
     structuredOutputAttemptCount: number;
     structuredOutputMode: StructuredOutputMode;
@@ -1558,7 +2134,12 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
       status: "ready_for_merge",
       targetPageId: null,
       changeSetId: null,
+      reuseKey: input.reuseKey,
       metadata: {
+        compile_reuse: {
+          reuse_key: input.reuseKey,
+          status: "miss",
+        },
         generation_mode: "source_fallback",
         merge_risk: {
           confidence: enrichedFallbackDraft.confidence,
@@ -1572,6 +2153,8 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
 
     await this.mergeQueue.enqueueWikiMergeJob({
       job_id: input.payload.job_id,
+      tenant_id: input.payload.tenant_id,
+      project_id: input.payload.project_id,
       knowledge_base_id: input.payload.knowledge_base_id,
       wiki_draft_id: saved.id,
       target_page_id: null,
@@ -1587,6 +2170,10 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
       draftCandidateId: saved.id,
       metadata: {
         draft_ids: [saved.id],
+        compile_reuse: {
+          reuse_key: input.reuseKey,
+          status: "miss",
+        },
         fallback_mode: "source_fallback",
         failure_category: input.failureCategory,
         model_call_id: modelCall.id,
@@ -1610,6 +2197,10 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
       message: "Merging source-backed fallback wiki draft...",
       metadata: {
         draft_count: 1,
+        compile_reuse: {
+          reuse_key: input.reuseKey,
+          status: "miss",
+        },
         fallback_mode: "source_fallback",
         failure_category: input.failureCategory,
         model_call_id: modelCall.id,
@@ -1718,6 +2309,8 @@ export class WikiMergeProcessorService implements WikiMergeProcessor {
       jobId: payload.job_id,
       knowledgeBaseId: payload.knowledge_base_id,
       inputSnapshotId: payload.input_snapshot_id,
+      tenantId: payload.tenant_id,
+      projectId: payload.project_id,
     });
     const resolvedPrompt = resolveDatasetPromptTemplateFromSnapshot({
       purpose: "merge",
@@ -1953,18 +2546,24 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     private readonly db: Kysely<DatabaseSchema>,
     private readonly idFactory: (scope: string) => string = createWorkerId,
     private readonly embeddingIndexer?: WikiPageEmbeddingIndexer,
+    private readonly options: { graphInsightBatchSize?: number } = {},
   ) {}
 
   async applyDraft(input: WikiMergeApplyInput): Promise<WikiMergeApplyResult> {
     await input.assertCanContinue?.();
 
     const applied = await this.db.transaction().execute(async (trx) => {
-      await sql`
-        select pg_advisory_xact_lock(hashtext(${`wiki.merge:${input.draft.knowledgeBaseId}`}))
-      `.execute(trx);
+      await this.lockKnowledgeBaseGraphWrites(input.draft.knowledgeBaseId, trx);
 
       return this.applyDraftTransaction(input, trx);
     });
+
+    await input.assertCanContinue?.();
+    await this.refreshDerivedGraphSignalEdges(
+      input.draft.knowledgeBaseId,
+      applied.changeSetId,
+      applied.knowledgeVersionId,
+    );
 
     await input.assertCanContinue?.();
 
@@ -2277,20 +2876,6 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     `.execute(db);
     await this.insertRelationshipCandidates(input, changeSetId, knowledgeVersionId, now, db);
     await input.assertCanContinue?.();
-    await this.insertDerivedGraphSignalEdges(
-      input.draft.knowledgeBaseId,
-      changeSetId,
-      knowledgeVersionId,
-      now,
-      db,
-    );
-    await this.recordGraphInsightRefreshJob(
-      input.draft.knowledgeBaseId,
-      changeSetId,
-      knowledgeVersionId,
-      now,
-      db,
-    );
     await sql`
       update knowledge_bases
       set current_version_id = ${knowledgeVersionId}, updated_at = ${now}
@@ -2417,6 +3002,165 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     return pages.length;
   }
 
+  private async refreshDerivedGraphSignalEdges(
+    knowledgeBaseId: string,
+    changeSetId: string,
+    knowledgeVersionId: string,
+  ): Promise<void> {
+    const startedAt = new Date().toISOString();
+    const jobId = await this.createGraphInsightRefreshJob(
+      knowledgeBaseId,
+      changeSetId,
+      knowledgeVersionId,
+      startedAt,
+      this.db,
+    );
+
+    try {
+      let graphInsights: GraphInsightsResponse | null = null;
+
+      await this.db.transaction().execute(async (trx) => {
+        await this.lockKnowledgeBaseGraphWrites(knowledgeBaseId, trx);
+        await this.insertDerivedGraphSignalEdges(
+          knowledgeBaseId,
+          changeSetId,
+          knowledgeVersionId,
+          startedAt,
+          trx,
+        );
+        graphInsights = await this.createGraphInsightsSnapshot(knowledgeBaseId, trx);
+      });
+
+      if (graphInsights === null) {
+        throw new Error("Graph insight snapshot was not created.");
+      }
+
+      await this.completeGraphInsightRefreshJob(
+        jobId,
+        knowledgeBaseId,
+        changeSetId,
+        knowledgeVersionId,
+        graphInsights,
+        new Date().toISOString(),
+        this.db,
+      );
+    } catch (error) {
+      await this.failGraphInsightRefreshJob(
+        jobId,
+        changeSetId,
+        knowledgeVersionId,
+        error,
+        new Date().toISOString(),
+        this.db,
+      );
+    }
+  }
+
+  async refreshGraphInsightsForJob(input: {
+    jobId: string;
+    knowledgeBaseId: string;
+    onProgress?: (progress: GraphInsightsRefreshProgress) => Promise<void>;
+    precomputedGraphInsights?: GraphInsightsResponse;
+    requestedKnowledgeVersionId: string | null;
+    skipDerivedGraphSignals?: boolean;
+  }): Promise<{ status: "completed" | "failed"; knowledge_base_id: string; job_id: string }> {
+    let context: { changeSetId: string | null; knowledgeVersionId: string } | null = null;
+    const startedAt = new Date().toISOString();
+
+    try {
+      context = await this.resolveGraphInsightRefreshContext(
+        input.knowledgeBaseId,
+        input.requestedKnowledgeVersionId,
+      );
+
+      await this.markGraphInsightRefreshJobRunning(
+        input.jobId,
+        input.knowledgeBaseId,
+        context.changeSetId,
+        context.knowledgeVersionId,
+        startedAt,
+        this.db,
+      );
+
+      let graphInsights: GraphInsightsResponse | null = null;
+      const refreshContext = context;
+
+      if (input.precomputedGraphInsights !== undefined) {
+        graphInsights = input.precomputedGraphInsights;
+      }
+
+      if (input.skipDerivedGraphSignals !== true) {
+        await this.db.transaction().execute(async (trx) => {
+          await this.lockKnowledgeBaseGraphWrites(input.knowledgeBaseId, trx);
+          await this.insertDerivedGraphSignalEdges(
+            input.knowledgeBaseId,
+            refreshContext.changeSetId,
+            refreshContext.knowledgeVersionId,
+            startedAt,
+            trx,
+          );
+        });
+        await input.onProgress?.({
+          metadata: {
+            derived_graph_signals_completed: true,
+          },
+          processedCount: 1,
+          stage: "graph_signals",
+          totalCount: 2,
+        });
+      }
+
+      if (graphInsights === null) {
+        graphInsights = await this.createGraphInsightsSnapshot(input.knowledgeBaseId, this.db, {
+          ...(input.onProgress === undefined ? {} : { onProgress: input.onProgress }),
+        });
+      }
+      await input.onProgress?.({
+        metadata: {
+          graph_insights_snapshot: graphInsights,
+          graph_insights_summary: createGraphInsightsCompactSummary(graphInsights),
+        },
+        processedCount: 7,
+        stage: "snapshot",
+        totalCount: 7,
+      });
+
+      if (graphInsights === null) {
+        throw new Error("Graph insight snapshot was not created.");
+      }
+
+      await this.completeGraphInsightRefreshJob(
+        input.jobId,
+        input.knowledgeBaseId,
+        context.changeSetId,
+        context.knowledgeVersionId,
+        graphInsights,
+        new Date().toISOString(),
+        this.db,
+      );
+
+      return {
+        job_id: input.jobId,
+        knowledge_base_id: input.knowledgeBaseId,
+        status: "completed",
+      };
+    } catch (error) {
+      await this.failGraphInsightRefreshJob(
+        input.jobId,
+        context?.changeSetId ?? null,
+        context?.knowledgeVersionId ?? input.requestedKnowledgeVersionId,
+        error,
+        new Date().toISOString(),
+        this.db,
+      );
+
+      return {
+        job_id: input.jobId,
+        knowledge_base_id: input.knowledgeBaseId,
+        status: "failed",
+      };
+    }
+  }
   private async loadSystemPageMarkdown(
     knowledgeBaseId: string,
     systemKey: string,
@@ -2441,7 +3185,13 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
   ): Promise<void> {
     const relationships = await this.loadAnalysisRelationships(input.draft.analysisResultId, db);
-    const pages = await this.listRelationshipPages(input.draft.knowledgeBaseId, db);
+    const pageLookupLimit = Math.max(1, this.options.graphInsightBatchSize ?? 100);
+    const pages = await this.listRelationshipPagesForRelationships(
+      input.draft.knowledgeBaseId,
+      relationships,
+      pageLookupLimit,
+      db,
+    );
     const edges = resolveRelationshipEdgesForPages({
       knowledgeBaseId: input.draft.knowledgeBaseId,
       pages,
@@ -2460,17 +3210,23 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
 
   private async insertDerivedGraphSignalEdges(
     knowledgeBaseId: string,
-    changeSetId: string,
+    changeSetId: string | null,
     knowledgeVersionId: string,
     now: string,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
   ): Promise<void> {
-    const pages = await this.listGraphSignalPages(knowledgeBaseId, db);
-    const existingEdges = await this.listExistingGraphEdges(knowledgeBaseId, db);
+    const limit = Math.max(1, this.options.graphInsightBatchSize ?? 100);
+    const pages = await this.listGraphSignalPages(knowledgeBaseId, limit, db);
+    const existingEdges = await this.listExistingGraphEdges(knowledgeBaseId, limit, db);
     const edges = deriveGraphSignalEdgesForPages({
       knowledgeBaseId,
       pages,
       existingEdges,
+      limits: {
+        maxCommonNeighborPairs: limit * limit,
+        maxSharedSourcePairs: limit * limit,
+        maxTypeAffinityPairs: limit * limit,
+      },
     });
 
     await this.insertResolvedEdges(
@@ -2483,13 +3239,534 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     );
   }
 
-  private async recordGraphInsightRefreshJob(
+  private async createGraphInsightsSnapshot(
+    knowledgeBaseId: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+    options: {
+      onProgress?: (progress: GraphInsightsRefreshProgress) => Promise<void>;
+    } = {},
+  ): Promise<GraphInsightsResponse> {
+    const limit = Math.max(1, this.options.graphInsightBatchSize ?? 100);
+    const counts = await this.countGraphInsightInputs(knowledgeBaseId, db);
+    await options.onProgress?.({
+      metadata: {
+        graph_insights_stage_completed: "page",
+        node_count: counts.nodeCount,
+      },
+      processedCount: 2,
+      stage: "page",
+      totalCount: 7,
+    });
+
+    const isolatedPages = await this.listBoundedDegreeGraphInsights({
+      knowledgeBaseId,
+      db,
+      insightType: "isolated_page",
+      maxDegree: 0,
+      limit,
+    });
+    const sparsePages = await this.listBoundedDegreeGraphInsights({
+      knowledgeBaseId,
+      db,
+      insightType: "sparse_page",
+      minDegree: 1,
+      maxDegree: 1,
+      limit,
+    });
+    const bridgePages = await this.listBoundedDegreeGraphInsights({
+      knowledgeBaseId,
+      db,
+      insightType: "bridge_page",
+      minDegree: 2,
+      limit,
+      orderByDegreeDesc: true,
+    });
+    await options.onProgress?.({
+      metadata: {
+        graph_insights_stage_completed: "degree",
+        limit,
+        selected_degree_insights: isolatedPages.length + sparsePages.length + bridgePages.length,
+      },
+      processedCount: 3,
+      stage: "degree",
+      totalCount: 7,
+    });
+
+    const communities = await this.listBoundedCommunityGraphInsights(knowledgeBaseId, limit, db);
+    await options.onProgress?.({
+      metadata: {
+        graph_insights_stage_completed: "community",
+        limit,
+        selected_communities: communities.length,
+      },
+      processedCount: 4,
+      stage: "community",
+      totalCount: 7,
+    });
+
+    const surprisingConnections = await this.listBoundedSurprisingConnections(
+      knowledgeBaseId,
+      limit,
+      db,
+    );
+    await options.onProgress?.({
+      metadata: {
+        edge_count: counts.edgeCount,
+        graph_insights_stage_completed: "edge",
+        limit,
+        selected_edges: surprisingConnections.length,
+      },
+      processedCount: 5,
+      stage: "edge",
+      totalCount: 7,
+    });
+    await options.onProgress?.({
+      metadata: {
+        graph_insights_stage_completed: "source_overlap",
+        skipped: true,
+        reason: "source-overlap insight materialization is not enabled in this bounded worker.",
+      },
+      processedCount: 6,
+      stage: "source_overlap",
+      totalCount: 7,
+    });
+    const knowledgeGaps = [
+      ...isolatedPages.map((item) => ({
+        ...item,
+        id: createStableWorkerGraphInsightId("knowledge_gap", item.page_id ?? "", "isolated"),
+        insight_type: "knowledge_gap" as const,
+        reason: "Page has no relationship evidence.",
+        reason_codes: ["isolated_page"],
+      })),
+      ...sparsePages.map((item) => ({
+        ...item,
+        id: createStableWorkerGraphInsightId("knowledge_gap", item.page_id ?? "", "sparse"),
+        insight_type: "knowledge_gap" as const,
+        reason: "Page has fewer than two graph relationships.",
+        reason_codes: ["sparse_page"],
+      })),
+    ];
+    const graphInsights: GraphInsightsResponse = {
+      knowledge_base_id: knowledgeBaseId,
+      status: {
+        failure_reason: null,
+        source_job_id: null,
+        started_at: null,
+        state: counts.nodeCount > limit || counts.edgeCount > limit ? "partial" : "ready",
+        updated_at: null,
+      },
+      snapshot: {
+        algorithm: createBoundedGraphInsightAlgorithmMetadata(limit),
+        edge_count: counts.edgeCount,
+        graph_hash: createWorkerGraphHash({
+          edgeCount: counts.edgeCount,
+          knowledgeBaseId,
+          nodeCount: counts.nodeCount,
+        }),
+        node_count: counts.nodeCount,
+      },
+      empty_reasons: createWorkerGraphInsightEmptyReasons({
+        bridge_pages: bridgePages,
+        communities,
+        isolated_pages: isolatedPages,
+        knowledge_gaps: knowledgeGaps,
+        sparse_pages: sparsePages,
+        surprising_connections: surprisingConnections,
+      }),
+      isolated_pages: isolatedPages,
+      sparse_pages: sparsePages,
+      bridge_pages: bridgePages,
+      knowledge_gaps: knowledgeGaps,
+      communities,
+      surprising_connections: surprisingConnections,
+    };
+
+    await options.onProgress?.({
+      metadata: {
+        graph_insights_stage_completed: "final_summary",
+        graph_insights_snapshot: graphInsights,
+        graph_insights_summary: {
+          bridge_pages_count: bridgePages.length,
+          communities_count: communities.length,
+          isolated_pages_count: isolatedPages.length,
+          knowledge_gaps_count: knowledgeGaps.length,
+          sparse_pages_count: sparsePages.length,
+          surprising_connections_count: surprisingConnections.length,
+        },
+        limit,
+        omitted_edge_count_estimate: Math.max(0, counts.edgeCount - limit),
+        omitted_node_count_estimate: Math.max(0, counts.nodeCount - limit),
+      },
+      processedCount: 7,
+      stage: "final_summary",
+      totalCount: 7,
+    });
+
+    return graphInsights;
+  }
+
+  private async countGraphInsightInputs(
+    knowledgeBaseId: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ): Promise<{ edgeCount: number; nodeCount: number }> {
+    const result = await sql<{
+      edge_count: string | number | bigint;
+      node_count: string | number | bigint;
+    }>`
+      select
+        (
+          select count(*)
+          from wiki_pages
+          where knowledge_base_id = ${knowledgeBaseId}
+            and deleted_at is null
+            and fork_tombstoned_at is null
+        ) as node_count,
+        (
+          select count(*)
+          from wiki_edges
+          where knowledge_base_id = ${knowledgeBaseId}
+            and fork_tombstoned_at is null
+        ) as edge_count
+    `.execute(db);
+    const row = result.rows[0];
+
+    return {
+      edgeCount: readSqlCount(row?.edge_count),
+      nodeCount: readSqlCount(row?.node_count),
+    };
+  }
+
+  private async listBoundedDegreeGraphInsights(input: {
+    knowledgeBaseId: string;
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema>;
+    insightType: "isolated_page" | "sparse_page" | "bridge_page";
+    minDegree?: number;
+    maxDegree?: number;
+    limit: number;
+    orderByDegreeDesc?: boolean;
+  }): Promise<GraphInsightItem[]> {
+    const minDegree = input.minDegree ?? 0;
+    const maxDegree = input.maxDegree ?? Number.MAX_SAFE_INTEGER;
+    const orderDirection = input.orderByDegreeDesc === true ? sql`degree desc` : sql`degree asc`;
+    const result = await sql<{
+      page_id: string;
+      title: string;
+      degree: string | number | bigint;
+    }>`
+      with edge_degrees as (
+        select page_id, count(*) as degree
+        from (
+          select from_page_id as page_id
+          from wiki_edges
+          where knowledge_base_id = ${input.knowledgeBaseId}
+            and fork_tombstoned_at is null
+          union all
+          select to_page_id as page_id
+          from wiki_edges
+          where knowledge_base_id = ${input.knowledgeBaseId}
+            and fork_tombstoned_at is null
+        ) edge_pages
+        group by page_id
+      )
+      select
+        wiki_pages.id as page_id,
+        wiki_pages.title,
+        coalesce(edge_degrees.degree, 0) as degree
+      from wiki_pages
+      left join edge_degrees on edge_degrees.page_id = wiki_pages.id
+      where wiki_pages.knowledge_base_id = ${input.knowledgeBaseId}
+        and wiki_pages.deleted_at is null
+        and wiki_pages.fork_tombstoned_at is null
+        and coalesce(edge_degrees.degree, 0) >= ${minDegree}
+        and coalesce(edge_degrees.degree, 0) <= ${maxDegree}
+      order by ${orderDirection}, wiki_pages.updated_at desc, wiki_pages.id desc
+      limit ${input.limit}
+    `.execute(input.db);
+
+    return result.rows.map((row) => {
+      const degree = readSqlCount(row.degree);
+      const reasonCodes =
+        input.insightType === "isolated_page"
+          ? ["isolated_page"]
+          : input.insightType === "sparse_page"
+            ? ["sparse_page"]
+            : ["high_degree_bridge_candidate"];
+
+      return {
+        id: createStableWorkerGraphInsightId(input.insightType, row.page_id, ...reasonCodes),
+        insight_type: input.insightType,
+        page_id: row.page_id,
+        title: row.title,
+        reason:
+          input.insightType === "isolated_page"
+            ? "Page has no relationship evidence."
+            : input.insightType === "sparse_page"
+              ? "Page has fewer than two graph relationships."
+              : "Page has many graph relationships and may connect multiple areas.",
+        reason_codes: reasonCodes,
+        severity: input.insightType === "isolated_page" ? "medium" : "low",
+        score: input.insightType === "bridge_page" ? degree : Math.max(1 - degree / 2, 0),
+        metadata: {
+          degree,
+          algorithm: "bounded_degree_summary",
+        },
+        evidence_refs: [
+          {
+            object_type: "wiki_page",
+            page_id: row.page_id,
+          },
+        ],
+      };
+    });
+  }
+
+  private async listBoundedCommunityGraphInsights(
+    knowledgeBaseId: string,
+    limit: number,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ): Promise<GraphInsightItem[]> {
+    const result = await sql<{
+      page_type: string;
+      member_count: string | number | bigint;
+      page_ids: string[] | null;
+      titles: string[] | null;
+    }>`
+      select
+        page_type,
+        count(*) as member_count,
+        (array_agg(id order by updated_at desc, id desc))[1:5] as page_ids,
+        (array_agg(title order by updated_at desc, id desc))[1:5] as titles
+      from wiki_pages
+      where knowledge_base_id = ${knowledgeBaseId}
+        and deleted_at is null
+        and fork_tombstoned_at is null
+      group by page_type
+      having count(*) >= 2
+      order by count(*) desc, page_type asc
+      limit ${limit}
+    `.execute(db);
+
+    return result.rows.map((row) => {
+      const memberCount = readSqlCount(row.member_count);
+      const pageIds = row.page_ids ?? [];
+      const titles = row.titles ?? [];
+
+      return {
+        id: createStableWorkerGraphInsightId("community", row.page_type),
+        insight_type: "community",
+        page_ids: pageIds,
+        title: titles[0] ?? row.page_type,
+        reason: "Pages share the same page type.",
+        reason_codes: ["type_affinity_cluster"],
+        score: memberCount,
+        community: {
+          algorithm: createBoundedGraphInsightAlgorithmMetadata(limit).community_algorithm,
+          cohesion: 1,
+          confidence: 0.5,
+          id: `type:${row.page_type}`,
+          member_count: memberCount,
+          representative_page_ids: pageIds,
+          representative_titles: titles,
+        },
+        metadata: {
+          page_type: row.page_type,
+          algorithm: "bounded_type_cluster",
+        },
+      };
+    });
+  }
+
+  private async listBoundedSurprisingConnections(
+    knowledgeBaseId: string,
+    limit: number,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ): Promise<GraphInsightItem[]> {
+    const result = await sql<{
+      edge_id: string;
+      from_page_id: string;
+      from_title: string;
+      relation_type: RetrievalRelationType;
+      to_page_id: string;
+      to_title: string;
+      weight: string | number;
+      explanation: string | null;
+    }>`
+      select
+        wiki_edges.id as edge_id,
+        wiki_edges.from_page_id,
+        from_pages.title as from_title,
+        wiki_edges.to_page_id,
+        to_pages.title as to_title,
+        wiki_edges.relation_type,
+        wiki_edges.weight::float as weight,
+        wiki_edges.explanation
+      from wiki_edges
+      join wiki_pages from_pages on from_pages.id = wiki_edges.from_page_id
+      join wiki_pages to_pages on to_pages.id = wiki_edges.to_page_id
+      where wiki_edges.knowledge_base_id = ${knowledgeBaseId}
+        and wiki_edges.fork_tombstoned_at is null
+        and from_pages.deleted_at is null
+        and to_pages.deleted_at is null
+        and from_pages.fork_tombstoned_at is null
+        and to_pages.fork_tombstoned_at is null
+      order by wiki_edges.weight desc, wiki_edges.updated_at desc, wiki_edges.id desc
+      limit ${limit}
+    `.execute(db);
+
+    return result.rows.map((row) => ({
+      id: createStableWorkerGraphInsightId(
+        "surprising_connection",
+        row.from_page_id,
+        row.to_page_id,
+        row.edge_id,
+      ),
+      insight_type: "surprising_connection",
+      page_ids: [row.from_page_id, row.to_page_id],
+      title: `${row.from_title} -> ${row.to_title}`,
+      reason: row.explanation ?? "High-weight relationship connects two pages.",
+      reason_codes: ["high_weight_relationship"],
+      score: Number(row.weight),
+      reasons: [
+        {
+          edge_id: row.edge_id,
+          explanation: row.explanation ?? `${row.from_title} relates to ${row.to_title}.`,
+          relation_type: row.relation_type,
+        },
+      ],
+      metadata: {
+        algorithm: "bounded_high_weight_edges",
+      },
+    }));
+  }
+
+  private async listGraphInsightPages(
+    knowledgeBaseId: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ) {
+    const result = await sql<{
+      current_version_id: string | null;
+      fork_tombstoned_at: string | null;
+      frontmatter: Record<string, unknown> | null;
+      id: string;
+      markdown: string;
+      metadata: Record<string, unknown> | null;
+      owner_knowledge_base_id: string | null;
+      page_type: string;
+      slug: string;
+      source_document_ids: string[] | null;
+      system_page_key: string | null;
+      title: string;
+      upstream_resource_id: string | null;
+      visibility_origin: string | null;
+    }>`
+      select
+        wiki_pages.id,
+        wiki_pages.current_version_id,
+        wiki_pages.title,
+        wiki_pages.page_type,
+        wiki_pages.slug,
+        wiki_pages.markdown,
+        wiki_pages.frontmatter,
+        wiki_pages.source_document_ids,
+        wiki_pages.metadata,
+        system_pages.system_key as system_page_key,
+        wiki_pages.owner_knowledge_base_id,
+        wiki_pages.visibility_origin,
+        wiki_pages.upstream_resource_id,
+        wiki_pages.fork_tombstoned_at
+      from wiki_pages
+      left join system_pages on system_pages.page_id = wiki_pages.id
+        and system_pages.knowledge_base_id = wiki_pages.knowledge_base_id
+      where wiki_pages.knowledge_base_id = ${knowledgeBaseId}
+        and wiki_pages.deleted_at is null
+        and wiki_pages.fork_tombstoned_at is null
+      order by wiki_pages.updated_at desc, wiki_pages.id desc
+    `.execute(db);
+
+    return result.rows.map((row) => {
+      const sourceDocumentIds = row.source_document_ids ?? [];
+
+      return {
+        fork_tombstoned_at: row.fork_tombstoned_at,
+        frontmatter: row.frontmatter ?? {},
+        is_system_page: row.system_page_key !== null,
+        knowledge_base_id: knowledgeBaseId,
+        markdown: row.markdown,
+        metadata: {
+          ...(row.metadata ?? {}),
+          slug: row.slug,
+        },
+        owner_knowledge_base_id: row.owner_knowledge_base_id,
+        page_id: row.id,
+        page_version_id: row.current_version_id ?? row.id,
+        source_refs: sourceDocumentIds.map((documentId) => ({ document_id: documentId })),
+        system_page_key: row.system_page_key,
+        title: row.title,
+        type: row.page_type,
+        upstream_resource_id: row.upstream_resource_id,
+        visibility_origin: readRetrievalVisibilityOrigin(row.visibility_origin),
+      };
+    });
+  }
+
+  private async listGraphInsightEdges(
+    knowledgeBaseId: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ) {
+    const result = await sql<{
+      explanation: string | null;
+      fork_tombstoned_at: string | null;
+      from_page_id: string;
+      id: string;
+      owner_knowledge_base_id: string | null;
+      relation_type: string;
+      source_document_ids: string[] | null;
+      to_page_id: string;
+      upstream_resource_id: string | null;
+      visibility_origin: string | null;
+      weight: number | null;
+    }>`
+      select
+        id,
+        from_page_id,
+        to_page_id,
+        relation_type,
+        weight,
+        explanation,
+        source_document_ids,
+        owner_knowledge_base_id,
+        visibility_origin,
+        upstream_resource_id,
+        fork_tombstoned_at
+      from wiki_edges
+      where knowledge_base_id = ${knowledgeBaseId}
+        and fork_tombstoned_at is null
+      order by updated_at desc, id desc
+    `.execute(db);
+
+    return result.rows.map((row) => ({
+      edge_id: row.id,
+      explanation: row.explanation ?? `${row.from_page_id} relates to ${row.to_page_id}.`,
+      fork_tombstoned_at: row.fork_tombstoned_at,
+      from_page_id: row.from_page_id,
+      knowledge_base_id: knowledgeBaseId,
+      owner_knowledge_base_id: row.owner_knowledge_base_id,
+      relation_type: readRetrievalRelationType(row.relation_type),
+      source_document_ids: row.source_document_ids ?? [],
+      to_page_id: row.to_page_id,
+      upstream_resource_id: row.upstream_resource_id,
+      visibility_origin: readRetrievalVisibilityOrigin(row.visibility_origin),
+      weight: row.weight ?? 1,
+    }));
+  }
+
+  private async createGraphInsightRefreshJob(
     knowledgeBaseId: string,
     changeSetId: string,
     knowledgeVersionId: string,
     now: string,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
-  ): Promise<void> {
+  ): Promise<string> {
     const jobId = this.idFactory("ingest_job");
 
     await sql`
@@ -2518,33 +3795,275 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
         ${knowledgeBaseId},
         null,
         'graph.insights.refresh',
-        'completed',
+        'running',
         'indexing',
-        100,
-        'Graph insights ready.',
+        10,
+        'Updating graph insights.',
         ${JSON.stringify({
           change_set_id: changeSetId,
           knowledge_version_id: knowledgeVersionId,
-          status: "ready",
+          retry_eligible: true,
+          status: "updating",
         })}::jsonb,
         ${JSON.stringify({
+          affected_knowledge_base_id: knowledgeBaseId,
           change_set_id: changeSetId,
+          generated_at: now,
           knowledge_version_id: knowledgeVersionId,
           refresh_kind: "graph_insights",
-          recompute_mode: "on_read_snapshot_cache",
+          retry_eligible: true,
         })}::jsonb,
         ${now},
         ${now},
-        ${now},
+        null,
         ${now}
       )
+    `.execute(db);
+
+    await this.insertGraphInsightRefreshEvent(
+      jobId,
+      "job.running",
+      "Updating graph insights.",
+      {
+        affected_knowledge_base_id: knowledgeBaseId,
+        change_set_id: changeSetId,
+        knowledge_version_id: knowledgeVersionId,
+        retry_eligible: true,
+        stage: "indexing",
+        status: "updating",
+      },
+      now,
+      db,
+    );
+
+    return jobId;
+  }
+
+  private async resolveGraphInsightRefreshContext(
+    knowledgeBaseId: string,
+    requestedKnowledgeVersionId: string | null,
+  ): Promise<{ changeSetId: string | null; knowledgeVersionId: string }> {
+    const result = await sql<{ change_set_id: string | null; knowledge_version_id: string | null }>`
+      select
+        knowledge_versions.change_set_id,
+        coalesce(${requestedKnowledgeVersionId}, knowledge_bases.current_version_id) as knowledge_version_id
+      from knowledge_bases
+      left join knowledge_versions on knowledge_versions.id = coalesce(
+        ${requestedKnowledgeVersionId},
+        knowledge_bases.current_version_id
+      )
+      where knowledge_bases.id = ${knowledgeBaseId}
+        and knowledge_bases.deleted_at is null
+      limit 1
+    `.execute(this.db);
+    const knowledgeVersionId = result.rows[0]?.knowledge_version_id ?? null;
+
+    if (knowledgeVersionId === null) {
+      throw new Error("Graph insight refresh requires an active knowledge version.");
+    }
+
+    return {
+      changeSetId: result.rows[0]?.change_set_id ?? null,
+      knowledgeVersionId,
+    };
+  }
+
+  private async markGraphInsightRefreshJobRunning(
+    jobId: string,
+    knowledgeBaseId: string,
+    changeSetId: string | null,
+    knowledgeVersionId: string,
+    now: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ): Promise<void> {
+    await sql`
+      update jobs
+      set
+        status = 'running',
+        stage = 'indexing',
+        progress = 10,
+        progress_message = 'Updating graph insights.',
+        result = ${JSON.stringify({
+          change_set_id: changeSetId,
+          knowledge_version_id: knowledgeVersionId,
+          retry_eligible: true,
+          status: "updating",
+        })}::jsonb,
+        metadata = metadata || ${JSON.stringify({
+          affected_knowledge_base_id: knowledgeBaseId,
+          change_set_id: changeSetId,
+          generated_at: now,
+          knowledge_version_id: knowledgeVersionId,
+          refresh_kind: "graph_insights",
+          retry_eligible: true,
+        })}::jsonb,
+        started_at = coalesce(started_at, ${now}),
+        updated_at = ${now}
+      where id = ${jobId}
+    `.execute(db);
+
+    await this.insertGraphInsightRefreshEvent(
+      jobId,
+      "job.running",
+      "Updating graph insights.",
+      {
+        affected_knowledge_base_id: knowledgeBaseId,
+        change_set_id: changeSetId,
+        knowledge_version_id: knowledgeVersionId,
+        retry_eligible: true,
+        stage: "indexing",
+        status: "updating",
+      },
+      now,
+      db,
+    );
+  }
+
+  private async completeGraphInsightRefreshJob(
+    jobId: string,
+    knowledgeBaseId: string,
+    changeSetId: string | null,
+    knowledgeVersionId: string,
+    graphInsights: GraphInsightsResponse,
+    now: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ): Promise<void> {
+    await sql`
+      update jobs
+      set
+        status = 'completed',
+        stage = 'indexing',
+        progress = 100,
+        progress_message = 'Graph insights ready.',
+        result = ${JSON.stringify({
+          change_set_id: changeSetId,
+          graph_insights: graphInsights,
+          knowledge_version_id: knowledgeVersionId,
+          retry_eligible: false,
+          status: "ready",
+        })}::jsonb,
+        metadata = metadata || ${JSON.stringify({
+          affected_knowledge_base_id: knowledgeBaseId,
+          change_set_id: changeSetId,
+          generated_at: now,
+          knowledge_version_id: knowledgeVersionId,
+          refresh_kind: "graph_insights",
+          retry_eligible: false,
+        })}::jsonb,
+        finished_at = ${now},
+        updated_at = ${now}
+      where id = ${jobId}
+    `.execute(db);
+
+    await this.insertGraphInsightRefreshEvent(
+      jobId,
+      "job.completed",
+      "Graph insights ready.",
+      {
+        affected_knowledge_base_id: knowledgeBaseId,
+        change_set_id: changeSetId,
+        generated_at: now,
+        knowledge_version_id: knowledgeVersionId,
+        retry_eligible: false,
+        stage: "indexing",
+        status: "ready",
+      },
+      now,
+      db,
+    );
+  }
+
+  private async failGraphInsightRefreshJob(
+    jobId: string,
+    changeSetId: string | null,
+    knowledgeVersionId: string | null,
+    error: unknown,
+    now: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ): Promise<void> {
+    const safeError = toGraphRefreshError(error);
+
+    await sql`
+      update jobs
+      set
+        status = 'failed',
+        stage = 'indexing',
+        progress = 0,
+        progress_message = ${safeError.message},
+        result = ${JSON.stringify({
+          change_set_id: changeSetId,
+          knowledge_version_id: knowledgeVersionId,
+          retry_eligible: true,
+          status: "failed",
+        })}::jsonb,
+        error = ${JSON.stringify(safeError)}::jsonb,
+        metadata = metadata || ${JSON.stringify({
+          change_set_id: changeSetId,
+          failed_at: now,
+          knowledge_version_id: knowledgeVersionId,
+          refresh_kind: "graph_insights",
+          retry_eligible: true,
+        })}::jsonb,
+        finished_at = ${now},
+        updated_at = ${now}
+      where id = ${jobId}
+    `.execute(db);
+
+    await this.insertGraphInsightRefreshEvent(
+      jobId,
+      "job.failed",
+      safeError.message,
+      {
+        change_set_id: changeSetId,
+        error_code: safeError.code,
+        failed_at: now,
+        knowledge_version_id: knowledgeVersionId,
+        retry_eligible: true,
+        stage: "indexing",
+        status: "failed",
+      },
+      now,
+      db,
+    );
+  }
+
+  private async insertGraphInsightRefreshEvent(
+    jobId: string,
+    eventType: string,
+    message: string,
+    metadata: Record<string, unknown>,
+    now: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
+  ): Promise<void> {
+    await sql`
+      insert into job_events (
+        id,
+        tenant_id,
+        project_id,
+        job_id,
+        event_type,
+        message,
+        metadata,
+        created_at
+      )
+      values (
+        ${createStableRelationshipId("jobevt_", jobId, eventType, now)},
+        (select tenant_id from jobs where id = ${jobId}),
+        (select project_id from jobs where id = ${jobId}),
+        ${jobId},
+        ${eventType},
+        ${message},
+        ${JSON.stringify(metadata)}::jsonb,
+        ${now}
+      )
+      on conflict (id) do nothing
     `.execute(db);
   }
 
   private async insertResolvedEdges(
     knowledgeBaseId: string,
     edges: readonly ResolvedRelationshipEdgeWrite[],
-    changeSetId: string,
+    changeSetId: string | null,
     knowledgeVersionId: string,
     now: string,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
@@ -2559,8 +4078,11 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     );
     const constrainedEdges = constrainResolvedEdgeSourcesToDocuments(edges, validSourceDocumentIds);
     const visibility = await this.createWriteVisibilityMetadata(knowledgeBaseId, db);
+    const orderedEdges = [...constrainedEdges].sort((left, right) =>
+      left.edgeId.localeCompare(right.edgeId),
+    );
 
-    for (const edge of constrainedEdges) {
+    for (const edge of orderedEdges) {
       await sql`
         insert into wiki_edges (
           id,
@@ -2652,6 +4174,15 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     }
   }
 
+  private async lockKnowledgeBaseGraphWrites(
+    knowledgeBaseId: string,
+    db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema>,
+  ): Promise<void> {
+    await sql`
+      select pg_advisory_xact_lock(hashtext(${`wiki.merge:${knowledgeBaseId}`}))
+    `.execute(db);
+  }
+
   private async loadValidSourceDocumentIds(
     knowledgeBaseId: string,
     sourceDocumentIds: readonly string[],
@@ -2675,6 +4206,7 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
 
   private async listGraphSignalPages(
     knowledgeBaseId: string,
+    limit: number,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
   ): Promise<GraphSignalPageRecord[]> {
     const result = await sql<{
@@ -2695,6 +4227,9 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
       from wiki_pages
       where knowledge_base_id = ${knowledgeBaseId}
         and deleted_at is null
+        and fork_tombstoned_at is null
+      order by updated_at desc, id desc
+      limit ${limit}
     `.execute(db);
 
     return result.rows.map((row) => ({
@@ -2709,6 +4244,7 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
 
   private async listExistingGraphEdges(
     knowledgeBaseId: string,
+    limit: number,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
   ): Promise<ResolvedRelationshipEdgeWrite[]> {
     const result = await sql<{
@@ -2732,6 +4268,9 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
         metadata
       from wiki_edges
       where knowledge_base_id = ${knowledgeBaseId}
+        and fork_tombstoned_at is null
+      order by updated_at desc, id desc
+      limit ${limit}
     `.execute(db);
 
     return result.rows.map((row) => ({
@@ -2760,15 +4299,32 @@ export class PostgresWikiMergeApplier implements WikiMergeApplier {
     return readRecordArray(result.rows[0]?.relationships);
   }
 
-  private async listRelationshipPages(
+  private async listRelationshipPagesForRelationships(
     knowledgeBaseId: string,
+    relationships: readonly Record<string, unknown>[],
+    limit: number,
     db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema> = this.db,
   ): Promise<RelationshipPageRecord[]> {
+    const references = createRelationshipPageReferences(relationships);
+
+    if (references.pageIds.length === 0 && references.lookupKeys.length === 0) {
+      return [];
+    }
+
+    const pageIds = formatTextArray(references.pageIds);
+    const lookupKeys = formatTextArray(references.lookupKeys);
     const result = await sql<RelationshipPageRecord>`
       select id, slug, title
       from wiki_pages
       where knowledge_base_id = ${knowledgeBaseId}
         and deleted_at is null
+        and (
+          id = any(${pageIds})
+          or lower(slug) = any(${lookupKeys})
+          or lower(title) = any(${lookupKeys})
+        )
+      order by updated_at desc, id desc
+      limit ${limit}
     `.execute(db);
 
     return result.rows;
@@ -3936,6 +5492,55 @@ function createRelationshipPageLookup(pages: readonly RelationshipPageRecord[]) 
   return { byId, byKey };
 }
 
+function createRelationshipPageReferences(relationships: readonly Record<string, unknown>[]): {
+  lookupKeys: string[];
+  pageIds: string[];
+} {
+  const lookupKeys = new Set<string>();
+  const pageIds = new Set<string>();
+
+  for (const relationship of relationships) {
+    addRelationshipReferenceId(pageIds, relationship.from_page_id);
+    addRelationshipReferenceId(pageIds, relationship.to_page_id);
+    addRelationshipReferenceId(pageIds, relationship.target_page_id);
+
+    addRelationshipReferenceKey(lookupKeys, relationship.from_slug);
+    addRelationshipReferenceKey(lookupKeys, relationship.source_slug);
+    addRelationshipReferenceKey(lookupKeys, relationship.to_slug);
+    addRelationshipReferenceKey(lookupKeys, relationship.target_slug);
+    addRelationshipReferenceKey(lookupKeys, relationship.from_title);
+    addRelationshipReferenceKey(lookupKeys, relationship.source_title);
+    addRelationshipReferenceKey(lookupKeys, relationship.to_title);
+    addRelationshipReferenceKey(lookupKeys, relationship.target_title);
+  }
+
+  return {
+    lookupKeys: [...lookupKeys],
+    pageIds: [...pageIds],
+  };
+}
+
+function addRelationshipReferenceId(lookup: Set<string>, value: unknown): void {
+  const id = readString(value);
+
+  if (id !== null) {
+    lookup.add(id);
+  }
+}
+
+function addRelationshipReferenceKey(lookup: Set<string>, value: unknown): void {
+  const rawValue = readString(value);
+
+  for (const candidate of [rawValue, readSlugTail(rawValue)]) {
+    const key = normalizeRelationshipLookupKey(candidate);
+
+    if (key !== null) {
+      lookup.add(key);
+      lookup.add(createSlug(key));
+    }
+  }
+}
+
 function addRelationshipPageKey(
   lookup: Map<string, RelationshipPageRecord>,
   value: string,
@@ -3996,6 +5601,10 @@ function readRecordArray(value: unknown): Record<string, unknown>[] {
 
     return record === null ? [] : [record];
   });
+}
+
+function formatTextArray(values: readonly string[]) {
+  return values.length === 0 ? sql`array[]::text[]` : sql`array[${sql.join(values)}]::text[]`;
 }
 
 function readPositiveNumber(value: unknown): number | null {
@@ -4165,6 +5774,143 @@ function toStageError(code: string, error: unknown): Record<string, unknown> {
   };
 }
 
+function toGraphRefreshError(error: unknown): {
+  code: string;
+  message: string;
+  retryable: boolean;
+} {
+  const message = error instanceof Error ? error.message : "Unknown graph refresh failure.";
+
+  return {
+    code: "graph_refresh_failed",
+    message: message.slice(0, 500),
+    retryable: true,
+  };
+}
+
+function readRetrievalRelationType(value: string): RetrievalRelationType {
+  if (
+    value === "wikilink" ||
+    value === "shared_source" ||
+    value === "common_neighbor" ||
+    value === "type_affinity" ||
+    value === "generated_relationship" ||
+    value === "evidence_relationship" ||
+    value === "manual"
+  ) {
+    return value;
+  }
+
+  return "generated_relationship";
+}
+
+function readRetrievalVisibilityOrigin(value: string | null): RetrievalVisibilityOrigin {
+  if (value === "fork_owned" || value === "upstream_inherited" || value === "canonical") {
+    return value;
+  }
+
+  return "canonical";
+}
+
+function createBoundedGraphInsightAlgorithmMetadata(limit?: number): GraphAlgorithmMetadata {
+  return {
+    name: "bounded_graph_insight_summary",
+    version: "1",
+    community_algorithm: {
+      name: "bounded_type_cluster",
+      version: "1",
+      weighted: false,
+    },
+    ...(limit === undefined ? {} : { weights: { insight_limit: limit } }),
+  };
+}
+
+function createStableWorkerGraphInsightId(...parts: readonly string[]): string {
+  return `gins_${createWorkerHash(parts.join(":")).slice(0, 24)}`;
+}
+
+function createWorkerGraphHash(input: {
+  edgeCount: number;
+  knowledgeBaseId: string;
+  nodeCount: number;
+}): string {
+  return createWorkerHash(
+    JSON.stringify({
+      edge_count: input.edgeCount,
+      knowledge_base_id: input.knowledgeBaseId,
+      node_count: input.nodeCount,
+    }),
+  );
+}
+
+function createGraphInsightsCompactSummary(
+  graphInsights: GraphInsightsResponse,
+): Record<string, unknown> {
+  const limit = extractBoundedGraphInsightLimit(graphInsights);
+
+  return {
+    bridge_pages_count: graphInsights.bridge_pages.length,
+    communities_count: graphInsights.communities.length,
+    graph_hash: graphInsights.snapshot.graph_hash,
+    isolated_pages_count: graphInsights.isolated_pages.length,
+    knowledge_gaps_count: graphInsights.knowledge_gaps.length,
+    limit,
+    node_count: graphInsights.snapshot.node_count,
+    edge_count: graphInsights.snapshot.edge_count,
+    omitted_edge_count_estimate: Math.max(0, graphInsights.snapshot.edge_count - limit),
+    omitted_node_count_estimate: Math.max(0, graphInsights.snapshot.node_count - limit),
+    sparse_pages_count: graphInsights.sparse_pages?.length ?? 0,
+    state: graphInsights.status.state,
+    surprising_connections_count: graphInsights.surprising_connections.length,
+  };
+}
+
+function extractBoundedGraphInsightLimit(graphInsights: GraphInsightsResponse): number {
+  const limit = graphInsights.snapshot.algorithm.weights?.insight_limit;
+
+  return typeof limit === "number" && Number.isFinite(limit) ? limit : 1;
+}
+
+function createWorkerHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function createWorkerGraphInsightEmptyReasons(
+  collections: Record<string, readonly GraphInsightItem[]>,
+): Record<string, string> {
+  const reasons: Record<string, string> = {};
+  const defaults: Record<string, string> = {
+    bridge_pages: "No bridge pages were detected.",
+    communities: "The graph does not contain a connected community large enough to report.",
+    isolated_pages: "No isolated pages were detected.",
+    knowledge_gaps: "No knowledge gaps were detected.",
+    sparse_pages: "No sparse pages were detected.",
+    surprising_connections: "No surprising connections were detected.",
+  };
+
+  for (const [key, items] of Object.entries(collections)) {
+    if (items.length === 0) {
+      reasons[key] = defaults[key] ?? "No graph insight data was detected.";
+    }
+  }
+
+  return reasons;
+}
+
+function readSqlCount(value: string | number | bigint | undefined): number {
+  if (value === undefined) {
+    return 0;
+  }
+  if (typeof value === "bigint") {
+    return Number(value);
+  }
+  if (typeof value === "number") {
+    return value;
+  }
+
+  return Number.parseInt(value, 10);
+}
+
 function summarizeError(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown analysis failure.";
 }
@@ -4225,6 +5971,141 @@ function isGenerationStructuredOutputRepairExhausted(error: unknown): boolean {
     error instanceof StructuredOutputValidationError &&
     readStructuredOutputRepairAttempts(error) >= generationStructuredOutputRepairAttempts
   );
+}
+
+function createAnalysisStageReuseKey(input: {
+  datasetConfigurationSnapshot: DatasetConfigurationSnapshotPayload | null;
+  knowledgeBaseId: string;
+  markdown: string;
+  maxParsedMarkdownBytes: number;
+  model: string;
+  payload: WikiAnalyzePayload;
+  promptHash: string;
+  promptLimits: CompilePromptLimits;
+  promptVersionId: string;
+  providerName: string;
+}): string {
+  return createCompileStageReuseKey({
+    contentHash: input.payload.content_hash,
+    datasetConfigurationSnapshotId: input.datasetConfigurationSnapshot?.id ?? null,
+    datasetConfigurationSnapshotVersion: input.datasetConfigurationSnapshot?.version ?? null,
+    knowledgeBaseId: input.knowledgeBaseId,
+    model: input.model,
+    normalizedContentHash: createContentHash(input.markdown),
+    parsedContentId: input.payload.parsed_content_id,
+    promptHash: input.promptHash,
+    promptVersionId: input.promptVersionId,
+    providerName: input.providerName,
+    runtimeConfigHash: createRuntimeConfigHash({
+      maxParsedMarkdownBytes: input.maxParsedMarkdownBytes,
+      promptLimits: input.promptLimits,
+    }),
+    sourceDocumentId: input.payload.document_id,
+    stage: "analysis",
+    stageImplementationVersion: analysisStageImplementationVersion,
+    tenantId: input.payload.tenant_id,
+  });
+}
+
+function createGenerationStageReuseKey(input: {
+  analysis: WikiAnalysisResultRecord;
+  datasetConfigurationSnapshot: DatasetConfigurationSnapshotPayload | null | undefined;
+  knowledgeBaseId: string;
+  model: string;
+  payload: WikiGeneratePayload;
+  promptHash: string;
+  promptLimits: CompilePromptLimits;
+  promptVersionId: string;
+  providerName: string;
+}): string {
+  return createCompileStageReuseKey({
+    contentHash: input.analysis.contentHash ?? createStableJsonHash(input.analysis.metadata),
+    datasetConfigurationSnapshotId: input.datasetConfigurationSnapshot?.id ?? null,
+    datasetConfigurationSnapshotVersion: input.datasetConfigurationSnapshot?.version ?? null,
+    knowledgeBaseId: input.knowledgeBaseId,
+    model: input.model,
+    normalizedContentHash: createStableJsonHash({
+      claims: input.analysis.claims,
+      concepts: input.analysis.concepts,
+      contradictions: input.analysis.contradictions,
+      entities: input.analysis.entities,
+      locator_refs: input.analysis.locatorRefs,
+      relationships: input.analysis.relationships,
+      source_refs: input.analysis.sourceRefs,
+    }),
+    parsedContentId: input.analysis.parsedContentId,
+    promptHash: input.promptHash,
+    promptVersionId: input.promptVersionId,
+    providerName: input.providerName,
+    runtimeConfigHash: createRuntimeConfigHash({
+      promptLimits: input.promptLimits,
+    }),
+    sourceDocumentId: input.payload.source_document_ids[0] ?? input.analysis.sourceDocumentId,
+    stage: "generation",
+    stageImplementationVersion: generationStageImplementationVersion,
+    tenantId: input.payload.tenant_id,
+  });
+}
+
+function toWikiAnalyzeProcessorResultFromAnalysisResult(input: {
+  analysisResult: WikiAnalysisResultRecord;
+  documentId: string;
+  knowledgeBaseId: string;
+  parsedContentId: string;
+  promptVersionId: string;
+}): WikiAnalyzeProcessorResult {
+  return {
+    status: "completed",
+    should_continue: true,
+    knowledge_base_id: input.knowledgeBaseId,
+    document_id: input.documentId,
+    parsed_content_id: input.parsedContentId,
+    analysis_result_id: input.analysisResult.id,
+    prompt_version_id: input.promptVersionId,
+    model_call_id: input.analysisResult.modelCallId,
+    entities: input.analysisResult.entities.map(toAnalysisSummaryItem),
+    concepts: input.analysisResult.concepts.map(toAnalysisSummaryItem),
+    contradictions: input.analysisResult.contradictions.map(toRecord),
+    relationships: input.analysisResult.relationships.map(toRelationshipSummaryItem),
+  };
+}
+
+function toAnalysisSummaryItem(item: Record<string, unknown>): {
+  evidence_locator: string;
+  title: string;
+} {
+  return {
+    title: readString(item.title) ?? "Untitled",
+    evidence_locator: readFirstEvidenceLocator(item),
+  };
+}
+
+function toRelationshipSummaryItem(item: Record<string, unknown>): {
+  evidence_locator: string;
+  from_title: string;
+  relation_type: string;
+  to_title: string;
+} {
+  return {
+    from_title: readString(item.from_title) ?? "",
+    to_title: readString(item.to_title) ?? "",
+    relation_type: readString(item.relation_type) ?? "",
+    evidence_locator: readFirstEvidenceLocator(item),
+  };
+}
+
+function readFirstEvidenceLocator(item: Record<string, unknown>): string {
+  const locatorRefs = Array.isArray(item.locator_refs) ? item.locator_refs : [];
+  const firstLocatorRef = readString(locatorRefs[0]);
+
+  if (firstLocatorRef !== null) {
+    return firstLocatorRef;
+  }
+
+  const sourceRefs = Array.isArray(item.source_refs) ? item.source_refs : [];
+  const firstSourceRef = normalizeRecord(sourceRefs[0]);
+
+  return readString(firstSourceRef?.locator) ?? "";
 }
 
 function readPurposeText(value: unknown): string | null {
@@ -4297,12 +6178,45 @@ function joinUrlPath(baseUrl: string, path: string): string {
   return trimmedBase.endsWith(`/${trimmedPath}`) ? trimmedBase : `${trimmedBase}/${trimmedPath}`;
 }
 
-async function readBodyAsString(body: unknown): Promise<string> {
-  const chunks: Buffer[] = [];
-
-  for await (const chunk of body as AsyncIterable<Buffer | string>) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+async function readBodyAsStringWithinLimit(
+  body: unknown,
+  contentLength: number | undefined,
+  maxBytes: number,
+  objectKey: string,
+): Promise<
+  | { kind: "success"; text: string }
+  | { kind: "fatal"; objectKey: string; actualBytes: number; limitBytes: number }
+> {
+  if (contentLength !== undefined && contentLength > maxBytes) {
+    return {
+      kind: "fatal",
+      objectKey,
+      actualBytes: contentLength,
+      limitBytes: maxBytes,
+    };
   }
 
-  return Buffer.concat(chunks).toString("utf8");
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+
+  for await (const chunk of body as AsyncIterable<Buffer | string>) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.byteLength;
+
+    if (totalBytes > maxBytes) {
+      return {
+        kind: "fatal",
+        objectKey,
+        actualBytes: totalBytes,
+        limitBytes: maxBytes,
+      };
+    }
+
+    chunks.push(buffer);
+  }
+
+  return {
+    kind: "success",
+    text: Buffer.concat(chunks, totalBytes).toString("utf8"),
+  };
 }

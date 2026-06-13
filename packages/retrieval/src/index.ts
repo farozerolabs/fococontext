@@ -132,6 +132,111 @@ export interface RetrievalRerankProvider {
   }>;
 }
 
+export interface OpenAICompatibleEmbeddingConfig {
+  apiKey: string;
+  baseUrl: string;
+  dimensions: number;
+  model: string;
+}
+
+export interface OpenAICompatibleRerankConfig {
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+}
+
+type EmbeddingFetch = (input: Request) => Promise<Response>;
+type RerankFetch = (input: Request) => Promise<Response>;
+
+interface OpenAIEmbeddingResponse {
+  data?: Array<{
+    embedding?: unknown;
+    index?: unknown;
+  }>;
+}
+
+interface OpenAIRerankResponse {
+  results?: unknown;
+  data?: unknown;
+  rankedDocuments?: unknown;
+}
+
+export function createOpenAICompatibleRetrievalEmbeddingProvider(
+  config: OpenAICompatibleEmbeddingConfig,
+  fetchFn: EmbeddingFetch = fetch,
+): RetrievalEmbeddingProvider {
+  return {
+    dimensions: config.dimensions,
+    model: config.model,
+    async embed(input) {
+      const response = await fetchFn(
+        new Request(joinUrlPath(config.baseUrl, "embeddings"), {
+          body: JSON.stringify({
+            input: [...input.texts],
+            model: config.model,
+          }),
+          headers: {
+            authorization: `Bearer ${config.apiKey}`,
+            "content-type": "application/json",
+          },
+          method: "POST",
+        }),
+      );
+
+      if (!response.ok) {
+        throw new Error(`Embedding provider request failed with status ${response.status}.`);
+      }
+
+      const payload = (await response.json()) as OpenAIEmbeddingResponse;
+      const data = Array.isArray(payload.data) ? payload.data : [];
+
+      return {
+        vectors: input.texts.map((_, index) => readEmbeddingVector(data, index)),
+      };
+    },
+  };
+}
+
+export function createOpenAICompatibleRetrievalRerankProvider(
+  config: OpenAICompatibleRerankConfig,
+  fetchFn: RerankFetch = fetch,
+): RetrievalRerankProvider {
+  return {
+    model: config.model,
+    async rerank(input) {
+      const response = await fetchFn(
+        new Request(resolveRerankEndpoint(config.baseUrl), {
+          body: JSON.stringify({
+            documents: [...input.documents],
+            model: config.model,
+            query: input.query,
+          }),
+          headers: {
+            authorization: `Bearer ${config.apiKey}`,
+            "content-type": "application/json",
+          },
+          method: "POST",
+        }),
+      );
+
+      if (!response.ok) {
+        throw new Error(`Rerank provider request failed with status ${response.status}.`);
+      }
+
+      const payload = (await response.json()) as OpenAIRerankResponse;
+      const rankedDocuments = readRerankResults(payload);
+
+      if (rankedDocuments.length === 0) {
+        throw new Error("Rerank provider response did not include ranked documents.");
+      }
+
+      return {
+        rankedDocuments,
+      };
+    },
+  };
+}
+
 export interface RetrievalCitation {
   document_id: string;
   parsed_content_id?: string;
@@ -257,6 +362,128 @@ export interface LexicalSearchInput {
   source_ids?: readonly string[];
 }
 
+export interface BoundedRetrievalReadInput {
+  knowledge_base_id: string;
+  limit: number;
+  fork_visibility?: {
+    knowledge_base_type: RetrievalKnowledgeBaseScopeRecord["knowledge_base_type"];
+    upstream_knowledge_base_id?: string | null;
+  };
+}
+
+export interface BoundedRetrievalPageFilter {
+  page_types?: readonly string[];
+  source_ids?: readonly string[];
+  version_id?: string;
+}
+
+export interface BoundedLexicalCandidateInput extends BoundedRetrievalReadInput {
+  filters?: BoundedRetrievalPageFilter;
+  query: string;
+}
+
+export interface BoundedLexicalCandidate {
+  match_reasons: readonly RetrievalMatchReason[];
+  page: RetrievalPageRecord;
+  rank: number;
+  score: number;
+}
+
+export interface BoundedSemanticCandidateInput extends BoundedRetrievalReadInput {
+  filters?: BoundedRetrievalPageFilter;
+  model: string;
+  query_vector: readonly number[];
+}
+
+export interface BoundedSemanticCandidate {
+  embedding: RetrievalEmbeddingRecord;
+  page: RetrievalPageRecord;
+  rank: number;
+  score: number;
+}
+
+export interface BoundedGraphCandidateInput extends BoundedRetrievalReadInput {
+  depth: number;
+  exclude_page_ids?: readonly string[];
+  filters?: BoundedRetrievalPageFilter;
+  relation_types?: readonly RetrievalRelationType[];
+  seed_edge_ids?: readonly string[];
+  seed_page_ids: readonly string[];
+  version_id?: string;
+}
+
+export interface BoundedGraphCandidate {
+  edge: RetrievalEdgeRecord;
+  source_page: RetrievalPageRecord;
+  target_page: RetrievalPageRecord;
+  traversal: RetrievalTraversalMetadata;
+}
+
+export interface BoundedSystemPageCandidateInput extends BoundedRetrievalReadInput {
+  system_page_keys?: readonly string[];
+}
+
+export interface BoundedSystemPageCandidate {
+  page: RetrievalPageRecord;
+  rank: number;
+  reason: "system_page";
+}
+
+export interface BoundedCitationCandidateInput extends BoundedRetrievalReadInput {
+  page_ids: readonly string[];
+  page_version_ids?: readonly string[];
+}
+
+export interface BoundedCitationCandidate {
+  page_id: string;
+  page_version_id: string;
+  source_ref: RetrievalSourceRef;
+}
+
+export interface BoundedMediaEvidenceCandidateInput extends BoundedRetrievalReadInput {
+  page_ids: readonly string[];
+  source_document_ids?: readonly string[];
+}
+
+export interface BoundedMediaEvidenceCandidate {
+  media_evidence: RetrievalMediaEvidence;
+  page_id: string;
+  page_version_id: string;
+}
+
+export interface BoundedRetrievalRepository {
+  findKnowledgeBaseScope(
+    knowledgeBaseId: string,
+  ): Promise<RetrievalKnowledgeBaseScopeRecord | undefined>;
+  searchLexicalCandidates(
+    input: BoundedLexicalCandidateInput,
+  ): Promise<readonly BoundedLexicalCandidate[]>;
+  searchSemanticCandidates(
+    input: BoundedSemanticCandidateInput,
+  ): Promise<readonly BoundedSemanticCandidate[]>;
+  listGraphCandidates(input: BoundedGraphCandidateInput): Promise<readonly BoundedGraphCandidate[]>;
+  listSystemPageCandidates(
+    input: BoundedSystemPageCandidateInput,
+  ): Promise<readonly BoundedSystemPageCandidate[]>;
+  listCitationCandidates(
+    input: BoundedCitationCandidateInput,
+  ): Promise<readonly BoundedCitationCandidate[]>;
+  listMediaEvidenceCandidates(
+    input: BoundedMediaEvidenceCandidateInput,
+  ): Promise<readonly BoundedMediaEvidenceCandidate[]>;
+  saveTrace(record: RetrievalTraceRecord): Promise<void>;
+}
+
+export class BoundedRetrievalIndexUnavailableError extends Error {
+  constructor(
+    message: string,
+    readonly warningCode: string,
+  ) {
+    super(message);
+    this.name = "BoundedRetrievalIndexUnavailableError";
+  }
+}
+
 export interface RetrievalRepository {
   upsertKnowledgeBaseScope(scope: RetrievalKnowledgeBaseScopeRecord): void;
   findKnowledgeBaseScope(knowledgeBaseId: string): RetrievalKnowledgeBaseScopeRecord | undefined;
@@ -314,6 +541,24 @@ export class LexicalRetrievalService {
         query,
       ),
     );
+  }
+}
+
+export class BoundedLexicalRetrievalService {
+  constructor(private readonly repository: BoundedRetrievalRepository) {}
+
+  async search(input: LexicalSearchInput): Promise<RetrievalResult[]> {
+    const candidates = await this.repository.searchLexicalCandidates({
+      knowledge_base_id: input.knowledge_base_id,
+      query: input.query,
+      limit: input.top_k ?? 10,
+      filters: {
+        ...(input.page_types === undefined ? {} : { page_types: input.page_types }),
+        ...(input.source_ids === undefined ? {} : { source_ids: input.source_ids }),
+      },
+    });
+
+    return candidates.map((candidate) => createLexicalRetrievalResult(candidate, input.query));
   }
 }
 
@@ -429,6 +674,32 @@ export class SemanticRetrievalService {
 
         return toSemanticRetrievalResult(page, candidate.embedding, candidate.score, index + 1);
       });
+  }
+}
+
+export class BoundedSemanticRetrievalService {
+  constructor(
+    private readonly repository: BoundedRetrievalRepository,
+    private readonly provider: RetrievalEmbeddingProvider,
+  ) {}
+
+  async search(input: SemanticSearchInput): Promise<RetrievalResult[]> {
+    const queryEmbedding = await this.provider.embed({
+      texts: [input.query],
+    });
+    const queryVector = queryEmbedding.vectors[0] ?? [];
+    const candidates = await this.repository.searchSemanticCandidates({
+      knowledge_base_id: input.knowledge_base_id,
+      model: this.provider.model,
+      query_vector: queryVector,
+      limit: input.top_k ?? 10,
+      filters: {
+        ...(input.page_types === undefined ? {} : { page_types: input.page_types }),
+        ...(input.source_ids === undefined ? {} : { source_ids: input.source_ids }),
+      },
+    });
+
+    return candidates.map(createSemanticRetrievalResult);
   }
 }
 
@@ -752,11 +1023,10 @@ function createCandidateTraceSummaries(
 }
 
 function createRerankCandidateTextByPageId(
-  repository: RetrievalRepository,
-  knowledgeBaseId: string,
+  pages: readonly RetrievalPageRecord[],
 ): Map<string, string> {
   return new Map(
-    repository.listPages(knowledgeBaseId).map((page) => [
+    pages.map((page) => [
       page.page_id,
       [
         page.title,
@@ -880,6 +1150,24 @@ export class GraphExpansionService {
   }
 }
 
+export class BoundedGraphExpansionService {
+  constructor(private readonly repository: BoundedRetrievalRepository) {}
+
+  async expand(input: GraphExpansionInput): Promise<GraphExpansion[]> {
+    const seedPageIds = uniqueStrings(input.seed_results.map((result) => result.page_id));
+    const limitPerResult = input.limit_per_result ?? 5;
+    const candidates = await this.repository.listGraphCandidates({
+      knowledge_base_id: input.knowledge_base_id,
+      seed_page_ids: seedPageIds,
+      depth: input.depth ?? 1,
+      limit: Math.max(seedPageIds.length, 1) * limitPerResult,
+      ...(input.relation_types === undefined ? {} : { relation_types: input.relation_types }),
+    });
+
+    return toBoundedGraphExpansions(candidates, input.depth ?? 1);
+  }
+}
+
 export type RetrieveMode = "keyword" | "semantic" | "graph" | "hybrid";
 
 export type RetrieveAnswerabilityStatus = "answerable" | "partial" | "not_answerable";
@@ -992,6 +1280,7 @@ export interface RetrieveResponse {
   knowledge_base_id: string;
   target_knowledge_base_type: RetrievalKnowledgeBaseScopeRecord["knowledge_base_type"];
   visibility_summary: RetrievalVisibilitySummary;
+  graph_readiness?: GraphInsightStatus;
   query: string;
   mode: RetrieveMode;
   results: readonly RetrievalResult[];
@@ -1019,6 +1308,7 @@ export interface RetrievalRuntimeLimits {
 }
 
 export interface RetrieveEngineOptions {
+  boundedRepository?: BoundedRetrievalRepository;
   rerankProvider?: RetrievalRerankProvider;
   limits?: Partial<RetrievalRuntimeLimits>;
 }
@@ -1038,8 +1328,6 @@ const defaultAnswerableConfidenceThreshold = 0.6;
 const defaultPartialConfidenceThreshold = 0.35;
 const defaultAnswerabilityMinCitations = 1;
 
-const graphInsightResponseCache = new Map<string, GraphInsightsResponse>();
-
 interface NormalizedRetrieveInput {
   top_k: number;
   graph_depth: number;
@@ -1052,37 +1340,235 @@ interface NormalizedRetrieveInput {
   warnings: string[];
 }
 
+type OptimizedRetrievalTraceStage = "graph" | "lexical" | "semantic";
+
+interface RetrievalResultSet {
+  results: RetrievalResult[];
+  pages: RetrievalPageRecord[];
+}
+
+interface GraphExpansionSet {
+  expansions: GraphExpansion[];
+  pages: RetrievalPageRecord[];
+  edges: RetrievalEdgeRecord[];
+}
+
+function createOptimizedRetrievalStageMetadata(input: {
+  bounded: boolean;
+  durationMs: number;
+  inputCount?: number;
+  outputCount: number;
+  stage: OptimizedRetrievalTraceStage;
+  warningCodes?: readonly string[];
+}): Record<string, unknown> {
+  return {
+    cache_status: "not_used",
+    duration_ms: Math.max(0, Math.floor(input.durationMs)),
+    input_count: input.inputCount ?? null,
+    output_count: input.outputCount,
+    query_path: getOptimizedRetrievalQueryPath(input.stage, input.bounded),
+    store: input.bounded ? "bounded_database_repository" : "in_memory_repository",
+    warning_codes: [...new Set(input.warningCodes ?? [])],
+  };
+}
+
+function getOptimizedRetrievalQueryPath(
+  stage: OptimizedRetrievalTraceStage,
+  bounded: boolean,
+): string {
+  if (stage === "lexical") {
+    return bounded ? "indexed_database_search" : "in_memory_scan";
+  }
+  if (stage === "semantic") {
+    return bounded ? "vector_index_top_k" : "in_memory_embedding_scan";
+  }
+
+  return bounded ? "indexed_edge_traversal" : "in_memory_edge_scan";
+}
+
 export class RetrieveEngine {
-  private readonly lexicalService: LexicalRetrievalService;
-  private readonly semanticService: SemanticRetrievalService;
+  private readonly boundedRepository: BoundedRetrievalRepository | undefined;
+  private readonly lexicalService: LexicalRetrievalService | undefined;
+  private readonly semanticService: SemanticRetrievalService | undefined;
   private readonly rankFusionService: RankFusionService;
-  private readonly graphExpansionService: GraphExpansionService;
+  private readonly graphExpansionService: GraphExpansionService | undefined;
   private readonly limits: RetrievalRuntimeLimits;
 
   constructor(
-    private readonly repository: RetrievalRepository,
-    embeddingProvider: RetrievalEmbeddingProvider,
+    private readonly repository: RetrievalRepository | undefined,
+    private readonly embeddingProvider: RetrievalEmbeddingProvider,
     options: RetrieveEngineOptions = {},
   ) {
-    this.lexicalService = new LexicalRetrievalService(repository);
-    this.semanticService = new SemanticRetrievalService(repository, embeddingProvider);
+    this.boundedRepository = options.boundedRepository;
+    this.lexicalService =
+      repository === undefined ? undefined : new LexicalRetrievalService(repository);
+    this.semanticService =
+      repository === undefined
+        ? undefined
+        : new SemanticRetrievalService(repository, embeddingProvider);
     this.rankFusionService = new RankFusionService(
       options.rerankProvider === undefined ? {} : { rerankProvider: options.rerankProvider },
     );
-    this.graphExpansionService = new GraphExpansionService(repository);
+    this.graphExpansionService =
+      repository === undefined ? undefined : new GraphExpansionService(repository);
     this.limits = {
       ...defaultRetrievalRuntimeLimits,
       ...options.limits,
     };
   }
 
+  private requireExecutionRepository(): RetrievalRepository {
+    if (this.repository === undefined) {
+      throw new Error("Retrieval execution repository is unavailable.");
+    }
+
+    return this.repository;
+  }
+
+  private async findTargetKnowledgeBaseType(
+    knowledgeBaseId: string,
+  ): Promise<RetrievalKnowledgeBaseScopeRecord["knowledge_base_type"]> {
+    if (this.boundedRepository !== undefined) {
+      return (
+        (await this.boundedRepository.findKnowledgeBaseScope(knowledgeBaseId))
+          ?.knowledge_base_type ?? "canonical"
+      );
+    }
+
+    return (
+      this.requireExecutionRepository().findKnowledgeBaseScope(knowledgeBaseId)
+        ?.knowledge_base_type ?? "canonical"
+    );
+  }
+
+  private async searchLexical(input: LexicalSearchInput): Promise<RetrievalResultSet> {
+    if (this.boundedRepository === undefined) {
+      const repository = this.requireExecutionRepository();
+      const results = this.lexicalService?.search(input) ?? [];
+      const resultPageIds = new Set(results.map((result) => result.page_id));
+
+      return {
+        results,
+        pages: repository
+          .listPages(input.knowledge_base_id)
+          .filter((page) => resultPageIds.has(page.page_id)),
+      };
+    }
+
+    const candidates = await this.boundedRepository.searchLexicalCandidates({
+      knowledge_base_id: input.knowledge_base_id,
+      query: input.query,
+      limit: input.top_k ?? 10,
+      filters: {
+        ...(input.page_types === undefined ? {} : { page_types: input.page_types }),
+        ...(input.source_ids === undefined ? {} : { source_ids: input.source_ids }),
+      },
+    });
+
+    return {
+      results: candidates.map((candidate) => createLexicalRetrievalResult(candidate, input.query)),
+      pages: candidates.map((candidate) => candidate.page),
+    };
+  }
+
+  private async searchSemantic(input: SemanticSearchInput): Promise<RetrievalResultSet> {
+    if (this.boundedRepository === undefined) {
+      const repository = this.requireExecutionRepository();
+      const results = (await this.semanticService?.search(input)) ?? [];
+      const resultPageIds = new Set(results.map((result) => result.page_id));
+
+      return {
+        results,
+        pages: repository
+          .listPages(input.knowledge_base_id)
+          .filter((page) => resultPageIds.has(page.page_id)),
+      };
+    }
+
+    const queryEmbedding = await this.embeddingProvider.embed({
+      texts: [input.query],
+    });
+    const candidates = await this.boundedRepository.searchSemanticCandidates({
+      knowledge_base_id: input.knowledge_base_id,
+      model: this.embeddingProvider.model,
+      query_vector: queryEmbedding.vectors[0] ?? [],
+      limit: input.top_k ?? 10,
+      filters: {
+        ...(input.page_types === undefined ? {} : { page_types: input.page_types }),
+        ...(input.source_ids === undefined ? {} : { source_ids: input.source_ids }),
+      },
+    });
+
+    return {
+      results: candidates.map(createSemanticRetrievalResult),
+      pages: candidates.map((candidate) => candidate.page),
+    };
+  }
+
+  private async expandGraph(input: GraphExpansionInput): Promise<GraphExpansionSet> {
+    if (this.boundedRepository === undefined) {
+      const repository = this.requireExecutionRepository();
+      const expansions = this.graphExpansionService?.expand(input) ?? [];
+      const pageIds = new Set([
+        ...input.seed_results.map((result) => result.page_id),
+        ...expansions.map((expansion) => expansion.to_page_id),
+      ]);
+
+      return {
+        expansions,
+        pages: repository
+          .listPages(input.knowledge_base_id)
+          .filter((page) => pageIds.has(page.page_id)),
+        edges: repository
+          .listEdges(input.knowledge_base_id)
+          .filter((edge) => expansions.some((expansion) => expansion.edge_id === edge.edge_id)),
+      };
+    }
+
+    const seedPageIds = uniqueStrings(input.seed_results.map((result) => result.page_id));
+    const limitPerResult = input.limit_per_result ?? 5;
+    const candidates = await this.boundedRepository.listGraphCandidates({
+      knowledge_base_id: input.knowledge_base_id,
+      seed_page_ids: seedPageIds,
+      depth: input.depth ?? 1,
+      limit: Math.max(seedPageIds.length, 1) * limitPerResult,
+      ...(input.relation_types === undefined ? {} : { relation_types: input.relation_types }),
+    });
+
+    return {
+      expansions: toBoundedGraphExpansions(candidates, input.depth ?? 1),
+      pages: [...createBoundedGraphPageMap(candidates).values()],
+      edges: uniqueEdges(candidates.map((candidate) => candidate.edge)),
+    };
+  }
+
+  private async seedSystemPages(input: {
+    knowledgeBaseId: string;
+    includeContextPack: boolean;
+  }): Promise<RetrievalPageRecord[]> {
+    if (!input.includeContextPack) {
+      return [];
+    }
+
+    if (this.boundedRepository === undefined) {
+      return this.requireExecutionRepository()
+        .listPages(input.knowledgeBaseId)
+        .filter((page) => page.is_system_page);
+    }
+
+    const candidates = await this.boundedRepository.listSystemPageCandidates({
+      knowledge_base_id: input.knowledgeBaseId,
+      limit: 8,
+    });
+
+    return candidates.map((candidate) => candidate.page);
+  }
+
   async retrieve(input: RetrieveInput): Promise<RetrieveResponse> {
     const mode = input.mode ?? "hybrid";
     const normalizedInput = normalizeRetrieveInput(input, this.limits);
     const topK = normalizedInput.top_k;
-    const targetKnowledgeBaseType =
-      this.repository.findKnowledgeBaseScope(input.knowledge_base_id)?.knowledge_base_type ??
-      "canonical";
+    const targetKnowledgeBaseType = await this.findTargetKnowledgeBaseType(input.knowledge_base_id);
     const stages: RetrievalTraceStage[] = [];
     const lexicalQuery = createLexicalQuery(input.query);
     const requestWarnings: string[] = [];
@@ -1121,15 +1607,29 @@ export class RetrieveEngine {
       semanticInput.source_ids = input.source_ids;
     }
 
-    const lexicalResults =
-      mode === "keyword" || mode === "hybrid" ? this.lexicalService.search(lexicalInput) : [];
+    const lexicalStartedAt = Date.now();
+    const lexicalSet =
+      mode === "keyword" || mode === "hybrid"
+        ? await this.searchLexical(lexicalInput)
+        : { results: [], pages: [] };
+    const lexicalResults = lexicalSet.results;
+    const lexicalDurationMs = Date.now() - lexicalStartedAt;
 
     stages.push({
       name: "keyword_retrieval",
       input: {
         query: input.query,
+        page_type_filter_count: input.page_types?.length ?? 0,
+        source_filter_count: input.source_ids?.length ?? 0,
+        top_k: topK,
       },
       output: {
+        ...createOptimizedRetrievalStageMetadata({
+          bounded: this.boundedRepository !== undefined,
+          durationMs: lexicalDurationMs,
+          outputCount: lexicalResults.length,
+          stage: "lexical",
+        }),
         result_count: lexicalResults.length,
       },
     });
@@ -1141,39 +1641,77 @@ export class RetrieveEngine {
       output: summarizeMetadataMatches(lexicalResults),
     });
 
-    const semanticIndexRecordCount = this.repository.listEmbeddings(input.knowledge_base_id).length;
     const semanticRequested = mode === "semantic" || mode === "hybrid";
+    const semanticIndexRecordCount =
+      this.boundedRepository === undefined
+        ? this.requireExecutionRepository().listEmbeddings(input.knowledge_base_id).length
+        : null;
     if (semanticRequested && semanticIndexRecordCount === 0) {
       requestWarnings.push("retrieve.index.semantic_not_ready");
     }
 
-    const semanticResults =
-      mode === "semantic" || mode === "hybrid"
-        ? await this.semanticService.search(semanticInput)
-        : [];
+    let semanticResults: RetrievalResult[] = [];
+    let semanticPages: RetrievalPageRecord[] = [];
+    let semanticIndexUnavailable = false;
+    const semanticStartedAt = Date.now();
+    if (semanticRequested) {
+      try {
+        const semanticSet = await this.searchSemantic(semanticInput);
+
+        semanticResults = semanticSet.results;
+        semanticPages = semanticSet.pages;
+      } catch (error) {
+        if (error instanceof BoundedRetrievalIndexUnavailableError) {
+          semanticIndexUnavailable = true;
+          requestWarnings.push(error.warningCode);
+        } else {
+          throw error;
+        }
+      }
+    }
+    const semanticDurationMs = Date.now() - semanticStartedAt;
+    const semanticWarningCodes = [
+      ...(semanticIndexRecordCount === 0 ? ["retrieve.index.semantic_not_ready"] : []),
+      ...(semanticIndexUnavailable ? ["retrieve.index.semantic_unavailable"] : []),
+    ];
 
     stages.push({
       name: "semantic_retrieval",
       input: {
         query: input.query,
+        page_type_filter_count: input.page_types?.length ?? 0,
+        requested: semanticRequested,
+        source_filter_count: input.source_ids?.length ?? 0,
+        top_k: topK,
       },
       output: {
+        ...createOptimizedRetrievalStageMetadata({
+          bounded: this.boundedRepository !== undefined,
+          durationMs: semanticDurationMs,
+          outputCount: semanticResults.length,
+          stage: "semantic",
+          warningCodes: semanticWarningCodes,
+        }),
         result_count: semanticResults.length,
-        index_record_count: semanticIndexRecordCount,
-        ready: !semanticRequested || semanticIndexRecordCount > 0,
+        index_record_count: semanticIndexRecordCount ?? "bounded",
+        ready:
+          !semanticRequested ||
+          (!semanticIndexUnavailable &&
+            (semanticIndexRecordCount === null || semanticIndexRecordCount > 0)),
       },
     });
 
+    const rankFusionStartedAt = Date.now();
     const rankFusion = await this.rankFusionService.fuseWithDiagnostics({
       query: input.query,
       lexical_results: mode === "semantic" ? [] : lexicalResults,
       semantic_results: mode === "keyword" ? [] : semanticResults,
       candidate_text_by_page_id: createRerankCandidateTextByPageId(
-        this.repository,
-        input.knowledge_base_id,
+        uniquePagesById([...lexicalSet.pages, ...semanticPages]),
       ),
       top_k: topK,
     });
+    const rankFusionDurationMs = Date.now() - rankFusionStartedAt;
     const results = rankFusion.results;
 
     stages.push({
@@ -1183,6 +1721,8 @@ export class RetrieveEngine {
         semantic_count: semanticResults.length,
       },
       output: {
+        cache_status: "not_used",
+        duration_ms: rankFusionDurationMs,
         result_count: results.length,
         diagnostics: {
           lexical_count: rankFusion.diagnostics.lexical_count,
@@ -1215,15 +1755,31 @@ export class RetrieveEngine {
       graphInput.relation_types = input.relation_types;
     }
 
-    const graphExpansions =
-      input.include_graph === false ? [] : this.graphExpansionService.expand(graphInput);
+    const graphStartedAt = Date.now();
+    const graphSet =
+      input.include_graph === false
+        ? { expansions: [], pages: [], edges: [] }
+        : await this.expandGraph(graphInput);
+    const graphExpansions = graphSet.expansions;
+    const graphDurationMs = Date.now() - graphStartedAt;
 
     stages.push({
       name: "graph_expansion",
       input: {
+        depth: normalizedInput.graph_depth,
+        limit_per_result: normalizedInput.graph_limit_per_result,
+        relation_type_filter_count: input.relation_types?.length ?? 0,
+        requested: input.include_graph !== false,
         seed_page_ids: graphSeedResults.map((result) => result.page_id),
       },
       output: {
+        ...createOptimizedRetrievalStageMetadata({
+          bounded: this.boundedRepository !== undefined,
+          durationMs: graphDurationMs,
+          inputCount: graphSeedResults.length,
+          outputCount: graphExpansions.length,
+          stage: "graph",
+        }),
         expansion_count: graphExpansions.length,
       },
     });
@@ -1231,10 +1787,25 @@ export class RetrieveEngine {
     const expandableGraph =
       input.include_expand_hints === false
         ? null
-        : buildExpandableGraph(this.repository, results, graphExpansions, input);
+        : buildExpandableGraph(
+            uniquePagesById([...lexicalSet.pages, ...semanticPages, ...graphSet.pages]),
+            results,
+            graphExpansions,
+            input,
+          );
+    const systemPages = await this.seedSystemPages({
+      knowledgeBaseId: input.knowledge_base_id,
+      includeContextPack: input.include_context_pack === true,
+    });
+    const contextPages = uniquePagesById([
+      ...systemPages,
+      ...lexicalSet.pages,
+      ...semanticPages,
+      ...graphSet.pages,
+    ]);
     const contextPack =
       input.include_context_pack === true
-        ? new ContextPackBuilder(this.repository).build({
+        ? new ContextPackBuilder(contextPages).build({
             knowledge_base_id: input.knowledge_base_id,
             results,
             graph_expansions: graphExpansions,
@@ -1384,7 +1955,7 @@ export class RetrieveEngine {
     };
     const trace =
       input.include_trace === true
-        ? this.createTrace(input, responseWithoutTrace, stages, normalizedInput)
+        ? await this.createTrace(input, responseWithoutTrace, stages, normalizedInput)
         : null;
 
     return {
@@ -1393,12 +1964,12 @@ export class RetrieveEngine {
     };
   }
 
-  private createTrace(
+  private async createTrace(
     input: RetrieveInput,
     response: Omit<RetrieveResponse, "trace">,
     stages: readonly RetrievalTraceStage[],
     normalizedInput: NormalizedRetrieveInput,
-  ): RetrievalTraceRecord {
+  ): Promise<RetrievalTraceRecord> {
     const trace: RetrievalTraceRecord = {
       id: createRetrievalTraceId(),
       knowledge_base_id: input.knowledge_base_id,
@@ -1426,8 +1997,6 @@ export class RetrieveEngine {
       created_at: new Date().toISOString(),
     };
 
-    this.repository.saveTrace(trace);
-
     return trace;
   }
 }
@@ -1454,6 +2023,11 @@ export interface RetrieveExpandResponse {
   context_pack_delta: ContextPack | null;
   answerability: RetrieveAnswerability;
   resolved_evidence?: unknown;
+  warnings?: readonly string[];
+  graph_budget?: {
+    edge_limit: number;
+    omitted_edges: number;
+  };
   next_expansion: {
     seed_page_ids: readonly string[];
     relation_types: readonly RetrievalRelationType[];
@@ -1559,7 +2133,7 @@ export class RetrieveExpandEngine {
               {
                 page_id: page.page_id,
                 page_version_id: page.page_version_id,
-                source_refs: page.source_refs.map((source) => ({ ...source })),
+                source_refs: clonePageSourceRefs(page),
                 title: page.title,
                 type: page.type,
                 visibility_origin: page.visibility_origin ?? "canonical",
@@ -1614,17 +2188,121 @@ export class RetrieveExpandEngine {
   }
 }
 
+export class BoundedRetrieveExpandEngine {
+  constructor(private readonly repository: BoundedRetrievalRepository) {}
+
+  async expand(input: RetrieveExpandInput): Promise<RetrieveExpandResponse> {
+    const seedPageIds = uniqueStrings(input.seed_page_ids);
+    const depth = input.depth ?? 1;
+    const edgeLimit = normalizeGraphTraversalLimit(seedPageIds.length, depth);
+    const candidates = await this.repository.listGraphCandidates({
+      knowledge_base_id: input.knowledge_base_id,
+      seed_page_ids: seedPageIds,
+      seed_edge_ids: input.seed_edge_ids ?? [],
+      exclude_page_ids: input.exclude_page_ids ?? [],
+      depth,
+      limit: edgeLimit,
+      ...(input.relation_types === undefined ? {} : { relation_types: input.relation_types }),
+      ...(input.version_id === undefined ? {} : { version_id: input.version_id }),
+    });
+    const graphExpansions = toBoundedGraphExpansions(candidates, depth);
+    const pagesById = createBoundedGraphPageMap(candidates);
+    const expandedResults = graphExpansions.flatMap((expansion) => {
+      const page = pagesById.get(expansion.to_page_id);
+
+      return page === undefined ? [] : [toExpandedRetrievalResult(page, expansion)];
+    });
+    const contextPackDelta =
+      input.include_context_pack === true
+        ? new ContextPackBuilder([...pagesById.values()]).build({
+            knowledge_base_id: input.knowledge_base_id,
+            results: expandedResults,
+            graph_expansions: [],
+            budget_tokens: input.context_budget_tokens ?? 4000,
+          })
+        : null;
+    const expandedPageIds = uniqueStrings(expandedResults.map((result) => result.page_id));
+    const excludePageIds = new Set(input.exclude_page_ids ?? []);
+    const allNodeIds = uniqueStrings([...seedPageIds, ...expandedPageIds]);
+    const warnings = candidates.length >= edgeLimit ? ["graph.limit.edge_budget_reached"] : [];
+    const answerability = assessRetrieveAnswerability({
+      query: "",
+      mode: "graph",
+      results: expandedResults,
+      graph_expansions: graphExpansions,
+      citations: dedupeCitations(expandedResults.flatMap((result) => result.citations)),
+      context_pack: contextPackDelta,
+      warnings,
+      normalized_input: {
+        top_k: expandedResults.length,
+        graph_depth: depth,
+        graph_limit_per_result: graphExpansions.length,
+        context_budget_tokens: input.context_budget_tokens ?? 4000,
+        min_answer_confidence: defaultAnswerableConfidenceThreshold,
+        partial_answer_confidence: defaultPartialConfidenceThreshold,
+        strict_evidence: false,
+        no_answer_behavior: "diagnostic_results",
+        warnings,
+      },
+      semantic_requested: false,
+      semantic_index_record_count: 0,
+      duplicate_pruned_count: 0,
+      has_filters:
+        (input.relation_types?.length ?? 0) > 0 || (input.exclude_page_ids?.length ?? 0) > 0,
+    }).answerability;
+    const annotatedContextPackDelta =
+      contextPackDelta === null
+        ? null
+        : attachContextPackAnswerability(contextPackDelta, answerability);
+
+    return {
+      knowledge_base_id: input.knowledge_base_id,
+      expanded_results: expandedResults,
+      nodes: allNodeIds.flatMap((pageId) => {
+        const page = pagesById.get(pageId);
+
+        return page === undefined ? [] : [toExpandableGraphNode(page)];
+      }),
+      edges: graphExpansions.map((item) => ({
+        edge_id: item.edge_id,
+        from_page_id: item.from_page_id,
+        source_document_ids: [...item.source_document_ids],
+        to_page_id: item.to_page_id,
+        relation_type: item.relation_type,
+        visibility_origin: item.edge_visibility_origin ?? "canonical",
+      })),
+      context_pack_delta: annotatedContextPackDelta,
+      answerability,
+      warnings,
+      graph_budget: {
+        edge_limit: edgeLimit,
+        omitted_edges: candidates.length >= edgeLimit ? 1 : 0,
+      },
+      next_expansion: {
+        seed_page_ids: expandedPageIds,
+        relation_types: uniqueRelationTypes(graphExpansions.map((item) => item.relation_type)),
+        depth: 1,
+        exclude_page_ids: uniqueStrings([...excludePageIds, ...seedPageIds, ...expandedPageIds]),
+      },
+    };
+  }
+}
+
 export interface GraphQueryInput {
   knowledge_base_id: string;
   page_id?: string;
   depth?: number;
   edge_reason?: RetrievalRelationType;
+  exclude_page_ids?: readonly string[];
+  limit?: number;
   page_type?: string;
+  version_id?: string;
 }
 
 export interface GraphQueryResponse {
   knowledge_base_id: string;
   version_id: string | null;
+  graph_readiness?: GraphInsightStatus;
   nodes: readonly ExpandableGraphNode[];
   edges: ReadonlyArray<
     ExpandableGraphEdge & {
@@ -1634,6 +2312,11 @@ export interface GraphQueryResponse {
       weight: number;
     }
   >;
+  warnings?: readonly string[];
+  graph_budget?: {
+    edge_limit: number;
+    omitted_edges: number;
+  };
 }
 
 export interface GraphAlgorithmMetadata {
@@ -1738,6 +2421,231 @@ export interface GraphInsightsResponse {
   surprising_connections: readonly GraphInsightItem[];
 }
 
+export class BoundedGraphQueryService {
+  constructor(private readonly repository: BoundedRetrievalRepository) {}
+
+  async query(input: GraphQueryInput): Promise<GraphQueryResponse> {
+    const edgeLimit = normalizeGraphQueryLimit(input.limit);
+    const candidates = await this.repository.listGraphCandidates({
+      knowledge_base_id: input.knowledge_base_id,
+      seed_page_ids: input.page_id === undefined ? [] : [input.page_id],
+      seed_edge_ids: [],
+      exclude_page_ids: input.exclude_page_ids ?? [],
+      depth: input.depth ?? 1,
+      limit: edgeLimit,
+      ...(input.edge_reason === undefined ? {} : { relation_types: [input.edge_reason] }),
+      ...(input.page_type === undefined ? {} : { filters: { page_types: [input.page_type] } }),
+      ...(input.version_id === undefined ? {} : { version_id: input.version_id }),
+    });
+    const pageById = createBoundedGraphPageMap(candidates);
+    const edges = candidates.map((candidate) => candidate.edge);
+    const visibleNodeIds = new Set<string>();
+
+    for (const candidate of candidates) {
+      visibleNodeIds.add(candidate.source_page.page_id);
+      visibleNodeIds.add(candidate.target_page.page_id);
+    }
+
+    if (input.page_id !== undefined) {
+      visibleNodeIds.add(input.page_id);
+    }
+
+    const nodes = [...visibleNodeIds].flatMap((pageId) => {
+      const page = pageById.get(pageId);
+
+      if (page === undefined || (input.page_type !== undefined && page.type !== input.page_type)) {
+        return [];
+      }
+
+      return [toExpandableGraphNode(page)];
+    });
+    const graphAlgorithm = createGraphRelevanceAlgorithmMetadata();
+    const signalContext = createGraphSignalContributionContext([...pageById.values()], edges);
+    const retainedNodeIds = new Set(nodes.map((node) => node.page_id));
+    const warnings = candidates.length >= edgeLimit ? ["graph.limit.edge_budget_reached"] : [];
+
+    return {
+      knowledge_base_id: input.knowledge_base_id,
+      version_id: input.version_id ?? null,
+      nodes,
+      edges: edges
+        .filter(
+          (edge) => retainedNodeIds.has(edge.from_page_id) && retainedNodeIds.has(edge.to_page_id),
+        )
+        .map((edge) => ({
+          edge_id: edge.edge_id,
+          from_page_id: edge.from_page_id,
+          source_document_ids: [...edge.source_document_ids],
+          to_page_id: edge.to_page_id,
+          relation_type: edge.relation_type,
+          visibility_origin: edge.visibility_origin ?? "canonical",
+          algorithm: graphAlgorithm,
+          explanation: edge.explanation,
+          signal_contributions: calculateGraphSignalContributions(edge, signalContext),
+          weight: edge.weight,
+        })),
+      warnings,
+      graph_budget: {
+        edge_limit: edgeLimit,
+        omitted_edges: candidates.length >= edgeLimit ? 1 : 0,
+      },
+    };
+  }
+}
+
+export function createGraphInsightsFromRecords(input: {
+  knowledgeBaseId: string;
+  pages: readonly RetrievalPageRecord[];
+  edges: readonly RetrievalEdgeRecord[];
+  status?: GraphInsightStatus;
+}): GraphInsightsResponse {
+  const pageIds = new Set(input.pages.map((page) => page.page_id));
+  const pageById = new Map(input.pages.map((page) => [page.page_id, page]));
+  const visibleEdges = input.edges.filter(
+    (edge) => pageIds.has(edge.from_page_id) && pageIds.has(edge.to_page_id),
+  );
+  const signalContext = createGraphSignalContributionContext(input.pages, visibleEdges);
+  const degreeByPageId = new Map<string, number>();
+  const edgesByPageId = new Map<string, RetrievalEdgeRecord[]>();
+
+  for (const edge of visibleEdges) {
+    degreeByPageId.set(edge.from_page_id, (degreeByPageId.get(edge.from_page_id) ?? 0) + 1);
+    degreeByPageId.set(edge.to_page_id, (degreeByPageId.get(edge.to_page_id) ?? 0) + 1);
+    edgesByPageId.set(edge.from_page_id, [...(edgesByPageId.get(edge.from_page_id) ?? []), edge]);
+    edgesByPageId.set(edge.to_page_id, [...(edgesByPageId.get(edge.to_page_id) ?? []), edge]);
+  }
+
+  const communityAnalysis = detectGraphCommunities(input.pages, visibleEdges);
+  const isolatedPages = input.pages
+    .filter((page) => isGraphInsightPage(page))
+    .filter((page) => (degreeByPageId.get(page.page_id) ?? 0) === 0)
+    .map((page) =>
+      createGraphInsightItem({
+        insight_type: "isolated_page",
+        page_id: page.page_id,
+        title: page.title,
+        reason: "Page has no relationship evidence.",
+        reason_codes: ["isolated_page"],
+        severity: "medium",
+        score: 1,
+        evidence_refs: [
+          {
+            object_type: "wiki_page",
+            page_id: page.page_id,
+          },
+        ],
+      }),
+    );
+  const sparsePages = input.pages
+    .filter((page) => isGraphInsightPage(page))
+    .filter((page) => {
+      const degree = degreeByPageId.get(page.page_id) ?? 0;
+
+      return degree > 0 && degree < 2;
+    })
+    .map((page) => ({
+      ...createGraphInsightItem({
+        insight_type: "sparse_page" as const,
+        page_id: page.page_id,
+        title: page.title,
+        reason_codes: ["sparse_page"],
+        severity: "low",
+        score: 0.5,
+      }),
+      reason: "Page has fewer than two graph relationships.",
+    }));
+  const bridgePages = input.pages
+    .filter((page) => isGraphInsightPage(page))
+    .filter((page) => isBridgePage(page, communityAnalysis.assignments, edgesByPageId))
+    .map((page) => ({
+      ...createGraphInsightItem({
+        insight_type: "bridge_page",
+        page_id: page.page_id,
+        title: page.title,
+        reason_codes: ["bridge_page"],
+        severity: "low",
+        score: countNeighborCommunities(page.page_id, communityAnalysis.assignments, edgesByPageId),
+      }),
+      reasons: (edgesByPageId.get(page.page_id) ?? [])
+        .sort((left, right) => right.weight - left.weight)
+        .slice(0, 1)
+        .map(toGraphInsightReason),
+    }));
+  const sparseCommunityGaps = communityAnalysis.communities
+    .filter((community) => community.cohesion < 0.15 && community.memberIds.length >= 3)
+    .map((community) =>
+      createGraphInsightItem({
+        community: toGraphCommunityMetadata(community),
+        insight_type: "knowledge_gap",
+        page_ids: community.memberIds,
+        reason: "Community has weak internal graph cohesion.",
+        reason_codes: ["sparse_community"],
+        severity: "low",
+        score: Number((1 - community.cohesion).toFixed(4)),
+        title: `Sparse community: ${community.topPageTitles[0] ?? community.id}`,
+      }),
+    );
+  const bridgeGaps = bridgePages.map((item) => ({
+    ...item,
+    id: createStableGraphInsightId("knowledge_gap", item.page_id ?? "", "bridge"),
+    insight_type: "knowledge_gap" as const,
+    reason: "Page connects multiple graph communities.",
+    reason_codes: ["bridge_page"],
+  }));
+  const knowledgeGaps = [
+    ...isolatedPages.map((item) => ({
+      ...item,
+      id: createStableGraphInsightId("knowledge_gap", item.page_id ?? "", "isolated"),
+      insight_type: "knowledge_gap" as const,
+      reason: "Page has no relationship evidence.",
+      reason_codes: ["isolated_page"],
+    })),
+    ...sparseCommunityGaps,
+    ...bridgeGaps,
+  ];
+  const communities = communityAnalysis.communities
+    .filter((community) => community.memberIds.length >= 2)
+    .map((community) =>
+      createGraphInsightItem({
+        community: toGraphCommunityMetadata(community),
+        insight_type: "community",
+        page_ids: community.memberIds,
+        reason: "Connected pages share graph relationships.",
+        reason_codes: ["community"],
+        score: community.cohesion,
+        title: community.topPageTitles[0] ?? community.id,
+      }),
+    );
+  const surprisingConnections = findSurprisingGraphConnections(
+    visibleEdges,
+    pageById,
+    degreeByPageId,
+    communityAnalysis.assignments,
+    signalContext,
+  );
+  const snapshot = createGraphInsightSnapshot(input.pages, visibleEdges);
+
+  return {
+    knowledge_base_id: input.knowledgeBaseId,
+    status: input.status ?? createReadyGraphInsightStatus(),
+    snapshot,
+    empty_reasons: createGraphInsightEmptyReasons({
+      bridge_pages: bridgePages,
+      communities,
+      isolated_pages: isolatedPages,
+      knowledge_gaps: knowledgeGaps,
+      sparse_pages: sparsePages,
+      surprising_connections: surprisingConnections,
+    }),
+    isolated_pages: isolatedPages,
+    sparse_pages: sparsePages,
+    bridge_pages: bridgePages,
+    knowledge_gaps: knowledgeGaps,
+    communities,
+    surprising_connections: surprisingConnections,
+  };
+}
+
 export class GraphQueryService {
   constructor(private readonly repository: RetrievalRepository) {}
 
@@ -1753,7 +2661,8 @@ export class GraphQueryService {
           input.page_id === undefined ||
           edge.from_page_id === input.page_id ||
           edge.to_page_id === input.page_id,
-      );
+      )
+      .filter((edge) => !(input.exclude_page_ids ?? []).includes(edge.to_page_id));
     const nodeIds = new Set<string>();
 
     if (input.page_id === undefined) {
@@ -1784,7 +2693,7 @@ export class GraphQueryService {
         {
           page_id: page.page_id,
           page_version_id: page.page_version_id,
-          source_refs: page.source_refs.map((source) => ({ ...source })),
+          source_refs: clonePageSourceRefs(page),
           title: page.title,
           type: page.type,
           visibility_origin: page.visibility_origin ?? "canonical",
@@ -1821,164 +2730,19 @@ export class GraphQueryService {
 
   insights(knowledgeBaseId: string): GraphInsightsResponse {
     const pages = this.repository.listPages(knowledgeBaseId);
-    const pageIds = new Set(pages.map((page) => page.page_id));
-    const pageById = new Map(pages.map((page) => [page.page_id, page]));
     const edges = this.repository
       .listEdges(knowledgeBaseId)
-      .filter((edge) => pageIds.has(edge.from_page_id) && pageIds.has(edge.to_page_id));
-    const signalContext = createGraphSignalContributionContext(pages, edges);
-    const degreeByPageId = new Map<string, number>();
-    const edgesByPageId = new Map<string, RetrievalEdgeRecord[]>();
-
-    for (const edge of edges) {
-      degreeByPageId.set(edge.from_page_id, (degreeByPageId.get(edge.from_page_id) ?? 0) + 1);
-      degreeByPageId.set(edge.to_page_id, (degreeByPageId.get(edge.to_page_id) ?? 0) + 1);
-      edgesByPageId.set(edge.from_page_id, [...(edgesByPageId.get(edge.from_page_id) ?? []), edge]);
-      edgesByPageId.set(edge.to_page_id, [...(edgesByPageId.get(edge.to_page_id) ?? []), edge]);
-    }
-
-    const communityAnalysis = detectGraphCommunities(pages, edges);
-    const isolatedPages = pages
-      .filter((page) => isGraphInsightPage(page))
-      .filter((page) => (degreeByPageId.get(page.page_id) ?? 0) === 0)
-      .map((page) =>
-        createGraphInsightItem({
-          insight_type: "isolated_page",
-          page_id: page.page_id,
-          title: page.title,
-          reason: "Page has no relationship evidence.",
-          reason_codes: ["isolated_page"],
-          severity: "medium",
-          score: 1,
-          evidence_refs: [
-            {
-              object_type: "wiki_page",
-              page_id: page.page_id,
-            },
-          ],
-        }),
+      .filter(
+        (edge) =>
+          pages.some((page) => page.page_id === edge.from_page_id) &&
+          pages.some((page) => page.page_id === edge.to_page_id),
       );
-    const sparsePages = pages
-      .filter((page) => isGraphInsightPage(page))
-      .filter((page) => {
-        const degree = degreeByPageId.get(page.page_id) ?? 0;
 
-        return degree > 0 && degree < 2;
-      })
-      .map((page) => ({
-        ...createGraphInsightItem({
-          insight_type: "sparse_page" as const,
-          page_id: page.page_id,
-          title: page.title,
-          reason_codes: ["sparse_page"],
-          severity: "low",
-          score: 0.5,
-        }),
-        reason: "Page has fewer than two graph relationships.",
-      }));
-    const bridgePages = pages
-      .filter((page) => isGraphInsightPage(page))
-      .filter((page) => isBridgePage(page, communityAnalysis.assignments, edgesByPageId))
-      .map((page) => ({
-        ...createGraphInsightItem({
-          insight_type: "bridge_page",
-          page_id: page.page_id,
-          title: page.title,
-          reason_codes: ["bridge_page"],
-          severity: "low",
-          score: countNeighborCommunities(
-            page.page_id,
-            communityAnalysis.assignments,
-            edgesByPageId,
-          ),
-        }),
-        reasons: (edgesByPageId.get(page.page_id) ?? [])
-          .sort((left, right) => right.weight - left.weight)
-          .slice(0, 1)
-          .map(toGraphInsightReason),
-      }));
-    const sparseCommunityGaps = communityAnalysis.communities
-      .filter((community) => community.cohesion < 0.15 && community.memberIds.length >= 3)
-      .map((community) =>
-        createGraphInsightItem({
-          community: toGraphCommunityMetadata(community),
-          insight_type: "knowledge_gap",
-          page_ids: community.memberIds,
-          reason: "Community has weak internal graph cohesion.",
-          reason_codes: ["sparse_community"],
-          severity: "low",
-          score: Number((1 - community.cohesion).toFixed(4)),
-          title: `Sparse community: ${community.topPageTitles[0] ?? community.id}`,
-        }),
-      );
-    const bridgeGaps = bridgePages.map((item) => ({
-      ...item,
-      id: createStableGraphInsightId("knowledge_gap", item.page_id ?? "", "bridge"),
-      insight_type: "knowledge_gap" as const,
-      reason: "Page connects multiple graph communities.",
-      reason_codes: ["bridge_page"],
-    }));
-    const knowledgeGaps = [
-      ...isolatedPages.map((item) => ({
-        ...item,
-        id: createStableGraphInsightId("knowledge_gap", item.page_id ?? "", "isolated"),
-        insight_type: "knowledge_gap" as const,
-        reason: "Page has no relationship evidence.",
-        reason_codes: ["isolated_page"],
-      })),
-      ...sparseCommunityGaps,
-      ...bridgeGaps,
-    ];
-    const communities = communityAnalysis.communities
-      .filter((community) => community.memberIds.length >= 2)
-      .map((community) =>
-        createGraphInsightItem({
-          community: toGraphCommunityMetadata(community),
-          insight_type: "community",
-          page_ids: community.memberIds,
-          reason: "Connected pages share graph relationships.",
-          reason_codes: ["community"],
-          score: community.cohesion,
-          title: community.topPageTitles[0] ?? community.id,
-        }),
-      );
-    const surprisingConnections = findSurprisingGraphConnections(
+    return createGraphInsightsFromRecords({
+      knowledgeBaseId,
+      pages,
       edges,
-      pageById,
-      degreeByPageId,
-      communityAnalysis.assignments,
-      signalContext,
-    );
-    const snapshot = createGraphInsightSnapshot(pages, edges);
-    const cacheKey = `${knowledgeBaseId}:${snapshot.graph_hash}`;
-    const cached = graphInsightResponseCache.get(cacheKey);
-
-    if (cached !== undefined) {
-      return cloneGraphInsightsResponse(cached);
-    }
-
-    const response = {
-      knowledge_base_id: knowledgeBaseId,
-      status: createReadyGraphInsightStatus(),
-      snapshot,
-      empty_reasons: createGraphInsightEmptyReasons({
-        bridge_pages: bridgePages,
-        communities,
-        isolated_pages: isolatedPages,
-        knowledge_gaps: knowledgeGaps,
-        sparse_pages: sparsePages,
-        surprising_connections: surprisingConnections,
-      }),
-      isolated_pages: isolatedPages,
-      sparse_pages: sparsePages,
-      bridge_pages: bridgePages,
-      knowledge_gaps: knowledgeGaps,
-      communities,
-      surprising_connections: surprisingConnections,
-    };
-    graphInsightResponseCache.set(cacheKey, cloneGraphInsightsResponse(response));
-
-    return response;
+    });
   }
 }
 
@@ -2076,11 +2840,13 @@ export interface BuildContextPackInput {
   budget_tokens: number;
 }
 
+type ContextPackPageSource = RetrievalRepository | readonly RetrievalPageRecord[];
+
 export class ContextPackBuilder {
-  constructor(private readonly repository: RetrievalRepository) {}
+  constructor(private readonly pageSource: ContextPackPageSource) {}
 
   build(input: BuildContextPackInput): ContextPack {
-    const visiblePages = this.repository.listPages(input.knowledge_base_id);
+    const visiblePages = listContextPackPages(this.pageSource, input.knowledge_base_id);
     const visiblePagesById = new Map(visiblePages.map((page) => [page.page_id, page]));
     const systemPages = visiblePages.filter((page) => page.is_system_page);
     const sortedResults = sortResultsForContext(input.results);
@@ -2235,8 +3001,20 @@ export class ContextPackBuilder {
   }
 }
 
-export function createInMemoryRetrievalRepository(): RetrievalRepository {
-  return new InMemoryRetrievalRepository();
+function listContextPackPages(
+  pageSource: ContextPackPageSource,
+  knowledgeBaseId: string,
+): RetrievalPageRecord[] {
+  const pages: readonly RetrievalPageRecord[] =
+    typeof (pageSource as RetrievalRepository).listPages === "function"
+      ? (pageSource as RetrievalRepository).listPages(knowledgeBaseId)
+      : (pageSource as readonly RetrievalPageRecord[]);
+
+  return pages.filter((page) => page.knowledge_base_id === knowledgeBaseId).map(clonePage);
+}
+
+export function createBoundedRetrievalExecutionContext(): RetrievalRepository {
+  return new BoundedRetrievalExecutionContext();
 }
 
 interface LexicalCandidate {
@@ -2258,7 +3036,10 @@ function isCanonicalScopedRecord(
 }
 
 function isForkOwnedRecord(record: RetrievalVisibilityMetadata, knowledgeBaseId: string): boolean {
-  return record.owner_knowledge_base_id === knowledgeBaseId;
+  return (
+    record.owner_knowledge_base_id === knowledgeBaseId &&
+    record.visibility_origin !== "upstream_inherited"
+  );
 }
 
 function endpointsVisible(edge: RetrievalEdgeRecord, visiblePageIds: ReadonlySet<string>): boolean {
@@ -2317,7 +3098,7 @@ function normalizeVisibleEmbedding(
   };
 }
 
-class InMemoryRetrievalRepository implements RetrievalRepository {
+class BoundedRetrievalExecutionContext implements RetrievalRepository {
   private readonly scopes = new Map<string, RetrievalKnowledgeBaseScopeRecord>();
   private readonly pages = new Map<string, RetrievalPageRecord>();
   private readonly edges = new Map<string, RetrievalEdgeRecord>();
@@ -3116,6 +3897,43 @@ function toRetrievalResult(
   };
 }
 
+export function scoreBoundedLexicalCandidatePage(
+  page: RetrievalPageRecord,
+  input: { query: string; rank: number },
+): BoundedLexicalCandidate | null {
+  const query = createLexicalQuery(input.query);
+
+  if (query.tokens.length === 0) {
+    return null;
+  }
+
+  const candidate = scoreLexicalPage(page, query);
+
+  if (candidate.keywordScore <= 0) {
+    return null;
+  }
+
+  return {
+    match_reasons: candidate.matchReasons,
+    page: clonePage(candidate.page),
+    rank: input.rank,
+    score: candidate.keywordScore,
+  };
+}
+
+export function createLexicalRetrievalResult(
+  candidate: BoundedLexicalCandidate,
+  queryText: string,
+): RetrievalResult {
+  return toRetrievalResult(
+    candidate.page,
+    candidate.score,
+    candidate.match_reasons,
+    candidate.rank,
+    createLexicalQuery(queryText),
+  );
+}
+
 function toSemanticRetrievalResult(
   page: RetrievalPageRecord,
   embedding: RetrievalEmbeddingRecord,
@@ -3158,6 +3976,17 @@ function toSemanticRetrievalResult(
     },
     visibility_origin: page.visibility_origin ?? "canonical",
   };
+}
+
+export function createSemanticRetrievalResult(
+  candidate: BoundedSemanticCandidate,
+): RetrievalResult {
+  return toSemanticRetrievalResult(
+    candidate.page,
+    candidate.embedding,
+    candidate.score,
+    candidate.rank,
+  );
 }
 
 function createResultSourceRefs(
@@ -3321,13 +4150,13 @@ function toExpandedRetrievalResult(
   };
 }
 
-interface EmbeddingUnit {
+export interface EmbeddingUnit {
   objectType: RetrievalEmbeddingObjectType;
   objectId: string;
   text: string;
 }
 
-function createEmbeddingUnits(page: RetrievalPageRecord): EmbeddingUnit[] {
+export function createEmbeddingUnits(page: RetrievalPageRecord): EmbeddingUnit[] {
   if (page.is_system_page) {
     return [
       {
@@ -3437,6 +4266,99 @@ function toGraphExpansion(
     insight_refs: insightRefsByPageId.get(edge.to_page_id) ?? [],
     signal_contributions: calculateGraphSignalContributions(edge, signalContext),
   };
+}
+
+function toBoundedGraphExpansions(
+  candidates: readonly BoundedGraphCandidate[],
+  fallbackDepth: number,
+): GraphExpansion[] {
+  const pages = [...createBoundedGraphPageMap(candidates).values()];
+  const edges = uniqueEdges(candidates.map((candidate) => candidate.edge));
+  const signalContext = createGraphSignalContributionContext(pages, edges);
+
+  return uniqueGraphCandidates(candidates)
+    .map((candidate) =>
+      toGraphExpansion(
+        candidate.edge,
+        candidate.target_page,
+        candidate.traversal.depth || fallbackDepth,
+        pages,
+        edges,
+        new Map(),
+        signalContext,
+      ),
+    )
+    .sort((left, right) => right.graph_score - left.graph_score);
+}
+
+function createBoundedGraphPageMap(
+  candidates: readonly BoundedGraphCandidate[],
+): Map<string, RetrievalPageRecord> {
+  const pagesById = new Map<string, RetrievalPageRecord>();
+
+  for (const candidate of candidates) {
+    pagesById.set(candidate.source_page.page_id, candidate.source_page);
+    pagesById.set(candidate.target_page.page_id, candidate.target_page);
+  }
+
+  return pagesById;
+}
+
+function toExpandableGraphNode(page: RetrievalPageRecord): ExpandableGraphNode {
+  const displayMetadata = createDisplayMetadata(page);
+
+  return {
+    page_id: page.page_id,
+    page_version_id: page.page_version_id,
+    source_refs: clonePageSourceRefs(page),
+    title: page.title,
+    type: page.type,
+    ...(displayMetadata === undefined ? {} : { display_metadata: displayMetadata }),
+    visibility_origin: page.visibility_origin ?? "canonical",
+  };
+}
+
+function uniqueGraphCandidates(
+  candidates: readonly BoundedGraphCandidate[],
+): BoundedGraphCandidate[] {
+  const seen = new Set<string>();
+  const output: BoundedGraphCandidate[] = [];
+
+  for (const candidate of candidates) {
+    if (seen.has(candidate.edge.edge_id)) {
+      continue;
+    }
+
+    seen.add(candidate.edge.edge_id);
+    output.push(candidate);
+  }
+
+  return output;
+}
+
+function uniqueEdges(edges: readonly RetrievalEdgeRecord[]): RetrievalEdgeRecord[] {
+  const edgesById = new Map(edges.map((edge) => [edge.edge_id, edge] as const));
+
+  return [...edgesById.values()];
+}
+
+function uniqueRelationTypes(values: readonly RetrievalRelationType[]): RetrievalRelationType[] {
+  return [...new Set(values)];
+}
+
+function normalizeGraphTraversalLimit(seedCount: number, depth: number): number {
+  const normalizedSeeds = Math.max(1, Math.trunc(seedCount));
+  const normalizedDepth = Math.max(1, Math.min(Math.trunc(depth), 5));
+
+  return Math.min(Math.max(normalizedSeeds * normalizedDepth * 25, 25), 500);
+}
+
+function normalizeGraphQueryLimit(value: number | undefined): number {
+  if (value === undefined) {
+    return 200;
+  }
+
+  return Math.max(1, Math.min(Math.trunc(value), 500));
 }
 
 function createGraphInsightRefsByPageId(
@@ -3580,7 +4502,7 @@ interface RetrieveAnswerabilityAssessmentInput {
   warnings: readonly string[];
   normalized_input: NormalizedRetrieveInput;
   semantic_requested: boolean;
-  semantic_index_record_count: number;
+  semantic_index_record_count: number | null;
   duplicate_pruned_count: number;
   has_filters: boolean;
 }
@@ -4131,7 +5053,7 @@ function clampPositiveInteger(
 }
 
 function buildExpandableGraph(
-  repository: RetrievalRepository,
+  pages: readonly RetrievalPageRecord[],
   results: readonly RetrievalResult[],
   graphExpansions: readonly GraphExpansion[],
   input: RetrieveInput,
@@ -4141,7 +5063,9 @@ function buildExpandableGraph(
     ...new Set([...seedPageIds, ...graphExpansions.map((item) => item.to_page_id)]),
   ];
   const visiblePagesById = new Map(
-    repository.listPages(input.knowledge_base_id).map((page) => [page.page_id, page]),
+    pages
+      .filter((page) => page.knowledge_base_id === input.knowledge_base_id)
+      .map((page) => [page.page_id, page]),
   );
   const nodes = nodePageIds.flatMap((pageId) => {
     const page = visiblePagesById.get(pageId);
@@ -4156,7 +5080,7 @@ function buildExpandableGraph(
       {
         page_id: page.page_id,
         page_version_id: page.page_version_id,
-        source_refs: page.source_refs.map((source) => ({ ...source })),
+        source_refs: clonePageSourceRefs(page),
         title: page.title,
         type: page.type,
         ...(displayMetadata === undefined ? {} : { display_metadata: displayMetadata }),
@@ -4204,6 +5128,18 @@ function uniqueResultsByPage(results: readonly RetrievalResult[]): RetrievalResu
   return uniqueResults;
 }
 
+function uniquePagesById(pages: readonly RetrievalPageRecord[]): RetrievalPageRecord[] {
+  const pagesById = new Map<string, RetrievalPageRecord>();
+
+  for (const page of pages) {
+    if (!pagesById.has(page.page_id)) {
+      pagesById.set(page.page_id, page);
+    }
+  }
+
+  return [...pagesById.values()];
+}
+
 function summarizeRetrieveVisibility(input: {
   context_pack: ContextPack | null;
   expandable_graph: ExpandableGraph | null;
@@ -4248,6 +5184,10 @@ function summarizeRetrieveVisibility(input: {
   }
 
   for (const entry of input.context_pack?.entries ?? []) {
+    if (entry.category === "system_pages") {
+      continue;
+    }
+
     addPage(entry.page_id, entry.visibility_origin);
   }
 
@@ -5015,10 +5955,6 @@ function normalizeGraphPageKey(value: string): string {
 
 function hashStable(value: string): string {
   return createHash("sha256").update(value).digest("hex");
-}
-
-function cloneGraphInsightsResponse(response: GraphInsightsResponse): GraphInsightsResponse {
-  return JSON.parse(JSON.stringify(response)) as GraphInsightsResponse;
 }
 
 function toGraphInsightReason(edge: RetrievalEdgeRecord): GraphInsightReason {
@@ -6884,10 +7820,19 @@ function normalized(value: string): string {
   return value.toLowerCase();
 }
 
+function clonePageSourceRefs(page: RetrievalPageRecord): RetrievalSourceRef[] {
+  const visibilityOrigin = page.visibility_origin ?? "canonical";
+
+  return page.source_refs.map((source) => ({
+    ...source,
+    visibility_origin: source.visibility_origin ?? visibilityOrigin,
+  }));
+}
+
 function clonePage(page: RetrievalPageRecord): RetrievalPageRecord {
   return {
     ...page,
-    source_refs: page.source_refs.map((source) => ({ ...source })),
+    source_refs: clonePageSourceRefs(page),
     ...(page.frontmatter === undefined
       ? {}
       : { frontmatter: JSON.parse(JSON.stringify(page.frontmatter)) as Record<string, unknown> }),
@@ -6955,4 +7900,64 @@ function cloneTrace(record: RetrievalTraceRecord): RetrievalTraceRecord {
 
 function createRetrievalTraceId(): string {
   return `trace_${randomUUID().replaceAll("-", "")}`;
+}
+
+function readEmbeddingVector(data: NonNullable<OpenAIEmbeddingResponse["data"]>, index: number) {
+  const item = data.find((candidate) => candidate.index === index) ?? data[index];
+  const embedding = item?.embedding;
+
+  if (!Array.isArray(embedding) || !embedding.every((value) => typeof value === "number")) {
+    throw new Error("Embedding provider response did not include a valid vector.");
+  }
+
+  return [...embedding];
+}
+
+function readRerankResults(payload: OpenAIRerankResponse): Array<{ index: number; score: number }> {
+  const results =
+    readArray(payload.results) ??
+    readArray(payload.data) ??
+    readArray(payload.rankedDocuments) ??
+    [];
+
+  return results.flatMap((item) => {
+    const record = readRecord(item);
+    const index = readNumber(record.index);
+    const score = readNumber(record.score) ?? readNumber(record.relevance_score);
+
+    if (index === null || score === null) {
+      return [];
+    }
+
+    return [
+      {
+        index,
+        score,
+      },
+    ];
+  });
+}
+
+function readArray(value: unknown): unknown[] | null {
+  return Array.isArray(value) ? value : null;
+}
+
+function readRecord(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function readNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function resolveRerankEndpoint(baseUrl: string): string {
+  const trimmed = baseUrl.replace(/\/+$/u, "");
+
+  return /\/rerank$/u.test(trimmed) ? trimmed : joinUrlPath(trimmed, "rerank");
+}
+
+function joinUrlPath(baseUrl: string, path: string) {
+  return `${baseUrl.replace(/\/+$/u, "")}/${path}`;
 }

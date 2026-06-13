@@ -3,6 +3,11 @@ import type { RuntimeConfig } from "@fococontext/core";
 import { isAbsolute, relative, resolve } from "node:path";
 
 import {
+  createRemoteSourceSecurityPolicy,
+  validateRemoteSourceUrl,
+  type RemoteSourceSecurityPolicy,
+} from "./remote-source-security.js";
+import {
   sourceWatchSourceKinds,
   type CreateSourceWatchRuleInput,
   type ScheduledImportJobRecord,
@@ -489,7 +494,13 @@ export function validateSourceWatchLocation(
   }
 
   if (sourceKind === "url_list") {
-    validateUrlListLocation(location, config.sourceWatch.adapters.urlList.allowedProtocols);
+    validateUrlListLocation(
+      location,
+      createRemoteSourceSecurityPolicy(
+        config,
+        config.sourceWatch.adapters.urlList.allowedProtocols,
+      ),
+    );
     return;
   }
 
@@ -498,10 +509,13 @@ export function validateSourceWatchLocation(
     return;
   }
 
-  validateGitRepositoryLocation(location, config.sourceWatch.adapters.gitRepo.allowedProtocols);
+  validateGitRepositoryLocation(
+    location,
+    createRemoteSourceSecurityPolicy(config, config.sourceWatch.adapters.gitRepo.allowedProtocols),
+  );
 }
 
-function validateUrlListLocation(location: string, allowedProtocols: readonly string[]): void {
+function validateUrlListLocation(location: string, policy: RemoteSourceSecurityPolicy): void {
   const urls = location
     .split(/\r?\n|,/u)
     .map((item) => item.trim())
@@ -517,15 +531,18 @@ function validateUrlListLocation(location: string, allowedProtocols: readonly st
   }
 
   for (const url of urls) {
-    const parsed = parseUrl(url);
-
-    if (parsed === null || !allowedProtocols.includes(parsed.protocol.replace(/:$/u, ""))) {
+    try {
+      validateRemoteSourceUrl(url, policy);
+    } catch (error) {
       throw new ApiError("invalid_request", {
         messageKey: "api.validation.source_watch_url_list_invalid",
         details: {
           fields: ["location"],
-          allowed_protocols: [...allowedProtocols],
+          ...(error instanceof ApiError && error.details !== undefined
+            ? { remote_source_error: error.details }
+            : {}),
         },
+        cause: error,
       });
     }
   }
@@ -544,30 +561,21 @@ function validateS3PrefixLocation(location: string): void {
   });
 }
 
-function validateGitRepositoryLocation(
-  location: string,
-  allowedProtocols: readonly string[],
-): void {
-  const parsed = parseUrl(location);
-
-  if (parsed !== null && allowedProtocols.includes(parsed.protocol.replace(/:$/u, ""))) {
-    return;
-  }
-
-  throw new ApiError("invalid_request", {
-    messageKey: "api.validation.source_watch_git_location_invalid",
-    details: {
-      fields: ["location"],
-      allowed_protocols: [...allowedProtocols],
-    },
-  });
-}
-
-function parseUrl(value: string): URL | null {
+function validateGitRepositoryLocation(location: string, policy: RemoteSourceSecurityPolicy): void {
   try {
-    return new URL(value);
-  } catch {
-    return null;
+    validateRemoteSourceUrl(location, policy);
+    return;
+  } catch (error) {
+    throw new ApiError("invalid_request", {
+      messageKey: "api.validation.source_watch_git_location_invalid",
+      details: {
+        fields: ["location"],
+        ...(error instanceof ApiError && error.details !== undefined
+          ? { remote_source_error: error.details }
+          : {}),
+      },
+      cause: error,
+    });
   }
 }
 

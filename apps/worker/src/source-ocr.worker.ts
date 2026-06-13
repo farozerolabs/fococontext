@@ -1,7 +1,5 @@
 import { Queue, Worker } from "bullmq";
-import { sql, type Kysely } from "kysely";
 import type { RuntimeConfig } from "@fococontext/core";
-import type { DatabaseSchema } from "@fococontext/db";
 import {
   applyPdfOcrResults,
   isRetryableOcrProviderError,
@@ -20,12 +18,30 @@ import type {
   WorkerJobProgressWriter,
   WorkerJobStateGuard,
 } from "./job-progress.postgres-writer.js";
+import type { DocumentProcessingStateStore } from "./document-processing-state.js";
 import type { MediaCaptionQueue } from "./media-caption.worker.js";
+import {
+  createOcrPolicyHash,
+  toOcrCandidateProcessingUnit,
+  toOcrProcessingUnit,
+} from "./source-ocr-processing-state.js";
 import type { SourceOcrPayload } from "./source-parse.worker.js";
 import type { WikiAnalyzeQueue } from "./wiki-compile.worker.js";
 
 export const sourceOcrQueueName = "source.ocr";
 export const sourceOcrJobName = "source.ocr.document";
+
+type BoundedObjectReadResult = BoundedObjectReadSuccess | BoundedObjectReadFailure;
+
+interface BoundedObjectReadSuccess {
+  kind: "success";
+  content: Buffer;
+}
+
+interface BoundedObjectReadFailure {
+  kind: "fatal";
+  error: Record<string, unknown>;
+}
 
 export interface SourceOcrQueueJob {
   name: string;
@@ -34,8 +50,10 @@ export interface SourceOcrQueueJob {
 
 export interface SourceOcrProcessorConfig {
   concurrency: number;
+  checkpointInterval: number;
   confidenceThreshold: number;
   languages: string[];
+  maxObjectBytes: number;
   maxPagePixels: number;
   maxPagesPerDocument: number;
   maxRetries: number;
@@ -43,6 +61,7 @@ export interface SourceOcrProcessorConfig {
   retryBaseDelayMs: number;
   storePageImages: boolean;
   timeoutSeconds: number;
+  windowSize: number;
 }
 
 export interface SourceOcrProcessorOptions {
@@ -53,6 +72,7 @@ export interface SourceOcrProcessorOptions {
   jobProgress?: WorkerJobProgressWriter;
   objectStorage: ObjectStorageAdapter;
   ocrProvider: OcrProvider;
+  processingState?: DocumentProcessingStateStore;
   repository: SourceOcrRepository;
   sleep?: (milliseconds: number) => Promise<void>;
 }
@@ -114,8 +134,25 @@ export interface SourceOcrSaveResultInput {
   warnings: readonly ParserWarning[];
 }
 
+export interface SourceOcrPageProgressInput {
+  artifacts: readonly SourceOcrArtifactWrite[];
+  completedAt: string;
+  documentId: string;
+  jobId: string;
+  pages: readonly SourceOcrPageWrite[];
+  parsedContentId: string;
+}
+
+export interface SourceOcrReusablePageInput {
+  documentId: string;
+  pageNumbers: readonly number[];
+  parsedContentId: string;
+}
+
 export interface SourceOcrRepository {
   getParsedContentContext(parsedContentId: string): Promise<SourceOcrParsedContentContext | null>;
+  listReusableOcrPages(input: SourceOcrReusablePageInput): Promise<SourceOcrPageWrite[]>;
+  saveOcrPageWindow(input: SourceOcrPageProgressInput): Promise<void>;
   saveOcrResult(input: SourceOcrSaveResultInput): Promise<void>;
 }
 
@@ -184,7 +221,7 @@ export class BullMqSourceOcrWorker {
 
 export function createSourceOcrWorkerOptions(config: RuntimeConfig) {
   return {
-    concurrency: config.limits.ocr.concurrency,
+    concurrency: config.limits.backgroundJobs.ocr.concurrency,
     connection: {
       url: config.redis.url,
     },
@@ -199,6 +236,7 @@ export class SourceOcrProcessor {
   private readonly jobProgress: WorkerJobProgressWriter | undefined;
   private readonly objectStorage: ObjectStorageAdapter;
   private readonly ocrProvider: OcrProvider;
+  private readonly processingState: DocumentProcessingStateStore | undefined;
   private readonly repository: SourceOcrRepository;
   private readonly sleep: (milliseconds: number) => Promise<void>;
 
@@ -210,6 +248,7 @@ export class SourceOcrProcessor {
     this.jobProgress = options.jobProgress;
     this.objectStorage = options.objectStorage;
     this.ocrProvider = options.ocrProvider;
+    this.processingState = options.processingState;
     this.repository = options.repository;
     this.sleep =
       options.sleep ??
@@ -221,6 +260,8 @@ export class SourceOcrProcessor {
       jobId: payload.job_id,
       knowledgeBaseId: payload.knowledge_base_id,
       inputSnapshotId: payload.input_snapshot_id,
+      tenantId: payload.tenant_id,
+      projectId: payload.project_id,
       sourceDocumentId: payload.document_id,
     });
 
@@ -254,6 +295,33 @@ export class SourceOcrProcessor {
       return createSourceOcrFailedResult(payload);
     }
 
+    const candidatePageNumbers = payload.candidate_pages.map((page) => page.pageNumber);
+    const policyHash = createOcrPolicyHash(this.config);
+    const reusablePages = await this.repository.listReusableOcrPages({
+      documentId: payload.document_id,
+      pageNumbers: candidatePageNumbers,
+      parsedContentId: payload.parsed_content_id,
+    });
+    const reusablePageNumbers = new Set(reusablePages.map((page) => page.pageNumber));
+    const pendingCandidatePages = payload.candidate_pages
+      .filter((page) => !reusablePageNumbers.has(page.pageNumber))
+      .slice(0, Math.max(0, this.config.maxPagesPerDocument - reusablePages.length));
+    await this.processingState?.upsertUnits([
+      ...reusablePages.map((page) =>
+        toOcrProcessingUnit(payload, page, {
+          policyHash,
+          status: page.status,
+        }),
+      ),
+      ...pendingCandidatePages.map((page, index) =>
+        toOcrCandidateProcessingUnit(payload, page, {
+          policyHash,
+          status: "pending",
+          unitIndex: index,
+        }),
+      ),
+    ]);
+
     await this.jobProgress?.updateJobProgress({
       jobId: payload.job_id,
       knowledgeBaseId: payload.knowledge_base_id,
@@ -265,87 +333,233 @@ export class SourceOcrProcessor {
       parsedContentId: payload.parsed_content_id,
       metadata: {
         ocr_candidate_page_count: payload.candidate_pages.length,
-        ocr_candidate_pages: payload.candidate_pages.map((page) => page.pageNumber),
+        ocr_candidate_pages: candidatePageNumbers,
+        ocr_reusable_page_count: reusablePages.length,
+        ocr_window_size: this.config.windowSize,
       },
     });
 
-    const objectReads = new Map<string, Promise<Buffer>>();
-    const readObjectOnce = (key: string): Promise<Buffer> => {
+    if (candidatePageNumbers.length > 0 && pendingCandidatePages.length === 0) {
+      await this.processingState?.upsertCheckpoint({
+        checkpointKey: "ocr-pages",
+        configHash: policyHash,
+        cursor: {
+          completed_page_count: reusablePages.length,
+          total_page_count: candidatePageNumbers.length,
+        },
+        jobId: payload.job_id,
+        parsedContentId: payload.parsed_content_id,
+        sourceDocumentId: payload.document_id,
+        stage: "ocr",
+        status: "completed",
+        summary: {
+          reused_page_count: reusablePages.length,
+        },
+      });
+      await this.enqueueDownstream(payload, context);
+
+      return {
+        block_count: reusablePages.flatMap((page) => page.blocks).length,
+        document_id: payload.document_id,
+        failed_page_count: countFailedPages(reusablePages),
+        parsed_content_id: payload.parsed_content_id,
+        should_continue: true,
+        status: "completed",
+      };
+    }
+
+    const objectReads = new Map<string, Promise<BoundedObjectReadResult>>();
+    const readObjectOnce = (key: string): Promise<BoundedObjectReadResult> => {
       const existing = objectReads.get(key);
 
       if (existing !== undefined) {
         return existing;
       }
 
-      const next = this.objectStorage.getObject({ key }).then((object) => readBody(object.body));
+      const next = this.objectStorage
+        .getObject({ key })
+        .then((object) =>
+          readBodyWithinLimit(object.body, object.contentLength, this.config.maxObjectBytes, key),
+        );
       objectReads.set(key, next);
 
       return next;
     };
-    const [sourceContent, normalizedContent] = await Promise.all([
+    const [sourceRead, normalizedRead] = await Promise.all([
       readObjectOnce(payload.source_object_key),
       readObjectOnce(context.normalizedMarkdownObjectKey),
     ]);
-    const nativeMarkdown = normalizedContent.toString("utf8");
-    const nativePages = extractPdfNativePages(nativeMarkdown);
-    const rendered = await renderPdfPagesForOcr({
-      candidatePages: payload.candidate_pages.map((page) => page.pageNumber),
-      concurrency: this.config.concurrency,
-      content: sourceContent,
-      dpi: this.config.pageDpi,
-      maxPagePixels: this.config.maxPagePixels,
-      maxPages: this.config.maxPagesPerDocument,
-      timeoutMs: this.config.timeoutSeconds * 1000,
-      shouldCancel: async () => {
-        const nextGuard = await this.jobGuard?.canContinueJob({
-          jobId: payload.job_id,
-          knowledgeBaseId: payload.knowledge_base_id,
-          inputSnapshotId: payload.input_snapshot_id,
-          sourceDocumentId: payload.document_id,
-        });
-
-        return nextGuard?.canContinue === false;
-      },
-    });
-    const recognizedPages = await mapWithConcurrency(
-      rendered.pages,
-      this.config.concurrency,
-      (page) => this.recognizeRenderedPage(page),
-    );
-    const skippedPages = rendered.skippedPages.map((page) => toSkippedPageWrite(page));
-    const nextGuard = await this.canContinue(payload);
-
-    if (!nextGuard.canContinue) {
-      await this.jobProgress?.updateJobProgress({
-        jobId: payload.job_id,
-        knowledgeBaseId: payload.knowledge_base_id,
-        inputSnapshotId: payload.input_snapshot_id,
-        stage: "ocr",
-        status: "failed",
-        progress: 100,
-        message: "OCR stopped because the ingest job is no longer runnable.",
-        parsedContentId: payload.parsed_content_id,
-        error: {
-          code: "source_ocr_stale_job",
-          reason: nextGuard.reason ?? "unknown",
-        },
-      });
+    if (sourceRead.kind === "fatal") {
+      await this.markFailed(payload, sourceRead.error);
 
       return createSourceOcrFailedResult(payload);
     }
 
-    const artifacts = await this.storeRenderedPages(payload, rendered.pages);
-    const artifactByPageNumber = new Map(
-      artifacts.map((artifact) => [artifact.pageNumber, artifact]),
-    );
-    const pageWrites = [
-      ...recognizedPages.map((page) => ({
-        ...page,
-        artifactId: artifactByPageNumber.get(page.pageNumber)?.id ?? null,
-      })),
-      ...skippedPages,
-    ];
-    const ocrBlocks = recognizedPages.flatMap((page) => page.blocks);
+    if (normalizedRead.kind === "fatal") {
+      await this.markFailed(payload, normalizedRead.error);
+
+      return createSourceOcrFailedResult(payload);
+    }
+
+    const sourceContent = sourceRead.content;
+    const normalizedContent = normalizedRead.content;
+    const nativeMarkdown = normalizedContent.toString("utf8");
+    const nativePages = extractPdfNativePages(nativeMarkdown);
+    const artifacts: SourceOcrArtifactWrite[] = [];
+    const pageWrites: SourceOcrPageWrite[] = [...reusablePages];
+    const pendingWindows = chunkArray(pendingCandidatePages, this.config.windowSize);
+
+    for (const [windowIndex, pageWindow] of pendingWindows.entries()) {
+      await this.processingState?.upsertCheckpoint({
+        checkpointKey: "ocr-pages",
+        configHash: policyHash,
+        cursor: {
+          next_window_index: windowIndex,
+          processed_page_count: pageWrites.length,
+          total_window_count: pendingWindows.length,
+        },
+        jobId: payload.job_id,
+        parsedContentId: payload.parsed_content_id,
+        sourceDocumentId: payload.document_id,
+        stage: "ocr",
+        status: "running",
+      });
+      await this.processingState?.upsertUnits(
+        pageWindow.map((page, index) =>
+          toOcrCandidateProcessingUnit(payload, page, {
+            policyHash,
+            status: "running",
+            unitIndex: windowIndex * this.config.windowSize + index,
+          }),
+        ),
+      );
+      const rendered = await renderPdfPagesForOcr({
+        candidatePages: pageWindow.map((page) => page.pageNumber),
+        concurrency: this.config.concurrency,
+        content: sourceContent,
+        dpi: this.config.pageDpi,
+        maxPagePixels: this.config.maxPagePixels,
+        maxPages: this.config.maxPagesPerDocument,
+        timeoutMs: this.config.timeoutSeconds * 1000,
+        shouldCancel: async () => {
+          const nextGuard = await this.jobGuard?.canContinueJob({
+            jobId: payload.job_id,
+            knowledgeBaseId: payload.knowledge_base_id,
+            inputSnapshotId: payload.input_snapshot_id,
+            tenantId: payload.tenant_id,
+            projectId: payload.project_id,
+            sourceDocumentId: payload.document_id,
+          });
+
+          return nextGuard?.canContinue === false;
+        },
+      });
+      const recognizedPages = await mapWithConcurrency(
+        rendered.pages,
+        this.config.concurrency,
+        (page) => this.recognizeRenderedPage(page),
+      );
+      const nextGuard = await this.canContinue(payload);
+
+      if (!nextGuard.canContinue) {
+        await this.jobProgress?.updateJobProgress({
+          jobId: payload.job_id,
+          knowledgeBaseId: payload.knowledge_base_id,
+          inputSnapshotId: payload.input_snapshot_id,
+          stage: "ocr",
+          status: "failed",
+          progress: 100,
+          message: "OCR stopped because the ingest job is no longer runnable.",
+          parsedContentId: payload.parsed_content_id,
+          error: {
+            code: "source_ocr_stale_job",
+            reason: nextGuard.reason ?? "unknown",
+          },
+        });
+
+        return createSourceOcrFailedResult(payload);
+      }
+
+      const windowArtifacts = await this.storeRenderedPages(payload, rendered.pages);
+      const artifactByPageNumber = new Map(
+        windowArtifacts.map((artifact) => [artifact.pageNumber, artifact]),
+      );
+      const windowPageWrites = [
+        ...recognizedPages.map((page) => ({
+          ...page,
+          artifactId: artifactByPageNumber.get(page.pageNumber)?.id ?? null,
+        })),
+        ...rendered.skippedPages.map((page) => toSkippedPageWrite(page)),
+      ];
+
+      await this.repository.saveOcrPageWindow({
+        artifacts: windowArtifacts,
+        completedAt: new Date().toISOString(),
+        documentId: payload.document_id,
+        jobId: payload.job_id,
+        pages: windowPageWrites,
+        parsedContentId: payload.parsed_content_id,
+      });
+      await this.processingState?.upsertUnits(
+        windowPageWrites.map((page) => {
+          const artifact = artifactByPageNumber.get(page.pageNumber);
+
+          if (artifact === undefined) {
+            return toOcrProcessingUnit(payload, page, {
+              policyHash,
+              status: page.status,
+            });
+          }
+
+          return toOcrProcessingUnit(payload, page, {
+            artifact,
+            policyHash,
+            status: page.status,
+          });
+        }),
+      );
+      await this.processingState?.upsertCheckpoint({
+        checkpointKey: "ocr-pages",
+        configHash: policyHash,
+        cursor: {
+          completed_window_index: windowIndex,
+          processed_page_count: pageWrites.length + windowPageWrites.length,
+          total_window_count: pendingWindows.length,
+        },
+        jobId: payload.job_id,
+        parsedContentId: payload.parsed_content_id,
+        sourceDocumentId: payload.document_id,
+        stage: "ocr",
+        status: "running",
+        summary: {
+          completed_windows: windowIndex + 1,
+        },
+      });
+      artifacts.push(...windowArtifacts);
+      pageWrites.push(...windowPageWrites);
+
+      if ((windowIndex + 1) % this.config.checkpointInterval === 0) {
+        await this.jobProgress?.updateJobProgress({
+          jobId: payload.job_id,
+          knowledgeBaseId: payload.knowledge_base_id,
+          inputSnapshotId: payload.input_snapshot_id,
+          stage: "ocr",
+          status: "running",
+          progress: 40,
+          message: "Running OCR on scanned PDF pages...",
+          parsedContentId: payload.parsed_content_id,
+          metadata: {
+            ocr_completed_windows: windowIndex + 1,
+            ocr_processed_page_count: pageWrites.length,
+            ocr_total_windows: pendingWindows.length,
+            ocr_window_size: this.config.windowSize,
+          },
+        });
+      }
+    }
+
+    pageWrites.sort((left, right) => left.pageNumber - right.pageNumber);
+    const ocrBlocks = pageWrites.flatMap((page) => page.blocks);
     const applied = applyPdfOcrResults({
       nativePages,
       ocrBlocks,
@@ -368,16 +582,32 @@ export class SourceOcrProcessor {
         ocrStatus: "failed",
         pages: pageWrites,
         parsedContentId: payload.parsed_content_id,
-        providerMetadata: createProviderMetadata(recognizedPages),
+        providerMetadata: createProviderMetadata(pageWrites),
         summary: {
           error: applied.error,
           failed_page_count: countFailedPages(pageWrites),
         },
-        warnings: rendered.warnings,
+        warnings: pageWrites.flatMap((page) => page.warnings),
       });
       await this.markFailed(payload, {
         code: "source_ocr_failed",
         parser_error: applied.error,
+      });
+      await this.processingState?.upsertCheckpoint({
+        checkpointKey: "ocr-pages",
+        configHash: policyHash,
+        jobId: payload.job_id,
+        parsedContentId: payload.parsed_content_id,
+        safeError: {
+          code: "source_ocr_failed",
+          parser_error: applied.error,
+        },
+        sourceDocumentId: payload.document_id,
+        stage: "ocr",
+        status: "failed",
+        summary: {
+          failed_page_count: countFailedPages(pageWrites),
+        },
       });
 
       return createSourceOcrFailedResult(payload, ocrBlocks.length, countFailedPages(pageWrites));
@@ -404,19 +634,40 @@ export class SourceOcrProcessor {
       ocrStatus:
         ocrBlocks.length > 0
           ? "succeeded"
-          : rendered.skippedPages.length > 0
+          : pageWrites.some((page) => page.status === "skipped")
             ? "skipped"
             : "not_required",
       pages: pageWrites,
       parsedContentId: payload.parsed_content_id,
-      providerMetadata: createProviderMetadata(recognizedPages),
+      providerMetadata: createProviderMetadata(pageWrites),
       summary: {
         failed_page_count: countFailedPages(pageWrites),
-        ocr_candidate_pages: payload.candidate_pages.map((page) => page.pageNumber),
-        ocr_page_count: rendered.pages.length,
-        skipped_page_count: rendered.skippedPages.length,
+        ocr_candidate_pages: candidatePageNumbers,
+        ocr_page_count: pageWrites.filter((page) => page.status === "succeeded").length,
+        ocr_reused_page_count: reusablePages.length,
+        ocr_window_size: this.config.windowSize,
+        skipped_page_count: pageWrites.filter((page) => page.status === "skipped").length,
       },
-      warnings: [...rendered.warnings, ...recognizedPages.flatMap((page) => page.warnings)],
+      warnings: pageWrites.flatMap((page) => page.warnings),
+    });
+    await this.processingState?.upsertCheckpoint({
+      checkpointKey: "ocr-pages",
+      configHash: policyHash,
+      cursor: {
+        completed_page_count: pageWrites.length,
+        total_page_count: candidatePageNumbers.length,
+      },
+      jobId: payload.job_id,
+      parsedContentId: payload.parsed_content_id,
+      sourceDocumentId: payload.document_id,
+      stage: "ocr",
+      status: "completed",
+      summary: {
+        failed_page_count: countFailedPages(pageWrites),
+        ocr_block_count: ocrBlocks.length,
+        ocr_page_count: pageWrites.filter((page) => page.status === "succeeded").length,
+        skipped_page_count: pageWrites.filter((page) => page.status === "skipped").length,
+      },
     });
 
     await this.enqueueDownstream(payload, context);
@@ -539,6 +790,8 @@ export class SourceOcrProcessor {
     if (this.captionQueue !== undefined && context.mediaAssetIds.length > 0) {
       await this.captionQueue.enqueueMediaCaptionJob({
         job_id: payload.job_id,
+        tenant_id: payload.tenant_id,
+        project_id: payload.project_id,
         knowledge_base_id: payload.knowledge_base_id,
         document_id: payload.document_id,
         parsed_content_id: payload.parsed_content_id,
@@ -569,6 +822,8 @@ export class SourceOcrProcessor {
 
     await this.compileQueue?.enqueueWikiAnalyzeJob({
       job_id: payload.job_id,
+      tenant_id: payload.tenant_id,
+      project_id: payload.project_id,
       knowledge_base_id: payload.knowledge_base_id,
       document_id: payload.document_id,
       parsed_content_id: payload.parsed_content_id,
@@ -616,6 +871,8 @@ export class SourceOcrProcessor {
       jobId: payload.job_id,
       knowledgeBaseId: payload.knowledge_base_id,
       inputSnapshotId: payload.input_snapshot_id,
+      tenantId: payload.tenant_id,
+      projectId: payload.project_id,
       sourceDocumentId: payload.document_id,
     });
 
@@ -626,244 +883,6 @@ export class SourceOcrProcessor {
     }
 
     return guard;
-  }
-}
-
-export class PostgresSourceOcrRepository implements SourceOcrRepository {
-  constructor(private readonly db: Kysely<DatabaseSchema>) {}
-
-  async getParsedContentContext(
-    parsedContentId: string,
-  ): Promise<SourceOcrParsedContentContext | null> {
-    const parsed = await sql<{
-      normalized_markdown_object_key: string;
-      parser_name: string;
-      parser_version: string;
-    }>`
-      select
-        normalized_markdown_object_key,
-        parser_name,
-        parser_version
-      from parsed_contents
-      where id = ${parsedContentId}
-    `.execute(this.db);
-    const row = parsed.rows[0];
-
-    if (row === undefined) {
-      return null;
-    }
-
-    const mediaAssets = await sql<{ id: string }>`
-      select id
-      from media_assets
-      where parsed_content_id = ${parsedContentId}
-        and caption_status in ('pending', 'failed')
-      order by id
-    `.execute(this.db);
-
-    return {
-      mediaAssetIds: mediaAssets.rows.map((asset) => asset.id),
-      normalizedMarkdownObjectKey: row.normalized_markdown_object_key,
-      parserName: row.parser_name,
-      parserVersion: row.parser_version,
-    };
-  }
-
-  async saveOcrResult(input: SourceOcrSaveResultInput): Promise<void> {
-    const pageNumbers = input.pages.map((page) => page.pageNumber);
-
-    if (pageNumbers.length > 0) {
-      await sql`
-        delete from ocr_blocks
-        where source_document_id = ${input.documentId}
-          and page_number in (${sql.join(pageNumbers)})
-      `.execute(this.db);
-    }
-
-    for (const artifact of input.artifacts) {
-      await sql`
-        insert into ocr_artifacts (
-          id,
-          source_document_id,
-          parsed_content_id,
-          job_id,
-          page_number,
-          artifact_kind,
-          object_key,
-          mime_type,
-          size_bytes,
-          sha256,
-          metadata
-        )
-        values (
-          ${artifact.id},
-          ${input.documentId},
-          ${input.parsedContentId},
-          ${input.jobId},
-          ${artifact.pageNumber},
-          'rendered_page_image',
-          ${artifact.objectKey},
-          ${artifact.mimeType},
-          ${artifact.sizeBytes},
-          ${artifact.sha256},
-          '{}'::jsonb
-        )
-        on conflict (id) do update set
-          object_key = excluded.object_key,
-          mime_type = excluded.mime_type,
-          size_bytes = excluded.size_bytes,
-          sha256 = excluded.sha256,
-          metadata = excluded.metadata
-      `.execute(this.db);
-    }
-
-    for (const page of input.pages) {
-      const pageStatusId = createOcrPageStatusId(input.documentId, page.pageNumber);
-
-      await sql`
-        insert into ocr_page_statuses (
-          id,
-          source_document_id,
-          parsed_content_id,
-          job_id,
-          page_number,
-          status,
-          reason,
-          provider_name,
-          engine,
-          model_version,
-          confidence_avg,
-          block_count,
-          attempt_count,
-          retryable,
-          error,
-          warnings,
-          metadata,
-          updated_at
-        )
-        values (
-          ${pageStatusId},
-          ${input.documentId},
-          ${input.parsedContentId},
-          ${input.jobId},
-          ${page.pageNumber},
-          ${page.status},
-          ${page.reason},
-          ${page.providerName},
-          ${page.engine},
-          ${page.modelVersion},
-          ${page.confidenceAvg},
-          ${page.blocks.length},
-          ${page.attemptCount},
-          ${page.retryable},
-          ${page.error === null ? null : JSON.stringify(page.error)}::jsonb,
-          ${JSON.stringify(page.warnings)}::jsonb,
-          ${JSON.stringify({ source_artifact_id: page.artifactId ?? null })}::jsonb,
-          ${input.completedAt}
-        )
-        on conflict (source_document_id, page_number) do update set
-          parsed_content_id = excluded.parsed_content_id,
-          job_id = excluded.job_id,
-          status = excluded.status,
-          reason = excluded.reason,
-          provider_name = excluded.provider_name,
-          engine = excluded.engine,
-          model_version = excluded.model_version,
-          confidence_avg = excluded.confidence_avg,
-          block_count = excluded.block_count,
-          attempt_count = excluded.attempt_count,
-          retryable = excluded.retryable,
-          error = excluded.error,
-          warnings = excluded.warnings,
-          metadata = excluded.metadata,
-          updated_at = excluded.updated_at
-      `.execute(this.db);
-
-      for (const block of page.blocks) {
-        const blockId = createOcrBlockId(input.documentId, page.pageNumber, block.blockIndex);
-
-        await sql`
-          insert into ocr_blocks (
-            id,
-            ocr_page_status_id,
-            source_document_id,
-            parsed_content_id,
-            source_artifact_id,
-            page_number,
-            block_index,
-            text,
-            confidence,
-            bbox,
-            language,
-            provider_name,
-            engine,
-            model_version,
-            locator
-          )
-          values (
-            ${blockId},
-            ${pageStatusId},
-            ${input.documentId},
-            ${input.parsedContentId},
-            ${page.artifactId ?? null},
-            ${page.pageNumber},
-            ${block.blockIndex},
-            ${block.text},
-            ${block.confidence ?? null},
-            ${block.bbox === undefined ? null : JSON.stringify(block.bbox)}::jsonb,
-            ${block.language ?? null},
-            ${block.provider},
-            ${block.engine},
-            ${block.modelVersion ?? null},
-            ${JSON.stringify({
-              block_id: blockId,
-              block_index: block.blockIndex,
-              kind: "page",
-              origin: "ocr",
-              page_number: page.pageNumber,
-              source_artifact_id: page.artifactId ?? null,
-              value: String(page.pageNumber),
-            })}::jsonb
-          )
-          on conflict (source_document_id, page_number, block_index) do update set
-            ocr_page_status_id = excluded.ocr_page_status_id,
-            parsed_content_id = excluded.parsed_content_id,
-            source_artifact_id = excluded.source_artifact_id,
-            text = excluded.text,
-            confidence = excluded.confidence,
-            bbox = excluded.bbox,
-            language = excluded.language,
-            provider_name = excluded.provider_name,
-            engine = excluded.engine,
-            model_version = excluded.model_version,
-            locator = excluded.locator
-        `.execute(this.db);
-      }
-    }
-
-    await sql`
-      update parsed_contents
-      set
-        normalized_markdown_object_key = ${input.normalizedMarkdownObjectKey},
-        locators = ${JSON.stringify(input.locators)}::jsonb,
-        ocr_status = ${input.ocrStatus},
-        ocr_summary = ${JSON.stringify(input.summary)}::jsonb,
-        ocr_warnings = ${JSON.stringify(input.warnings)}::jsonb,
-        ocr_provider_metadata = ${JSON.stringify(input.providerMetadata)}::jsonb,
-        ocr_page_count = ${input.pages.length},
-        ocr_block_count = ${input.blockCount},
-        ocr_derived_segment_count = ${input.blockCount},
-        ocr_completed_at = ${input.completedAt}
-      where id = ${input.parsedContentId}
-    `.execute(this.db);
-    await sql`
-      update source_documents
-      set
-        ocr_status = ${input.ocrStatus},
-        ocr_summary = ${JSON.stringify(input.summary)}::jsonb,
-        updated_at = ${input.completedAt}
-      where id = ${input.documentId}
-    `.execute(this.db);
   }
 }
 
@@ -987,6 +1006,17 @@ function averageConfidence(blocks: readonly PdfOcrBlock[]) {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
+function chunkArray<T>(items: readonly T[], size: number): T[][] {
+  const safeSize = Math.max(1, Math.floor(size));
+  const chunks: T[][] = [];
+
+  for (let index = 0; index < items.length; index += safeSize) {
+    chunks.push(items.slice(index, index + safeSize));
+  }
+
+  return chunks;
+}
+
 function normalizeOcrError(error: unknown): Record<string, unknown> {
   if (error instanceof Error) {
     return {
@@ -1043,30 +1073,54 @@ function createSourceOcrFailedResult(
   };
 }
 
-function createOcrPageStatusId(documentId: string, pageNumber: number) {
-  return `ocrpg_${sanitizeIdSegment(documentId)}_${pageNumber}`;
-}
-
-function createOcrBlockId(documentId: string, pageNumber: number, blockIndex: number) {
-  return `ocrblk_${sanitizeIdSegment(documentId)}_${pageNumber}_${blockIndex}`;
-}
-
-function sanitizeIdSegment(value: string) {
-  return value.replace(/[^a-zA-Z0-9]+/g, "_");
-}
-
 async function sha256Hex(buffer: Buffer) {
   const { createHash } = await import("node:crypto");
 
   return createHash("sha256").update(buffer).digest("hex");
 }
 
-async function readBody(body: unknown): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-
-  for await (const chunk of body as AsyncIterable<Buffer | string>) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+async function readBodyWithinLimit(
+  body: unknown,
+  contentLength: number | undefined,
+  maxBytes: number,
+  objectKey: string,
+): Promise<BoundedObjectReadResult> {
+  if (contentLength !== undefined && contentLength > maxBytes) {
+    return createObjectReadLimitExceededResult(objectKey, contentLength, maxBytes);
   }
 
-  return Buffer.concat(chunks);
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+
+  for await (const chunk of body as AsyncIterable<Buffer | string>) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.byteLength;
+
+    if (totalBytes > maxBytes) {
+      return createObjectReadLimitExceededResult(objectKey, totalBytes, maxBytes);
+    }
+
+    chunks.push(buffer);
+  }
+
+  return {
+    kind: "success",
+    content: Buffer.concat(chunks, totalBytes),
+  };
+}
+
+function createObjectReadLimitExceededResult(
+  objectKey: string,
+  actualBytes: number,
+  limitBytes: number,
+): BoundedObjectReadFailure {
+  return {
+    kind: "fatal",
+    error: {
+      code: "source_ocr_object_limit_exceeded",
+      object_key: objectKey,
+      actual_bytes: actualBytes,
+      limit_bytes: limitBytes,
+    },
+  };
 }

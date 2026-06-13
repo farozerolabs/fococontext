@@ -6,9 +6,29 @@ export interface FococontextApiClientOptions {
   locale?: string | (() => string | undefined)
 }
 
+const adminCsrfHeaderName = "x-fococontext-csrf"
+const adminCsrfHeaderValue = "1"
+
 export interface ListOptions {
+  cursor?: string
+  limit?: number
   page?: number
   pageSize?: number
+}
+
+export interface CleanupOperationItemListOptions {
+  itemsPage?: number
+  itemsPageSize?: number
+}
+
+export interface SourceWatchScanItemListOptions extends ListOptions {
+  itemKind?: SourceWatchScanItemKind
+}
+
+export interface DocumentProcessingUnitListOptions extends ListOptions {
+  jobId?: string
+  stage?: DocumentProcessingUnitStage
+  status?: DocumentProcessingUnitStatus
 }
 
 export interface FococontextApiClient {
@@ -35,12 +55,16 @@ export interface FococontextApiClient {
   deleteKnowledgeBaseFork(forkId: string): Promise<DeletedFork>
   deleteSourceDocument(documentId: string): Promise<DeletedSourceDocument>
   deleteKnowledgeBase(id: string): Promise<DeletedKnowledgeBase>
-  getCleanupOperation(operationId: string): Promise<CleanupOperation>
+  getCleanupOperation(
+    operationId: string,
+    options?: CleanupOperationItemListOptions
+  ): Promise<CleanupOperation>
   listCleanupOperations(
     options?: ListOptions
   ): Promise<CleanupOperationListResult>
   retryCleanupOperation(
-    operationId: string
+    operationId: string,
+    options?: CleanupOperationItemListOptions
   ): Promise<CleanupOperationRetryResult>
   reingestSourceDocument(documentId: string): Promise<DocumentUploadResult>
   retryMediaAssetCaption(mediaAssetId: string): Promise<JobDetail>
@@ -50,6 +74,7 @@ export interface FococontextApiClient {
   ): Promise<JobDetail>
   getGraph(knowledgeBaseId: string): Promise<GraphResponse>
   getGraphInsights(knowledgeBaseId: string): Promise<GraphInsightsResponse>
+  refreshGraphInsights(knowledgeBaseId: string): Promise<JobDetail>
   getJob(jobId: string): Promise<JobDetail>
   getIngestJobStatuses(input: {
     job_ids: string[]
@@ -63,9 +88,17 @@ export interface FococontextApiClient {
     knowledgeBaseId: string
   ): Promise<DatasetConfiguration>
   getKnowledgeCheck(checkId: string): Promise<KnowledgeCheckResponse>
+  listKnowledgeCheckFindings(
+    checkId: string,
+    options?: ListOptions
+  ): Promise<KnowledgeCheckFindingListResult>
   getChangeSet(changeSetId: string): Promise<ChangeSet>
   getAdminSession(): Promise<AdminLoginResult>
   getScheduledImportJob(jobId: string): Promise<ScheduledImportJobEnvelope>
+  listScheduledImportJobItems(
+    jobId: string,
+    options?: SourceWatchScanItemListOptions
+  ): Promise<SourceWatchScanItemListResult>
   getMediaAssetPreview(mediaAssetId: string): Promise<MediaAssetPreviewEnvelope>
   getSourceDocument(documentId: string): Promise<SourceDocumentDetail>
   getSystemSettings(): Promise<SystemSettingsStatus>
@@ -85,6 +118,10 @@ export interface FococontextApiClient {
     knowledgeBaseId: string,
     options?: ListOptions
   ): Promise<KnowledgeVersionListResult>
+  listKnowledgeBaseChangeSets(
+    knowledgeBaseId: string,
+    options?: ListOptions
+  ): Promise<ChangeSetListResult>
   listKnowledgeBasePageVersions(
     knowledgeBaseId: string,
     options?: ListOptions
@@ -93,11 +130,18 @@ export interface FococontextApiClient {
     pageId: string,
     options?: ListOptions
   ): Promise<WikiPageVersionListResult>
-  listRelatedPages(pageId: string): Promise<RelatedPageListResult>
+  listRelatedPages(
+    pageId: string,
+    options?: ListOptions
+  ): Promise<RelatedPageListResult>
   listSourceDocuments(
     knowledgeBaseId: string,
     options?: ListOptions
   ): Promise<SourceDocumentListResult>
+  listDocumentProcessingUnits(
+    documentId: string,
+    options?: DocumentProcessingUnitListOptions
+  ): Promise<DocumentProcessingUnitListResult>
   listSourceWatchRules(
     knowledgeBaseId: string,
     options?: ListOptions
@@ -196,6 +240,7 @@ interface ApiListEnvelope<TData> {
 
 export interface Pagination {
   has_more: boolean
+  next_cursor?: string | null
   page: number
   page_size: number
   total: number
@@ -461,6 +506,12 @@ export interface CleanupOperation {
     skipped: number
     total: number
   }
+  items_pagination?: {
+    has_more: boolean
+    page: number
+    page_size: number
+    total: number
+  }
   items?: CleanupOperationItem[]
   knowledge_base_id: string | null
   last_error?: Record<string, unknown> | null
@@ -624,7 +675,26 @@ export interface JobEvent {
     | "job.canceled"
 }
 
+export interface BackgroundOperation {
+  created_at: string
+  cursor: Record<string, unknown>
+  failed_count: number
+  id: string
+  job_id: string | null
+  knowledge_base_id: string | null
+  last_item_id: string | null
+  metadata: Record<string, unknown>
+  operation_kind: string
+  processed_count: number
+  safe_error: Record<string, unknown> | null
+  stage: string
+  status: string
+  total_count: number | null
+  updated_at: string
+}
+
 export interface JobDetail extends Job {
+  background_operations: readonly BackgroundOperation[]
   events: readonly JobEvent[]
 }
 
@@ -729,6 +799,51 @@ export interface MediaAsset {
   sha256: string
   updated_at: string
   width: number | null
+}
+
+export type DocumentProcessingUnitStage =
+  | "parsing"
+  | "ocr"
+  | "media_extraction"
+  | "captioning"
+  | "parsed_artifact"
+
+export type DocumentProcessingUnitStatus =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "skipped"
+  | "canceled"
+
+export interface DocumentProcessingUnit {
+  attempt_scope: string
+  completed_at: string | null
+  content_hash: string | null
+  counters: Record<string, unknown>
+  dedupe_key: string
+  id: string
+  job_id: string
+  locator: Record<string, unknown>
+  metadata: Record<string, unknown>
+  object_key: string | null
+  object_refs: readonly Record<string, unknown>[]
+  parsed_content_id: string | null
+  retry_eligible: boolean
+  safe_error: Record<string, unknown> | null
+  source_document_id: string
+  stage: DocumentProcessingUnitStage
+  status: DocumentProcessingUnitStatus
+  unit_index: number | null
+  unit_key: string
+  unit_type: string
+  updated_at: string
+  warnings: readonly Record<string, unknown>[]
+}
+
+export interface DocumentProcessingUnitListResult {
+  data: DocumentProcessingUnit[]
+  pagination: Pagination
 }
 
 export interface SourceDocumentDetail {
@@ -984,6 +1099,32 @@ export interface ScheduledImportJobListResult {
   pagination: Pagination
 }
 
+export type SourceWatchScanItemKind =
+  | "discovered"
+  | "skipped"
+  | "new"
+  | "changed"
+  | "unchanged"
+  | "delete_candidate"
+  | "failed"
+
+export interface SourceWatchScanItem {
+  comparison_status?: string
+  content_hash?: string
+  cursor?: Record<string, unknown>
+  item_kind: SourceWatchScanItemKind
+  payload: Record<string, unknown>
+  safe_error?: Record<string, unknown> | null
+  source_identity: string
+  source_path?: string
+  source_url?: string
+}
+
+export interface SourceWatchScanItemListResult {
+  data: SourceWatchScanItem[]
+  pagination: Pagination
+}
+
 export interface SourceWatchScan {
   changed_sources: readonly SourceWatchScanSource[]
   created_at: string
@@ -1140,6 +1281,26 @@ export interface ChangeSet {
   trigger_type: string
 }
 
+export interface ChangeSetSummary {
+  applied_at: string | null
+  base_version_id: string | null
+  created_at: string
+  description: string | null
+  discarded_at: string | null
+  id: string
+  knowledge_base_id: string
+  metadata: Record<string, unknown>
+  status: string
+  target_version_id: string | null
+  title: string
+  trigger_type: string
+}
+
+export interface ChangeSetListResult {
+  data: ChangeSetSummary[]
+  pagination: Pagination
+}
+
 export interface SourceRef {
   document_id: string
   locator?: string
@@ -1197,6 +1358,7 @@ export interface GraphSignalContribution {
 
 export interface GraphResponse {
   edges: readonly GraphEdge[]
+  graph_readiness?: GraphInsightStatus
   knowledge_base_id: string
   nodes: readonly GraphNode[]
   version_id: string | null
@@ -1289,23 +1451,25 @@ export interface CreateKnowledgeCheckInput {
   source_document_ids?: string[]
 }
 
+export interface KnowledgeCheckFinding {
+  affected_object_ids?: string[]
+  confidence?: number
+  evidence?: Record<string, unknown>[]
+  finding_id?: string
+  message: string
+  page_id: string | null
+  severity: "low" | "medium" | "high"
+  source_refs?: Record<string, unknown>[]
+  suggested_action?: Record<string, unknown>
+  type: KnowledgeCheckType
+}
+
 export interface KnowledgeCheckResponse {
   check_id: string
   checks: KnowledgeCheckType[]
   created_at: string
   configuration_snapshot: Record<string, unknown>
-  findings: Array<{
-    affected_object_ids?: string[]
-    confidence?: number
-    evidence?: Record<string, unknown>[]
-    finding_id?: string
-    message: string
-    page_id: string | null
-    severity: "low" | "medium" | "high"
-    source_refs?: Record<string, unknown>[]
-    suggested_action?: Record<string, unknown>
-    type: KnowledgeCheckType
-  }>
+  findings: KnowledgeCheckFinding[]
   knowledge_base_id: string
   page_ids: string[]
   progress: number
@@ -1328,6 +1492,11 @@ export interface KnowledgeCheckResponse {
   }
   status: KnowledgeCheckStatus
   updated_at: string
+}
+
+export interface KnowledgeCheckFindingListResult {
+  data: KnowledgeCheckFinding[]
+  pagination: Pagination
 }
 
 export interface RetrieveRequestInput {
@@ -1407,6 +1576,7 @@ export interface RetrieveResponse {
     used_tokens: number
   } | null
   expandable_graph: Record<string, unknown> | null
+  graph_readiness?: GraphInsightStatus
   graph_expansions: readonly Record<string, unknown>[]
   knowledge_base_id: string
   mode: string
@@ -1852,11 +2022,14 @@ export function createFococontextApiClient(
           method: "DELETE",
         }
       ),
-    getCleanupOperation: (operationId) =>
+    getCleanupOperation: (operationId, itemOptions = {}) =>
       requestJson(
         fetchFn,
         baseUrl,
-        `/cleanup-operations/${encodeURIComponent(operationId)}`,
+        appendCleanupItemQuery(
+          `/cleanup-operations/${encodeURIComponent(operationId)}`,
+          itemOptions
+        ),
         options
       ),
     listCleanupOperations: (listOptions = {}) =>
@@ -1866,11 +2039,14 @@ export function createFococontextApiClient(
         appendListQuery("/cleanup-operations", listOptions),
         options
       ),
-    retryCleanupOperation: (operationId) =>
+    retryCleanupOperation: (operationId, itemOptions = {}) =>
       requestJson(
         fetchFn,
         baseUrl,
-        `/cleanup-operations/${encodeURIComponent(operationId)}/retry`,
+        appendCleanupItemQuery(
+          `/cleanup-operations/${encodeURIComponent(operationId)}/retry`,
+          itemOptions
+        ),
         options,
         {
           method: "POST",
@@ -1941,6 +2117,16 @@ export function createFococontextApiClient(
         `/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/graph/insights`,
         options
       ),
+    refreshGraphInsights: (knowledgeBaseId) =>
+      requestJson(
+        fetchFn,
+        baseUrl,
+        `/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/graph/insights/refresh`,
+        options,
+        {
+          method: "POST",
+        }
+      ),
     getJob: (jobId) =>
       requestJson(
         fetchFn,
@@ -1988,6 +2174,16 @@ export function createFococontextApiClient(
         `/knowledge-checks/${encodeURIComponent(checkId)}`,
         options
       ),
+    listKnowledgeCheckFindings: (checkId, listOptions = {}) =>
+      requestListJson(
+        fetchFn,
+        baseUrl,
+        appendListQuery(
+          `/knowledge-checks/${encodeURIComponent(checkId)}/findings`,
+          listOptions
+        ),
+        options
+      ),
     getChangeSet: (changeSetId) =>
       requestJson(
         fetchFn,
@@ -2002,6 +2198,16 @@ export function createFococontextApiClient(
         fetchFn,
         baseUrl,
         `/scheduled-import-jobs/${encodeURIComponent(jobId)}`,
+        options
+      ),
+    listScheduledImportJobItems: (jobId, listOptions = {}) =>
+      requestListJson(
+        fetchFn,
+        baseUrl,
+        appendSourceWatchScanItemListQuery(
+          `/scheduled-import-jobs/${encodeURIComponent(jobId)}/items`,
+          listOptions
+        ),
         options
       ),
     getMediaAssetPreview: (mediaAssetId) =>
@@ -2066,6 +2272,16 @@ export function createFococontextApiClient(
         ),
         options
       ),
+    listKnowledgeBaseChangeSets: (knowledgeBaseId, listOptions = {}) =>
+      requestListJson(
+        fetchFn,
+        baseUrl,
+        appendListQuery(
+          `/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/change-sets`,
+          listOptions
+        ),
+        options
+      ),
     listKnowledgeBasePageVersions: (knowledgeBaseId, listOptions = {}) =>
       requestListJson(
         fetchFn,
@@ -2088,11 +2304,14 @@ export function createFococontextApiClient(
         ),
         options
       ),
-    listRelatedPages: (pageId) =>
+    listRelatedPages: (pageId, listOptions = {}) =>
       requestListJson(
         fetchFn,
         baseUrl,
-        `/pages/${encodeURIComponent(pageId)}/related`,
+        appendListQuery(
+          `/pages/${encodeURIComponent(pageId)}/related`,
+          listOptions
+        ),
         options
       ),
     listSourceDocuments: (knowledgeBaseId, listOptions = {}) =>
@@ -2101,6 +2320,16 @@ export function createFococontextApiClient(
         baseUrl,
         appendListQuery(
           `/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents`,
+          listOptions
+        ),
+        options
+      ),
+    listDocumentProcessingUnits: (documentId, listOptions = {}) =>
+      requestListJson(
+        fetchFn,
+        baseUrl,
+        appendDocumentProcessingUnitListQuery(
+          `/documents/${encodeURIComponent(documentId)}/processing-units`,
           listOptions
         ),
         options
@@ -2449,6 +2678,75 @@ function appendListQuery(path: string, options: ListOptions): string {
   if (options.pageSize !== undefined) {
     params.set("page_size", String(options.pageSize))
   }
+  if (options.cursor !== undefined) {
+    params.set("cursor", options.cursor)
+  }
+  if (options.limit !== undefined) {
+    params.set("limit", String(options.limit))
+  }
+
+  const query = params.toString()
+
+  if (query.length === 0) {
+    return path
+  }
+
+  return `${path}${path.includes("?") ? "&" : "?"}${query}`
+}
+
+function appendSourceWatchScanItemListQuery(
+  path: string,
+  options: SourceWatchScanItemListOptions
+): string {
+  const basePath = appendListQuery(path, options)
+
+  if (options.itemKind === undefined) {
+    return basePath
+  }
+
+  return `${basePath}${basePath.includes("?") ? "&" : "?"}item_kind=${encodeURIComponent(
+    options.itemKind
+  )}`
+}
+
+function appendDocumentProcessingUnitListQuery(
+  path: string,
+  options: DocumentProcessingUnitListOptions
+): string {
+  const basePath = appendListQuery(path, options)
+  const params = new URLSearchParams()
+
+  if (options.jobId !== undefined) {
+    params.set("job_id", options.jobId)
+  }
+  if (options.stage !== undefined) {
+    params.set("stage", options.stage)
+  }
+  if (options.status !== undefined) {
+    params.set("status", options.status)
+  }
+
+  const query = params.toString()
+
+  if (query.length === 0) {
+    return basePath
+  }
+
+  return `${basePath}${basePath.includes("?") ? "&" : "?"}${query}`
+}
+
+function appendCleanupItemQuery(
+  path: string,
+  options: CleanupOperationItemListOptions
+): string {
+  const params = new URLSearchParams()
+
+  if (options.itemsPage !== undefined) {
+    params.set("items_page", String(options.itemsPage))
+  }
+  if (options.itemsPageSize !== undefined) {
+    params.set("items_page_size", String(options.itemsPageSize))
+  }
 
   const query = params.toString()
 
@@ -2509,6 +2807,10 @@ function createHeaders(
     headers.set("content-type", "application/json")
   }
 
+  if (requiresAdminCsrfProof(init.method)) {
+    headers.set(adminCsrfHeaderName, adminCsrfHeaderValue)
+  }
+
   if (options.apiKey !== undefined && options.apiKey.length > 0) {
     headers.set("authorization", `Bearer ${options.apiKey}`)
   }
@@ -2521,6 +2823,12 @@ function createHeaders(
   }
 
   return headers
+}
+
+function requiresAdminCsrfProof(method: string | undefined): boolean {
+  const normalizedMethod = (method ?? "GET").toUpperCase()
+
+  return !["GET", "HEAD", "OPTIONS"].includes(normalizedMethod)
 }
 
 function resolveClientLocale(options: FococontextApiClientOptions) {

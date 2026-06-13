@@ -1,4 +1,4 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useState, type FormEvent, type ReactNode } from "react"
 import { useTranslation } from "react-i18next"
 
@@ -235,6 +235,22 @@ export function KnowledgeCheckDialog({
 
 function KnowledgeCheckResult({ result }: { result: KnowledgeCheckResponse }) {
   const { t } = useTranslation()
+  const apiClient = useApiClient()
+  const findingsQuery = useQuery({
+    enabled: result.check_id.length > 0,
+    queryKey: adminQueryKeys.knowledgeCheckFindings(result.check_id, {
+      page: 1,
+      pageSize: 100,
+    }),
+    queryFn: () =>
+      apiClient.listKnowledgeCheckFindings(result.check_id, {
+        page: 1,
+        pageSize: 100,
+      }),
+  })
+  const findings = findingsQuery.data?.data ?? result.findings
+  const findingTotal =
+    findingsQuery.data?.pagination.total ?? result.findings.length
 
   return (
     <section className="flex flex-col gap-3 rounded-md border bg-muted/20 p-3">
@@ -246,9 +262,7 @@ function KnowledgeCheckResult({ result }: { result: KnowledgeCheckResponse }) {
         <Metric label={t("source.column.status")}>
           {t(`status.${result.status}`)}
         </Metric>
-        <Metric label={t("knowledgeCheck.findings")}>
-          {result.findings.length}
-        </Metric>
+        <Metric label={t("knowledgeCheck.findings")}>{findingTotal}</Metric>
         {result.semantic_run === undefined ? null : (
           <>
             <Metric label={t("knowledgeCheck.semanticRun")}>
@@ -265,7 +279,7 @@ function KnowledgeCheckResult({ result }: { result: KnowledgeCheckResponse }) {
       </div>
       <Progress label={t(`status.${result.status}`)} value={result.progress} />
       <DetailList
-        items={result.findings.map((finding) =>
+        items={findings.map((finding) =>
           [
             t(`knowledgeCheck.type.${finding.type}`),
             t(`knowledgeCheck.severity.${finding.severity}`),
@@ -279,19 +293,17 @@ function KnowledgeCheckResult({ result }: { result: KnowledgeCheckResponse }) {
         title={t("knowledgeCheck.results")}
       />
       <DetailList
-        items={result.findings.flatMap(
-          (finding) => finding.affected_object_ids ?? []
-        )}
+        items={findings.flatMap((finding) => finding.affected_object_ids ?? [])}
         title={t("knowledgeCheck.affectedObjects")}
       />
       <DetailList
-        items={result.findings.flatMap((finding) =>
+        items={findings.flatMap((finding) =>
           (finding.evidence ?? []).map((evidence) => JSON.stringify(evidence))
         )}
         title={t("knowledgeCheck.evidence")}
       />
       <DetailList
-        items={result.findings.flatMap((finding) =>
+        items={findings.flatMap((finding) =>
           (finding.source_refs ?? []).map((sourceRef) =>
             JSON.stringify(sourceRef)
           )
@@ -299,7 +311,7 @@ function KnowledgeCheckResult({ result }: { result: KnowledgeCheckResponse }) {
         title={t("knowledgeCheck.sourceRefs")}
       />
       <DetailList
-        items={result.findings.flatMap((finding) =>
+        items={findings.flatMap((finding) =>
           finding.suggested_action === undefined
             ? []
             : [JSON.stringify(finding.suggested_action)]

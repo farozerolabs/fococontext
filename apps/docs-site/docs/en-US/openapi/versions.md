@@ -16,27 +16,30 @@ Use this page to inspect Change Sets, Knowledge Versions, Page Versions, diffs, 
 
 ## Endpoint Matrix
 
-| Method  | Path                                               | Summary                      | operationId               |
-| ------- | -------------------------------------------------- | ---------------------------- | ------------------------- |
-| `GET`   | `/v1/knowledge-bases/{knowledge_base_id}/versions` | List knowledge base versions | listKnowledgeBaseVersions |
-| `GET`   | `/v1/change-sets/{change_set_id}`                  | Get a change set             | getChangeSet              |
-| `POST`  | `/v1/change-sets/{change_set_id}/apply`            | Apply a change set           | applyChangeSet            |
-| `POST`  | `/v1/change-sets/{change_set_id}/discard`          | Discard a change set         | discardChangeSet          |
-| `POST`  | `/v1/knowledge-bases/{knowledge_base_id}/rollback` | Roll back a knowledge base   | rollbackKnowledgeBase     |
-| `GET`   | `/v1/pages/{page_id}/versions`                     | List wiki page versions      | listWikiPageVersions      |
-| `POST`  | `/v1/pages/{page_id}/rollback`                     | Roll back a wiki page        | rollbackWikiPage          |
-| `GET`   | `/v1/pages/{page_id}`                              | Get a wiki page              | getWikiPage               |
-| `PATCH` | `/v1/pages/{page_id}`                              | Update a wiki page           | updateWikiPage            |
+| Method  | Path                                                  | Summary                         | operationId                 |
+| ------- | ----------------------------------------------------- | ------------------------------- | --------------------------- |
+| `GET`   | `/v1/knowledge-bases/{knowledge_base_id}/versions`    | List knowledge base versions    | listKnowledgeBaseVersions   |
+| `GET`   | `/v1/knowledge-bases/{knowledge_base_id}/change-sets` | List knowledge base change sets | listKnowledgeBaseChangeSets |
+| `GET`   | `/v1/change-sets/{change_set_id}`                     | Get a change set                | getChangeSet                |
+| `POST`  | `/v1/change-sets/{change_set_id}/apply`               | Apply a change set              | applyChangeSet              |
+| `POST`  | `/v1/change-sets/{change_set_id}/discard`             | Discard a change set            | discardChangeSet            |
+| `POST`  | `/v1/knowledge-bases/{knowledge_base_id}/rollback`    | Roll back a knowledge base      | rollbackKnowledgeBase       |
+| `GET`   | `/v1/pages/{page_id}/versions`                        | List wiki page versions         | listWikiPageVersions        |
+| `POST`  | `/v1/pages/{page_id}/rollback`                        | Roll back a wiki page           | rollbackWikiPage            |
+| `GET`   | `/v1/pages/{page_id}`                                 | Get a wiki page                 | getWikiPage                 |
+| `PATCH` | `/v1/pages/{page_id}`                                 | Update a wiki page              | updateWikiPage              |
 
 ## Field Guide
 
-| Field                  | Meaning                                                                                      |
-| ---------------------- | -------------------------------------------------------------------------------------------- |
-| `knowledge_version_id` | Immutable Knowledge Base checkpoint.                                                         |
-| `page_version_id`      | Immutable Wiki Page checkpoint.                                                              |
-| `change_set_id`        | Diff container describing what changed and why.                                              |
-| `trigger`              | Origin such as ingest, rollback, source_delete, page_merge, fork_submission, or manual_edit. |
-| `rollback`             | Creates a new version that points to previous content while keeping past versions intact.    |
+| Field                    | Meaning                                                                                                                       |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `knowledge_version_id`   | Immutable Knowledge Base checkpoint.                                                                                          |
+| `page_version_id`        | Immutable Wiki Page checkpoint.                                                                                               |
+| `change_set_id`          | Diff container describing what changed and why.                                                                               |
+| `trigger`                | Origin such as ingest, rollback, source_delete, page_merge, fork_submission, or manual_edit.                                  |
+| `rollback`               | Creates a new version that points to previous content while keeping past versions intact.                                     |
+| `cursor`                 | Opaque query token for large version and Change Set lists. Send `pagination.next_cursor` with `limit` to fetch the next page. |
+| `pagination.next_cursor` | Next-page cursor returned by cursor-enabled lists. It is `null` or omitted when no next page remains.                         |
 
 ## OpenAPI
 
@@ -58,6 +61,18 @@ paths:
       responses:
         200:
           description: "Standard JSON response envelope"
+          content:
+            "application/json":
+              schema:
+                "$ref": "#/components/schemas/SuccessEnvelope"
+  "/knowledge-bases/{knowledge_base_id}/change-sets":
+    get:
+      summary: "List knowledge base change sets"
+      description: "Returns Knowledge Base-scoped Change Set summaries. Use the Change Set detail endpoint for full diff and item payloads."
+      operationId: "listKnowledgeBaseChangeSets"
+      responses:
+        200:
+          description: "Standard JSON list response envelope"
           content:
             "application/json":
               schema:

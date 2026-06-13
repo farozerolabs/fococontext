@@ -4,7 +4,7 @@ import { createListEnvelope, createRequestId, createSuccessEnvelope } from "@foc
 import { requireApiKeyScope, type ApiKeyRequest } from "../auth/api-key.guard.js";
 import { parsePaginationQuery } from "../http/pagination.js";
 import { KnowledgeBaseService } from "../knowledge-bases/knowledge-base.service.js";
-import { SourceWatchService } from "./source-watch.service.js";
+import { readOptionalSourceWatchScanItemKind, SourceWatchService } from "./source-watch.service.js";
 import type {
   CreateSourceWatchRuleInput,
   UpdateSourceWatchRuleInput,
@@ -13,6 +13,10 @@ import type {
 interface SourceWatchRuleListQuery {
   page?: string;
   page_size?: string;
+}
+
+interface SourceWatchScanItemListQuery extends SourceWatchRuleListQuery {
+  item_kind?: string;
 }
 
 @Controller("v1/knowledge-bases/:knowledgeBaseId/source-watch-rules")
@@ -30,7 +34,7 @@ export class KnowledgeBaseSourceWatchController {
     @Req() request: ApiKeyRequest,
   ) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     return createSuccessEnvelope(
       await this.sourceWatchService.create(knowledgeBaseId, body, scope),
       createRequestId(),
@@ -44,7 +48,7 @@ export class KnowledgeBaseSourceWatchController {
     @Req() request: ApiKeyRequest,
   ) {
     const scope = requireApiKeyScope(request);
-    this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
+    await this.knowledgeBaseService.assertReadableKnowledgeBase(knowledgeBaseId, scope);
     const result = await this.sourceWatchService.list(
       knowledgeBaseId,
       {
@@ -148,5 +152,30 @@ export class ScheduledImportJobController {
       await this.sourceWatchService.getScheduledImportJob(jobId, requireApiKeyScope(request)),
       createRequestId(),
     );
+  }
+
+  @Get(":jobId/items")
+  async items(
+    @Param("jobId") jobId: string,
+    @Query() query: SourceWatchScanItemListQuery,
+    @Req() request: ApiKeyRequest,
+  ) {
+    const itemKind = readOptionalSourceWatchScanItemKind(query.item_kind);
+    const result = await this.sourceWatchService.listSourceWatchScanItems(
+      jobId,
+      {
+        ...parsePaginationQuery(query),
+        ...(itemKind === undefined ? {} : { itemKind }),
+      },
+      requireApiKeyScope(request),
+    );
+
+    return createListEnvelope(result.items, {
+      page: result.page,
+      page_size: result.pageSize,
+      total: result.total,
+      has_more: result.hasMore,
+      requestId: createRequestId(),
+    });
   }
 }
