@@ -74,6 +74,19 @@ function validateReport(report) {
   requireArray(report, "blackBox.checks", missing);
   requireArray(report, "blackBox.endpointCoverage", missing);
   requireArray(report, "blackBox.adminViews", missing);
+  requireArray(report, "coverageInventory.apiRoutes", missing);
+  requireArray(report, "coverageInventory.apiEndpointGroups", missing);
+  requireArray(report, "coverageInventory.adminRoutes", missing);
+  requireArray(report, "coverageInventory.backendModules", missing);
+  requireArray(report, "coverageInventory.dockerComposeTemplates", missing);
+  requireArray(report, "coverageInventory.envTemplates", missing);
+  requireArray(report, "coverageInventory.migrations", missing);
+  requireArray(report, "coverageInventory.representativeInputs", missing);
+  requireArray(report, "coverageInventory.runtimeServices", missing);
+  requireArray(report, "coverageMatrices.endpointGroups", missing);
+  requireArray(report, "coverageMatrices.adminRoutes", missing);
+  requireArray(report, "coverageMatrices.backendModules", missing);
+  requireArray(report, "coverageMatrices.dockerEnv", missing);
   requireArray(report, "security.denialChecks", missing);
   requireArray(report, "developerExperience.findings", missing);
   requireArray(report, "developerExperience.callSequence", missing);
@@ -205,6 +218,44 @@ function validFixture() {
     api: { checks: [] },
     blackBox: { adminViews: [], checks: [], endpointCoverage: [] },
     compose: { checks: [] },
+    coverageInventory: {
+      adminRoutes: [{ component: "DashboardPage", path: "/dashboard" }],
+      apiEndpointGroups: ["knowledge-bases"],
+      apiRoutes: [
+        {
+          file: "apps/api/src/knowledge-bases/knowledge-base.controller.ts",
+          group: "knowledge-bases",
+          method: "GET",
+          path: "/v1/knowledge-bases",
+        },
+      ],
+      backendModules: [
+        {
+          category: "controller",
+          file: "apps/api/src/knowledge-bases/knowledge-base.controller.ts",
+          module: "apps/api/src/knowledge-bases/knowledge-base.controller",
+        },
+      ],
+      dockerComposeTemplates: [{ path: "docker-compose.dev.example.yml", status: "available" }],
+      envTemplates: [{ path: ".env.example", status: "available" }],
+      migrations: [{ direction: "up", path: "packages/db/migrations/0001.up.sql" }],
+      representativeInputs: [
+        {
+          documentType: "Markdown",
+          extension: ".md",
+          kind: "general",
+          relativePath: "sample.md",
+          sizeClass: "small",
+        },
+      ],
+      runtimeServices: ["api", "admin", "worker", "postgres", "redis"],
+    },
+    coverageMatrices: {
+      adminRoutes: [{ component: "DashboardPage", path: "/dashboard", status: "covered" }],
+      backendModules: [{ category: "controller", count: 1, status: "covered" }],
+      dockerEnv: [{ kind: "compose", path: "docker-compose.dev.example.yml", status: "covered" }],
+      endpointGroups: [{ group: "knowledge-bases", routeCount: 1, status: "covered" }],
+    },
     developerExperience: { callSequence: [], findings: [] },
     env: { checks: [] },
     failures: [],

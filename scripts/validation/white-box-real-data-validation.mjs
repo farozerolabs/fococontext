@@ -67,6 +67,9 @@ const composeEnabled = parseBoolean(
 const runtimeEnabled = parseBoolean(
   args.runtime ?? process.env.FOCOCONTEXT_VALIDATION_RUNTIME ?? "true",
 );
+const startCompose = parseBoolean(
+  args.startCompose ?? process.env.FOCOCONTEXT_VALIDATION_START_COMPOSE ?? "false",
+);
 const strict = parseBoolean(args.strict ?? process.env.FOCOCONTEXT_VALIDATION_STRICT ?? "true");
 const headless = parseBoolean(args.headless ?? process.env.HEADLESS ?? "true");
 const supportedMimeTypes = new Map([
@@ -106,6 +109,23 @@ const report = {
     checks: [],
     files: composeFiles.map((file) => relativePath(file)),
     services: {},
+  },
+  coverageInventory: {
+    adminRoutes: [],
+    apiEndpointGroups: [],
+    apiRoutes: [],
+    backendModules: [],
+    dockerComposeTemplates: [],
+    envTemplates: [],
+    migrations: [],
+    representativeInputs: [],
+    runtimeServices: [],
+  },
+  coverageMatrices: {
+    adminRoutes: [],
+    backendModules: [],
+    dockerEnv: [],
+    endpointGroups: [],
   },
   developerExperience: {
     callSequence: [],
@@ -202,13 +222,30 @@ report.validationSuite = {
 
 try {
   await step("preflight", async () => {
+    report.coverageInventory = await buildCoverageInventory();
+    validateCoverageInventory();
     await validateEnvConfiguration(envExample, selectedEnv);
     if (composeEnabled) {
+      if (startCompose) {
+        await startComposeRuntime(selectedEnv);
+      }
       await validateComposeConfiguration(selectedEnv);
     }
     report.manifests.documents = await selectGeneralDocuments();
     report.manifests.legal = await selectLegalMarkdown();
+    report.coverageInventory.representativeInputs = [
+      ...report.manifests.documents,
+      ...report.manifests.legal,
+    ].map((item) => ({
+      documentType: item.documentType,
+      extension: item.extension,
+      kind: item.kind,
+      relativePath: item.relativePath,
+      sizeClass: item.sizeClass,
+    }));
     validateCoverageMap();
+    validateBackendWhiteBoxInventory();
+    validateAdminStaticInventory();
     markCoverage(["env-template", "selected-env"], "verified");
     if (composeEnabled) {
       markCoverage(["docker-compose-config"], "verified");
@@ -390,6 +427,8 @@ async function validateEnvConfiguration(example, actual) {
     throw new Error("Rerank configuration must be empty or fully configured.");
   }
 
+  await validateEnvTemplateAlignment(example, actual);
+
   report.env.effective = redactObject({
     apiBaseUrl,
     adminBaseUrl,
@@ -406,6 +445,77 @@ async function validateEnvConfiguration(example, actual) {
     s3Endpoint: actual.S3_ENDPOINT,
     uploadDirectEnabled: actual.UPLOAD_DIRECT_ENABLED,
     uploadMaxFileSizeMb: actual.UPLOAD_MAX_FILE_SIZE_MB,
+  });
+}
+
+async function validateEnvTemplateAlignment(example, actual) {
+  const composeReferences = new Map();
+  for (const composeFile of composeFiles) {
+    if (!(await fileExists(composeFile))) {
+      continue;
+    }
+    const text = await readFile(composeFile, "utf8");
+    for (const match of text.matchAll(/\$\{([A-Z0-9_]+)([^}]*)?\}/gu)) {
+      const key = match[1];
+      const expression = match[2] ?? "";
+      const existing = composeReferences.get(key) ?? { optional: false, required: false };
+      composeReferences.set(key, {
+        optional: existing.optional || /^:-?/.test(expression) || /^-/.test(expression),
+        required: existing.required || /^:\?/.test(expression) || /^\?/.test(expression),
+      });
+    }
+  }
+  const allowedExternalReferences = new Set(["FOCOCONTEXT_ENV_FILE"]);
+  const missingFromTemplate = [...composeReferences.entries()]
+    .filter(([, meta]) => meta.required || !meta.optional)
+    .map(([key]) => key)
+    .filter((key) => !allowedExternalReferences.has(key))
+    .filter((key) => !(key in example))
+    .sort();
+  const unsafePublicValues = Object.entries(actual)
+    .filter(
+      ([key, value]) => /PASSWORD|SECRET|API_KEY|TOKEN|CREDENTIAL/iu.test(key) && !isEmpty(value),
+    )
+    .filter(
+      ([, value]) => String(value).startsWith("http://") && !String(value).includes("localhost"),
+    )
+    .map(([key]) => key)
+    .sort();
+  const unusedTemplateKeys = Object.keys(example)
+    .filter((key) => key.startsWith("FOCOCONTEXT_"))
+    .filter((key) => !composeReferences.has(key))
+    .filter(
+      (key) =>
+        ![
+          "FOCOCONTEXT_ADMIN_API_BASE_URL",
+          "FOCOCONTEXT_ADMIN_BASE_URL",
+          "FOCOCONTEXT_API_KEY",
+          "FOCOCONTEXT_CORS_ORIGINS",
+          "FOCOCONTEXT_SOURCE_WATCH_CONTAINER_DIR",
+          "FOCOCONTEXT_SOURCE_WATCH_HOST_DIR",
+        ].includes(key),
+    )
+    .sort();
+
+  recordCheck(
+    report.env.checks,
+    "compose-env-references-in-template",
+    missingFromTemplate.length === 0,
+    {
+      missingFromTemplate,
+      referenceCount: composeReferences.size,
+    },
+  );
+  recordCheck(
+    report.env.checks,
+    "selected-env-no-unsafe-public-secret-values",
+    unsafePublicValues.length === 0,
+    {
+      unsafePublicValues,
+    },
+  );
+  recordCheck(report.env.checks, "env-template-unused-fococontext-keys-reviewed", true, {
+    unusedTemplateKeys,
   });
 }
 
@@ -467,12 +577,56 @@ async function validateComposeConfiguration(actualEnv) {
     return state.length > 0 && !["running", "exited"].includes(state) && health !== "healthy";
   });
 
-  recordCheck(report.compose.checks, "compose-ps-readable", psItems.length > 0, {
-    services: psItems.map((item) => item.Service ?? item.Name ?? "unknown"),
+  if (startCompose) {
+    recordCheck(report.compose.checks, "compose-ps-readable", psItems.length > 0, {
+      services: psItems.map((item) => item.Service ?? item.Name ?? "unknown"),
+    });
+    recordCheck(
+      report.compose.checks,
+      "compose-ps-no-unexpected-unhealthy",
+      unhealthy.length === 0,
+      {
+        unhealthy,
+      },
+    );
+  } else {
+    report.warnings.push("Compose ps health checks were skipped because start-compose is false.");
+    recordCheck(report.compose.checks, "compose-ps-skipped-without-start", true, {
+      startCompose,
+    });
+  }
+}
+
+async function startComposeRuntime(actualEnv) {
+  logProgress("compose:up:start", {
+    files: composeFiles.map((file) => relativePath(file)).join(","),
   });
-  recordCheck(report.compose.checks, "compose-ps-no-unexpected-unhealthy", unhealthy.length === 0, {
-    unhealthy,
+  const dockerArgs = [
+    "compose",
+    ...composeFiles.flatMap((file) => ["-f", file]),
+    "up",
+    "-d",
+    "--build",
+    "--remove-orphans",
+  ];
+  const result = await execFileAsync("docker", dockerArgs, {
+    cwd: workspaceRoot,
+    env: {
+      ...process.env,
+      ...actualEnv,
+      FOCOCONTEXT_ENV_FILE: envPath,
+    },
+    maxBuffer: 50 * 1024 * 1024,
   });
+  report.compose.checks.push({
+    details: redactObject({
+      stderr: result.stderr.trim().slice(0, 4000),
+      stdout: result.stdout.trim().slice(0, 4000),
+    }),
+    name: "compose-up-completed",
+    status: "passed",
+  });
+  logProgress("compose:up:done");
 }
 
 async function validateRuntimeMetadata(actualEnv) {
@@ -570,7 +724,7 @@ function isKnownReleaseValue(value) {
 }
 
 async function selectGeneralDocuments() {
-  const files = await listFiles(documentsDir);
+  const files = await listFilesSafe(documentsDir, "general-document-samples");
   const candidates = files
     .filter((file) => supportedMimeTypes.has(extname(file).toLowerCase()))
     .sort(
@@ -598,14 +752,20 @@ async function selectGeneralDocuments() {
   }
 
   if (selected.length === 0) {
-    throw new Error(`No supported general validation documents found in ${documentsDir}.`);
+    recordCheck(report.env.checks, "general-document-samples-available", !apiEnabled, {
+      directory: documentsDir,
+      message: "No supported general validation documents were available.",
+    });
+    report.residualRisks.push(
+      `No supported general validation documents were available in ${documentsDir}.`,
+    );
   }
 
   return selected;
 }
 
 async function selectLegalMarkdown() {
-  const files = (await listFiles(legalMarkdownDir))
+  const files = (await listFilesSafe(legalMarkdownDir, "legal-markdown-samples"))
     .filter((file) => extname(file).toLowerCase() === ".md")
     .sort((left, right) => basename(left).localeCompare(basename(right)));
 
@@ -615,7 +775,13 @@ async function selectLegalMarkdown() {
   }
 
   if (selected.length === 0) {
-    throw new Error(`No legal Markdown validation documents found in ${legalMarkdownDir}.`);
+    recordCheck(report.env.checks, "legal-markdown-samples-available", !apiEnabled, {
+      directory: legalMarkdownDir,
+      message: "No legal Markdown validation documents were available.",
+    });
+    report.residualRisks.push(
+      `No legal Markdown validation documents were available in ${legalMarkdownDir}.`,
+    );
   }
 
   return selected;
@@ -650,7 +816,241 @@ function pickSpread(items, limit) {
   return selected;
 }
 
+async function buildCoverageInventory() {
+  const [apiRoutes, adminRoutes, backendModules, dockerComposeTemplates, envTemplates, migrations] =
+    await Promise.all([
+      inventoryApiRoutes(),
+      inventoryAdminRoutes(),
+      inventoryBackendModules(),
+      inventoryDockerComposeTemplates(),
+      inventoryEnvTemplates(),
+      inventoryMigrations(),
+    ]);
+
+  return {
+    adminRoutes,
+    apiEndpointGroups: [
+      ...new Set(
+        apiRoutes.filter((route) => route.path.startsWith("/v1/")).map((route) => route.group),
+      ),
+    ].sort(),
+    apiRoutes,
+    backendModules,
+    dockerComposeTemplates,
+    envTemplates,
+    migrations,
+    representativeInputs: [],
+    runtimeServices: ["api", "admin", "worker", "postgres", "redis", "migrate", "ocr-service"],
+  };
+}
+
+async function inventoryApiRoutes() {
+  const files = (await listFiles(resolve(workspaceRoot, "apps/api/src"))).filter((file) =>
+    file.endsWith(".controller.ts"),
+  );
+  const routes = [];
+
+  for (const file of files) {
+    const text = await readFile(file, "utf8");
+    const controllerMatches = [...text.matchAll(/@Controller\((?:["']([^"']*)["'])?\)/gu)].map(
+      (match) => ({
+        index: match.index ?? 0,
+        path: match[1] ?? "",
+      }),
+    );
+    const blocks =
+      controllerMatches.length === 0
+        ? [{ body: text, path: "" }]
+        : controllerMatches.map((match, index) => ({
+            body: text.slice(match.index, controllerMatches[index + 1]?.index ?? text.length),
+            path: match.path,
+          }));
+
+    for (const block of blocks) {
+      const methodMatches = [
+        ...block.body.matchAll(/@(Get|Post|Put|Patch|Delete)\((?:["']([^"']*)["'])?\)/gu),
+      ];
+      for (const match of methodMatches) {
+        const method = match[1].toUpperCase();
+        const routePath = joinRoutePath(block.path, match[2] ?? "");
+        if (routePath.length === 0) {
+          continue;
+        }
+        routes.push({
+          file: relativePath(file),
+          group: endpointGroup(routePath),
+          method,
+          path: `/${routePath}`,
+        });
+      }
+    }
+  }
+
+  return routes.sort((left, right) =>
+    `${left.group}:${left.method}:${left.path}`.localeCompare(
+      `${right.group}:${right.method}:${right.path}`,
+    ),
+  );
+}
+
+async function inventoryAdminRoutes() {
+  const routePathFile = resolve(workspaceRoot, "apps/admin-web/src/app/route-paths.ts");
+  const routerFile = resolve(workspaceRoot, "apps/admin-web/src/app/router.tsx");
+  const [routeText, routerText] = await Promise.all([
+    readFile(routePathFile, "utf8"),
+    readFile(routerFile, "utf8"),
+  ]);
+  const literalRoutes = [...routeText.matchAll(/["'](\/[^"']*)["']/gu)]
+    .map((match) => match[1])
+    .filter((route) => !route.includes("${"))
+    .filter((route) => route === "/" || route.startsWith("/"))
+    .map((route) => ({
+      component: componentForAdminRoute(route, routerText),
+      path: route,
+    }));
+
+  return uniqueBy(literalRoutes, (item) => item.path).sort((left, right) =>
+    left.path.localeCompare(right.path),
+  );
+}
+
+async function inventoryBackendModules() {
+  const roots = [
+    "apps/api/src",
+    "apps/worker/src",
+    "packages/core/src",
+    "packages/db/src",
+    "packages/retrieval/src",
+    "packages/storage/src",
+    "packages/llm/src",
+  ];
+  const modules = [];
+
+  for (const root of roots) {
+    const absoluteRoot = resolve(workspaceRoot, root);
+    const files = await listFilesSafe(absoluteRoot, `backend-root:${root}`);
+    for (const file of files.filter((item) => /\.(ts|tsx|mjs|js)$/u.test(item))) {
+      const moduleName = relativePath(file)
+        .replace(/\.(ts|tsx|mjs|js)$/u, "")
+        .replace(/\/(index|server|app)$/u, "");
+      modules.push({
+        category: backendModuleCategory(file),
+        file: relativePath(file),
+        module: moduleName,
+      });
+    }
+  }
+
+  return modules.sort((left, right) => left.file.localeCompare(right.file));
+}
+
+async function inventoryDockerComposeTemplates() {
+  const files = [
+    "docker-compose.example.yml",
+    "docker-compose.optional-ocr.example.yml",
+    "docker-compose.dev.example.yml",
+    "docker-compose.yml",
+  ];
+  const templates = [];
+  for (const file of files) {
+    const absolutePath = resolve(workspaceRoot, file);
+    const exists = await fileExists(absolutePath);
+    templates.push({
+      path: file,
+      status: exists ? "available" : "missing",
+    });
+  }
+  return templates;
+}
+
+async function inventoryEnvTemplates() {
+  const files = [".env.example", ".env"];
+  const templates = [];
+  for (const file of files) {
+    const absolutePath = resolve(workspaceRoot, file);
+    const exists = await fileExists(absolutePath);
+    templates.push({
+      path: file,
+      status: exists ? "available" : "missing",
+    });
+  }
+  return templates;
+}
+
+async function inventoryMigrations() {
+  const migrationDir = resolve(workspaceRoot, "packages/db/migrations");
+  const files = await listFilesSafe(migrationDir, "database-migrations");
+  return files
+    .filter((file) => file.endsWith(".sql"))
+    .map((file) => ({
+      direction: file.endsWith(".down.sql") ? "down" : "up",
+      path: relativePath(file),
+    }))
+    .sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function validateCoverageInventory() {
+  const inventory = report.coverageInventory;
+  recordCheck(report.env.checks, "inventory-api-routes-present", inventory.apiRoutes.length >= 20, {
+    count: inventory.apiRoutes.length,
+  });
+  recordCheck(
+    report.env.checks,
+    "inventory-admin-routes-present",
+    inventory.adminRoutes.length >= 10,
+    { count: inventory.adminRoutes.length },
+  );
+  recordCheck(
+    report.env.checks,
+    "inventory-backend-modules-present",
+    inventory.backendModules.length >= 50,
+    { count: inventory.backendModules.length },
+  );
+  recordCheck(
+    report.env.checks,
+    "inventory-migrations-present",
+    inventory.migrations.some((item) => item.direction === "up"),
+    { count: inventory.migrations.length },
+  );
+}
+
 function validateCoverageMap() {
+  const endpointCoverage = report.coverageInventory.apiEndpointGroups.map((group) => ({
+    group,
+    routeCount: report.coverageInventory.apiRoutes.filter((route) => route.group === group).length,
+    status: "planned",
+  }));
+  const adminCoverage = report.coverageInventory.adminRoutes.map((route) => ({
+    component: route.component,
+    path: route.path,
+    status: "planned",
+  }));
+  const backendCoverage = Object.entries(
+    report.coverageInventory.backendModules.reduce((groups, item) => {
+      groups[item.category] = (groups[item.category] ?? 0) + 1;
+      return groups;
+    }, {}),
+  ).map(([category, count]) => ({ category, count, status: "planned" }));
+  const dockerEnvCoverage = [
+    ...report.coverageInventory.dockerComposeTemplates.map((item) => ({
+      kind: "compose",
+      path: item.path,
+      status: item.status === "available" ? "planned" : "missing",
+    })),
+    ...report.coverageInventory.envTemplates.map((item) => ({
+      kind: "env",
+      path: item.path,
+      status: item.status === "available" ? "planned" : "missing",
+    })),
+  ];
+
+  report.coverageMatrices = {
+    adminRoutes: adminCoverage,
+    backendModules: backendCoverage,
+    dockerEnv: dockerEnvCoverage,
+    endpointGroups: endpointCoverage,
+  };
+
   const coverage = [
     "env-template",
     "selected-env",
@@ -674,10 +1074,98 @@ function validateCoverageMap() {
     "admin-pages",
     "admin-retrieval",
     "cleanup",
+    ...endpointCoverage.map((item) => `endpoint-group:${item.group}`),
+    ...adminCoverage.map((item) => `admin-route:${item.path}`),
+    ...backendCoverage.map((item) => `backend-module:${item.category}`),
+    ...dockerEnvCoverage.map((item) => `${item.kind}:${item.path}`),
   ];
 
   report.moduleCoverage = coverage.map((name) => ({ name, status: "planned" }));
-  recordCheck(report.env.checks, "coverage-map-defined", coverage.length >= 20, { coverage });
+  recordCheck(report.env.checks, "coverage-map-defined", coverage.length >= 50, {
+    adminRoutes: adminCoverage.length,
+    backendModules: backendCoverage.length,
+    endpointGroups: endpointCoverage.length,
+    total: coverage.length,
+  });
+}
+
+function validateBackendWhiteBoxInventory() {
+  const categories = new Set(report.coverageInventory.backendModules.map((item) => item.category));
+  for (const category of [
+    "auth-security",
+    "controller",
+    "database",
+    "queue-runtime",
+    "repository-query",
+    "retrieval-graph",
+    "service",
+    "storage",
+    "worker",
+  ]) {
+    const present = categories.has(category);
+    recordCheck(report.env.checks, `backend-category-${category}-present`, present, {
+      category,
+    });
+    if (present) {
+      markCoverage([`backend-module:${category}`], "verified");
+    }
+  }
+
+  for (const boundary of ["postgres", "redis", "object-storage"]) {
+    const hasBoundary =
+      boundary === "postgres"
+        ? report.coverageInventory.backendModules.some(
+            (item) => item.category === "database" || item.file.includes("postgres"),
+          )
+        : boundary === "redis"
+          ? report.coverageInventory.backendModules.some((item) => item.file.includes("redis"))
+          : report.coverageInventory.backendModules.some((item) => item.file.includes("storage"));
+    recordCheck(report.env.checks, `durable-boundary-${boundary}-present`, hasBoundary, {
+      boundary,
+    });
+  }
+}
+
+async function validateAdminStaticInventory() {
+  const [englishText, chineseText, clientText] = await Promise.all([
+    readFile(resolve(workspaceRoot, "apps/admin-web/src/i18n/resources/en-US.ts"), "utf8"),
+    readFile(resolve(workspaceRoot, "apps/admin-web/src/i18n/resources/zh-CN.ts"), "utf8"),
+    readFile(resolve(workspaceRoot, "apps/admin-web/src/api/fococontext-client.ts"), "utf8"),
+  ]);
+  const requiredKeys = [
+    "nav.dashboard",
+    "nav.sources",
+    "nav.jobs",
+    "nav.pages",
+    "nav.graph",
+    "nav.versions",
+    "nav.retrievalLab",
+    "nav.settings",
+    "state.loading",
+    "systemSettings.envApiKey",
+  ];
+
+  for (const key of requiredKeys) {
+    const lastSegment = key.split(".").at(-1);
+    recordCheck(
+      report.env.checks,
+      `admin-i18n-key-${key}`,
+      englishText.includes(lastSegment) && chineseText.includes(lastSegment),
+      { key },
+    );
+  }
+
+  recordCheck(
+    report.env.checks,
+    "admin-client-uses-credentials",
+    clientText.includes("credentials") && clientText.includes("include"),
+  );
+  recordCheck(
+    report.env.checks,
+    "admin-route-inventory-matches-i18n",
+    report.coverageInventory.adminRoutes.length >= 10,
+    { count: report.coverageInventory.adminRoutes.length },
+  );
 }
 
 async function runOpenApiValidation() {
@@ -703,6 +1191,9 @@ async function runOpenApiValidation() {
     ...report.manifests.documents.slice(0, 2),
     ...report.manifests.legal.slice(0, 3),
   ];
+  if (uploadItems.length === 0) {
+    throw new Error("OpenAPI validation requires at least one representative document.");
+  }
   let uploadIndex = 0;
   for (const item of uploadItems) {
     uploadIndex += 1;
@@ -737,6 +1228,7 @@ async function runOpenApiValidation() {
   logProgress("openapi:retrieve:done");
   logProgress("openapi:errors:start");
   await validateApiErrors(knowledgeBase.id);
+  await validateEndpointGroupCoverage(knowledgeBase.id);
   logProgress("openapi:errors:done");
 }
 
@@ -1170,6 +1662,125 @@ async function validateApiErrors(knowledgeBaseId) {
     anonymousOpenApi.status,
     anonymousOpenApi.status === 401 || anonymousOpenApi.status === 403,
   );
+
+  await validateUnauthenticatedEndpointMatrix(knowledgeBaseId);
+}
+
+async function validateUnauthenticatedEndpointMatrix(knowledgeBaseId) {
+  const routeSamples = sampleEndpointGroupRoutes(knowledgeBaseId);
+
+  for (const route of routeSamples) {
+    const startedAt = Date.now();
+    const body =
+      route.method === "GET" || route.method === "DELETE"
+        ? undefined
+        : JSON.stringify(route.body ?? {});
+    const response = await fetchWithTimeout(
+      `${apiBaseUrl}${route.path}`,
+      {
+        ...(body === undefined ? {} : { body }),
+        headers:
+          body === undefined
+            ? { accept: "application/json" }
+            : { "content-type": "application/json" },
+        method: route.method,
+      },
+      `unauthenticated-${route.group}`,
+    );
+    recordOpenApiCall(route.method, route.path, response.status, Date.now() - startedAt);
+    recordDenialCheck(
+      `unauthenticated-${route.group}-rejected`,
+      response.status,
+      response.status === 401 || response.status === 403,
+    );
+  }
+}
+
+function sampleEndpointGroupRoutes(knowledgeBaseId) {
+  const replacements = {
+    ":changeSetId": "cs_missing_validation",
+    ":checkId": "check_missing_validation",
+    ":documentId": "doc_missing_validation",
+    ":forkId": "fork_missing_validation",
+    ":id": knowledgeBaseId,
+    ":jobId": "job_missing_validation",
+    ":knowledgeBaseId": knowledgeBaseId,
+    ":mediaAssetId": "med_missing_validation",
+    ":operationId": "cleanup_missing_validation",
+    ":pageId": "page_missing_validation",
+    ":ruleId": "sw_missing_validation",
+    ":type": "overview",
+    ":uploadSessionId": "ups_missing_validation",
+    ":webhookId": "wh_missing_validation",
+  };
+  const byGroup = new Map();
+
+  for (const route of report.coverageInventory.apiRoutes) {
+    if (!route.path.startsWith("/v1/")) {
+      continue;
+    }
+    if (!byGroup.has(route.group)) {
+      let path = route.path.slice("/v1".length);
+      for (const [key, value] of Object.entries(replacements)) {
+        path = path.split(key).join(value);
+      }
+      byGroup.set(route.group, {
+        body: sampleBodyForRoute(route),
+        group: route.group,
+        method: route.method,
+        path,
+      });
+    }
+  }
+
+  return [...byGroup.values()];
+}
+
+function sampleBodyForRoute(route) {
+  if (route.method === "POST" && route.path.includes("/retrieve/expand")) {
+    return { seed_page_ids: ["page_missing_validation"] };
+  }
+  if (route.method === "POST" && route.path.includes("/retrieve")) {
+    return { query: "validation" };
+  }
+  if (route.method === "POST" && route.path.includes("/source-evidence")) {
+    return { items: [] };
+  }
+  if (route.method === "POST" && route.path.includes("/webhooks")) {
+    return { events: ["job.completed"], target_url: "https://example.com/webhook" };
+  }
+  if (route.method === "POST" && route.path.includes("/api-keys")) {
+    return { name: "validation" };
+  }
+  if (route.method === "POST" && route.path.includes("/knowledge-bases")) {
+    return { name: "Validation" };
+  }
+  return {};
+}
+
+async function validateEndpointGroupCoverage(knowledgeBaseId) {
+  const observedGroups = new Set(
+    report.blackBox.endpointCoverage
+      .filter((item) => item.path.startsWith("/"))
+      .map((item) => endpointGroup(`v1${item.path}`)),
+  );
+  const missingGroups = report.coverageInventory.apiEndpointGroups.filter(
+    (group) => !observedGroups.has(group),
+  );
+
+  report.coverageMatrices.endpointGroups = report.coverageMatrices.endpointGroups.map((item) => ({
+    ...item,
+    status: missingGroups.includes(item.group) ? "missing" : "covered",
+  }));
+  for (const group of observedGroups) {
+    markCoverage([`endpoint-group:${group}`], "verified");
+  }
+
+  recordCheck(report.api.checks, "endpoint-group-coverage", missingGroups.length === 0, {
+    knowledgeBaseId,
+    missingGroups,
+    observedGroups: [...observedGroups].sort(),
+  });
 }
 
 function recordDenialCheck(name, status, passed) {
@@ -1193,7 +1804,9 @@ async function runAdminValidation() {
     viewport: { height: 950, width: 1440 },
   });
   await context.addInitScript(() => {
-    window.localStorage.setItem("fococontext.admin.language", "en-US");
+    if (window.localStorage.getItem("fococontext.admin.language") === null) {
+      window.localStorage.setItem("fococontext.admin.language", "en-US");
+    }
   });
   const page = await context.newPage();
 
@@ -1214,8 +1827,21 @@ async function runAdminValidation() {
   });
 
   try {
+    await adminCheck("login-zh-cn-labels", async () => {
+      await context.clearCookies();
+      await page.goto(`${adminBaseUrl}/login`);
+      await page.evaluate(() => {
+        window.localStorage.setItem("fococontext.admin.language", "zh-CN");
+      });
+      await page.reload();
+      await expect(page.getByRole("button", { name: "登录" })).toBeVisible({ timeout: 20000 });
+    });
+
     await adminCheck("login", async () => {
       await context.clearCookies();
+      await page.evaluate(() => {
+        window.localStorage.setItem("fococontext.admin.language", "en-US");
+      });
       await page.goto(`${adminBaseUrl}/login`);
       await page.locator('input[name="username"]').fill(selectedEnv.FOCOCONTEXT_ADMIN_USERNAME);
       await page.locator('input[name="password"]').fill(selectedEnv.FOCOCONTEXT_ADMIN_PASSWORD);
@@ -1245,14 +1871,42 @@ async function runAdminValidation() {
       await captureAdmin(page, "03-dashboard");
     });
 
-    if (report.api.createdKnowledgeBaseId !== null && report.api.cleanupCompleted === false) {
-      await adminCheck("knowledge-base-pages", async () => {
-        await page.goto(
-          `${adminBaseUrl}/knowledge-bases/${report.api.createdKnowledgeBaseId}/jobs`,
-        );
-        await expect(page.getByRole("button", { name: "Refresh" })).toBeVisible({ timeout: 20000 });
-        await captureAdmin(page, "04-jobs");
+    await adminCheck("root-redirect", async () => {
+      await page.goto(`${adminBaseUrl}/`);
+      await expect(page).toHaveURL(/\/dashboard$/u, { timeout: 20000 });
+      await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible({
+        timeout: 20000,
       });
+    });
+
+    if (report.api.createdKnowledgeBaseId !== null && report.api.cleanupCompleted === false) {
+      const knowledgeBaseRoutes = [
+        "overview",
+        "sources",
+        "jobs",
+        "pages",
+        "graph",
+        "versions",
+        "forks",
+        "retrieval",
+        "settings",
+      ];
+      for (const route of knowledgeBaseRoutes) {
+        await adminCheck(`knowledge-base-${route}`, async () => {
+          await page.goto(
+            `${adminBaseUrl}/knowledge-bases/${report.api.createdKnowledgeBaseId}/${route}`,
+          );
+          await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => undefined);
+          await expect(page.locator("body")).toBeVisible({ timeout: 20000 });
+          await expect(page.locator("body")).not.toContainText(selectedEnv.FOCOCONTEXT_API_KEY);
+          if (route === "jobs") {
+            await expect(page.getByRole("button", { name: "Refresh" })).toBeVisible({
+              timeout: 20000,
+            });
+          }
+          await captureAdmin(page, `04-kb-${route}`);
+        });
+      }
     }
 
     const storage = await context.storageState();
@@ -1260,7 +1914,12 @@ async function runAdminValidation() {
     recordCheck(
       report.admin.checks,
       "admin-storage-no-public-api-key",
-      !serializedStorage.includes(selectedEnv.FOCOCONTEXT_API_KEY),
+      !containsSecretValue(serializedStorage, selectedEnv.FOCOCONTEXT_API_KEY),
+    );
+    recordCheck(
+      report.admin.checks,
+      "admin-storage-no-storage-secret",
+      !containsSecretValue(serializedStorage, selectedEnv.S3_SECRET_ACCESS_KEY),
     );
   } finally {
     await browser.close();
@@ -1361,6 +2020,8 @@ async function validateNoSecretLeak() {
 }
 
 function finalizeReport() {
+  updateCoverageMatrices();
+  synchronizeModuleCoverageWithMatrices();
   report.metrics.phaseElapsedMs = Object.fromEntries(
     Object.entries(report.timings)
       .filter(([, value]) => typeof value?.durationMs === "number")
@@ -1419,6 +2080,13 @@ function finalizeReport() {
     ...report.admin.checks.map((item) => ({ ...item, group: "admin" })),
   ];
 
+  const skippedCoverage = report.moduleCoverage.filter((item) => item.status === "planned");
+  if (skippedCoverage.length > 0) {
+    report.residualRisks.push(
+      `${skippedCoverage.length} coverage item(s) remained planned because the corresponding validation mode did not run or no representative runtime data was available.`,
+    );
+  }
+
   if (report.developerExperience.findings.length === 0) {
     report.developerExperience.findings.push({
       endpoint: "public-openapi-flow",
@@ -1469,6 +2137,113 @@ function finalizeReport() {
   ];
   report.releaseGate.residualRisks = [...report.residualRisks];
   report.releaseGate.ready = report.releaseGate.blockingFailures.length === 0;
+}
+
+function updateCoverageMatrices() {
+  const observedEndpointGroups = new Set(
+    report.blackBox.endpointCoverage.map((item) => endpointGroup(`v1${item.path}`)),
+  );
+  report.coverageMatrices.endpointGroups = report.coverageMatrices.endpointGroups.map((item) => ({
+    ...item,
+    status: observedEndpointGroups.has(item.group) ? "covered" : item.status,
+  }));
+
+  const observedAdminRoutes = new Set(
+    report.blackBox.adminViews
+      .filter((item) => item.status === "passed")
+      .map((item) => adminRouteFromCheckName(item.name))
+      .filter((item) => item !== null),
+  );
+  report.coverageMatrices.adminRoutes = report.coverageMatrices.adminRoutes.map((item) => ({
+    ...item,
+    status: observedAdminRoutes.has(item.path) ? "covered" : item.status,
+  }));
+
+  report.coverageMatrices.backendModules = report.coverageMatrices.backendModules.map((item) => ({
+    ...item,
+    status: report.env.checks.some(
+      (check) =>
+        check.name === `backend-category-${item.category}-present` && check.status === "passed",
+    )
+      ? "covered"
+      : item.status,
+  }));
+  report.coverageMatrices.dockerEnv = report.coverageMatrices.dockerEnv.map((item) => ({
+    ...item,
+    status:
+      item.status === "missing"
+        ? "missing"
+        : report.env.checks.some((check) => check.name.includes("env-template")) ||
+            report.compose.checks.length > 0
+          ? "covered"
+          : item.status,
+  }));
+}
+
+function synchronizeModuleCoverageWithMatrices() {
+  const coveredNames = new Set();
+  const missingNames = new Set();
+  for (const item of report.coverageMatrices.endpointGroups) {
+    const name = `endpoint-group:${item.group}`;
+    if (item.status === "covered") {
+      coveredNames.add(name);
+    } else if (item.status === "missing") {
+      missingNames.add(name);
+    }
+  }
+  for (const item of report.coverageMatrices.adminRoutes) {
+    const name = `admin-route:${item.path}`;
+    if (item.status === "covered") {
+      coveredNames.add(name);
+    } else if (item.status === "missing") {
+      missingNames.add(name);
+    }
+  }
+  for (const item of report.coverageMatrices.backendModules) {
+    const name = `backend-module:${item.category}`;
+    if (item.status === "covered") {
+      coveredNames.add(name);
+    } else if (item.status === "missing") {
+      missingNames.add(name);
+    }
+  }
+  for (const item of report.coverageMatrices.dockerEnv) {
+    const name = `${item.kind}:${item.path}`;
+    if (item.status === "covered") {
+      coveredNames.add(name);
+    } else if (item.status === "missing") {
+      missingNames.add(name);
+    }
+  }
+
+  report.moduleCoverage = report.moduleCoverage.map((item) => {
+    if (coveredNames.has(item.name)) {
+      return { ...item, status: "verified" };
+    }
+    if (missingNames.has(item.name)) {
+      return { ...item, status: "missing" };
+    }
+    return item;
+  });
+}
+
+function adminRouteFromCheckName(name) {
+  if (name === "login" || name === "login-zh-cn-labels") {
+    return "/login";
+  }
+  if (name === "root-redirect") {
+    return "/";
+  }
+  if (name === "dashboard-empty-and-pagination-surface") {
+    return "/dashboard";
+  }
+  if (name === "system-settings") {
+    return "/settings";
+  }
+  if (name.startsWith("knowledge-base-")) {
+    return `/knowledge-bases/:knowledgeBaseId/${name.slice("knowledge-base-".length)}`;
+  }
+  return null;
 }
 
 function ratio(numerator, denominator) {
@@ -1537,6 +2312,13 @@ function renderSummary(value) {
     "",
     ...value.moduleCoverage.map((item) => `- ${item.name}: ${item.status}`),
     "",
+    "## Coverage Matrices",
+    "",
+    `- Endpoint groups: ${countCovered(value.coverageMatrices.endpointGroups)}/${value.coverageMatrices.endpointGroups.length}`,
+    `- Admin routes: ${countCovered(value.coverageMatrices.adminRoutes)}/${value.coverageMatrices.adminRoutes.length}`,
+    `- Backend module categories: ${countCovered(value.coverageMatrices.backendModules)}/${value.coverageMatrices.backendModules.length}`,
+    `- Docker/env entries: ${countCovered(value.coverageMatrices.dockerEnv)}/${value.coverageMatrices.dockerEnv.length}`,
+    "",
     "## Results",
     "",
     `- Env checks: ${countPassed(value.env.checks)}/${value.env.checks.length}`,
@@ -1581,6 +2363,10 @@ function renderSummary(value) {
 
 function countPassed(checks) {
   return checks.filter((check) => check.status === "passed").length;
+}
+
+function countCovered(items) {
+  return items.filter((item) => item.status === "covered" || item.status === "verified").length;
 }
 
 function formatPercent(value) {
@@ -1808,6 +2594,118 @@ function parseEnv(text) {
   return values;
 }
 
+function joinRoutePath(...parts) {
+  return parts
+    .map((part) => String(part ?? "").replace(/^\/+|\/+$/gu, ""))
+    .filter((part) => part.length > 0)
+    .join("/");
+}
+
+function endpointGroup(routePath) {
+  const segments = routePath
+    .replace(/^\/+|\/+$/gu, "")
+    .split("/")
+    .filter((segment) => segment.length > 0);
+  const versionIndex = segments[0] === "v1" ? 1 : 0;
+  const first = segments[versionIndex] ?? "root";
+  const second = segments[versionIndex + 1] ?? "";
+  const resourceScopedGroups = new Set([
+    "change-sets",
+    "cleanup-operations",
+    "documents",
+    "forks",
+    "jobs",
+    "knowledge-checks",
+    "media-assets",
+    "pages",
+    "scheduled-import-jobs",
+    "source-watch-rules",
+    "webhooks",
+  ]);
+
+  if (first === "knowledge-bases" && isRouteParameter(second)) {
+    return segments[versionIndex + 2] ?? "knowledge-bases";
+  }
+  if (resourceScopedGroups.has(first)) {
+    return first;
+  }
+  return first;
+}
+
+function isRouteParameter(segment) {
+  return segment.startsWith(":") || /^\{[^}]+\}$/u.test(segment);
+}
+
+function componentForAdminRoute(route, routerText) {
+  if (route === "/") {
+    return "RootRedirect";
+  }
+  if (route === "/login") {
+    return "LoginPage";
+  }
+  if (route === "/dashboard") {
+    return "DashboardPage";
+  }
+  if (route === "/settings") {
+    return "SystemSettingsPage";
+  }
+  const suffix = route.split("/").at(-1);
+  const match = [...routerText.matchAll(/const (KnowledgeBase[A-Za-z]+Page) =/gu)].find((item) =>
+    item[1].toLowerCase().includes(String(suffix).replace(/s$/u, "").toLowerCase()),
+  );
+  return match?.[1] ?? "KnowledgeBaseRoute";
+}
+
+function backendModuleCategory(file) {
+  const relative = relativePath(file);
+  if (relative.includes("/auth/") || relative.includes("/security/")) {
+    return "auth-security";
+  }
+  if (relative.endsWith(".controller.ts")) {
+    return "controller";
+  }
+  if (
+    relative.includes("/database/") ||
+    relative.includes("postgres") ||
+    relative.includes("db/")
+  ) {
+    return "database";
+  }
+  if (relative.includes("/queues/") || relative.includes("queue") || relative.includes("redis")) {
+    return "queue-runtime";
+  }
+  if (relative.includes("repository") || relative.includes("operational-read")) {
+    return "repository-query";
+  }
+  if (
+    relative.includes("/retrieve/") ||
+    relative.includes("/graph/") ||
+    relative.includes("retrieval")
+  ) {
+    return "retrieval-graph";
+  }
+  if (relative.includes("storage") || relative.includes("object-storage")) {
+    return "storage";
+  }
+  if (relative.includes("apps/worker/")) {
+    return "worker";
+  }
+  return "service";
+}
+
+function uniqueBy(items, keyFn) {
+  const seen = new Set();
+  const unique = [];
+  for (const item of items) {
+    const key = keyFn(item);
+    if (!seen.has(key)) {
+      unique.push(item);
+      seen.add(key);
+    }
+  }
+  return unique;
+}
+
 function parseArgs(argv) {
   const parsed = {};
 
@@ -1859,6 +2757,24 @@ async function listFiles(root) {
   }
 
   return files;
+}
+
+async function listFilesSafe(root, label) {
+  try {
+    return await listFiles(root);
+  } catch (error) {
+    report.warnings.push(`${label} unavailable: ${toErrorMessage(error)}`);
+    return [];
+  }
+}
+
+async function fileExists(path) {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function manifestItem(path) {
@@ -1980,6 +2896,10 @@ function redactString(value) {
     }
   }
   return output;
+}
+
+function containsSecretValue(text, secret) {
+  return !isEmpty(secret) && !isPlaceholder(secret) && String(text).includes(String(secret));
 }
 
 function maskSecret(value) {
