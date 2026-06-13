@@ -11,6 +11,7 @@ import {
   type RuntimeQueueWorkKind,
 } from "@fococontext/core";
 import type { DatabaseSchema } from "@fococontext/db";
+import { createStageTimingMetadata } from "./compile-stage-reuse.js";
 import type { WorkerWebhookEventEmitter } from "./webhook-dispatch.worker.js";
 
 export type WorkerJobStatus = "queued" | "running" | "completed" | "failed" | "canceled";
@@ -340,9 +341,11 @@ export class PostgresWorkerJobProgressWriter
   ): Promise<Record<string, unknown>> {
     const result = await sql<{
       lastCreatedAt: Date | string | null;
+      queuedAt: Date | string | null;
       stageStartedAt: Date | string | null;
     }>`
       select
+        (select queued_at from jobs where id = ${jobId}) as "queuedAt",
         (
           select created_at
           from job_events
@@ -358,29 +361,18 @@ export class PostgresWorkerJobProgressWriter
         ) as "stageStartedAt"
     `.execute(this.db);
     const row = result.rows[0];
-    const nowMs = new Date(now).getTime();
-    const lastEventMs = readTimestampMs(row?.lastCreatedAt);
-    const stageStartedMs = readTimestampMs(row?.stageStartedAt) ?? nowMs;
 
-    return {
-      duration_since_previous_event_ms: lastEventMs === null ? 0 : Math.max(0, nowMs - lastEventMs),
-      stage_duration_ms: Math.max(0, nowMs - stageStartedMs),
-    };
+    return createStageTimingMetadata({
+      now,
+      previousEventAt: row?.lastCreatedAt,
+      queuedAt: row?.queuedAt,
+      stageStartedAt: row?.stageStartedAt,
+    });
   }
 }
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
-}
-
-function readTimestampMs(value: Date | string | null | undefined): number | null {
-  if (value === undefined || value === null) {
-    return null;
-  }
-
-  const timestamp = value instanceof Date ? value.getTime() : new Date(value).getTime();
-
-  return Number.isFinite(timestamp) ? timestamp : null;
 }
 
 function toJobEventType(status: WorkerJobStatus): JobProgressEventType {

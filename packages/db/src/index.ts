@@ -654,6 +654,7 @@ export interface WikiAnalysisResultRecord {
   relationships: readonly Record<string, unknown>[];
   sourceRefs: readonly Record<string, unknown>[];
   locatorRefs: readonly Record<string, unknown>[];
+  reuseKey: string | null;
   metadata: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
@@ -680,6 +681,7 @@ export interface WikiDraftCandidateRecord {
   status: string;
   targetPageId: string | null;
   changeSetId: string | null;
+  reuseKey: string | null;
   metadata: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
@@ -715,6 +717,7 @@ export type SaveWikiAnalysisResultInput = Omit<
   "createdAt" | "updatedAt"
 > & {
   createdAt?: string;
+  reuseKey?: string | null;
   updatedAt?: string;
 };
 
@@ -723,6 +726,7 @@ export type SaveWikiDraftCandidateInput = Omit<
   "createdAt" | "updatedAt"
 > & {
   createdAt?: string;
+  reuseKey?: string | null;
   updatedAt?: string;
 };
 
@@ -741,10 +745,18 @@ export interface CompileArtifactRepository {
   listModelCallsByChangeSet(changeSetId: string): Promise<PersistedModelCallRecord[]>;
   saveAnalysisResult(input: SaveWikiAnalysisResultInput): Promise<WikiAnalysisResultRecord>;
   findAnalysisResultById(id: string): Promise<WikiAnalysisResultRecord | null>;
+  findReusableAnalysisResult(input: {
+    knowledgeBaseId: string;
+    reuseKey: string;
+  }): Promise<WikiAnalysisResultRecord | null>;
   listAnalysisResultsByJob(jobId: string): Promise<WikiAnalysisResultRecord[]>;
   listAnalysisResultsByParsedContent(parsedContentId: string): Promise<WikiAnalysisResultRecord[]>;
   saveDraftCandidate(input: SaveWikiDraftCandidateInput): Promise<WikiDraftCandidateRecord>;
   findDraftCandidateById(id: string): Promise<WikiDraftCandidateRecord | null>;
+  listReusableDraftCandidates(input: {
+    knowledgeBaseId: string;
+    reuseKey: string;
+  }): Promise<WikiDraftCandidateRecord[]>;
   listDraftCandidatesByAnalysisResult(
     analysisResultId: string,
   ): Promise<WikiDraftCandidateRecord[]>;
@@ -896,6 +908,7 @@ class PostgresCompileArtifactRepository implements CompileArtifactRepository {
         source_refs,
         locator_refs,
         metadata,
+        reuse_key,
         created_at,
         updated_at
       )
@@ -917,6 +930,7 @@ class PostgresCompileArtifactRepository implements CompileArtifactRepository {
         ${JSON.stringify(input.sourceRefs)}::jsonb,
         ${JSON.stringify(input.locatorRefs)}::jsonb,
         ${JSON.stringify(input.metadata)}::jsonb,
+        ${input.reuseKey ?? null},
         ${createdAt},
         ${updatedAt}
       )
@@ -929,6 +943,7 @@ class PostgresCompileArtifactRepository implements CompileArtifactRepository {
         source_refs = excluded.source_refs,
         locator_refs = excluded.locator_refs,
         metadata = excluded.metadata,
+        reuse_key = excluded.reuse_key,
         updated_at = excluded.updated_at
       returning *
     `.execute(this.db);
@@ -943,6 +958,22 @@ class PostgresCompileArtifactRepository implements CompileArtifactRepository {
       select *
       from wiki_analysis_results
       where id = ${id}
+    `.execute(this.db);
+
+    return result.rows[0] === undefined ? null : toWikiAnalysisResultRecord(result.rows[0]);
+  }
+
+  async findReusableAnalysisResult(input: {
+    knowledgeBaseId: string;
+    reuseKey: string;
+  }): Promise<WikiAnalysisResultRecord | null> {
+    const result = await sql<WikiAnalysisResultRow>`
+      select *
+      from wiki_analysis_results
+      where knowledge_base_id = ${input.knowledgeBaseId}
+        and reuse_key = ${input.reuseKey}
+      order by created_at desc, id desc
+      limit 1
     `.execute(this.db);
 
     return result.rows[0] === undefined ? null : toWikiAnalysisResultRecord(result.rows[0]);
@@ -998,6 +1029,7 @@ class PostgresCompileArtifactRepository implements CompileArtifactRepository {
         target_page_id,
         change_set_id,
         metadata,
+        reuse_key,
         created_at,
         updated_at
       )
@@ -1023,6 +1055,7 @@ class PostgresCompileArtifactRepository implements CompileArtifactRepository {
         ${input.targetPageId},
         ${input.changeSetId},
         ${JSON.stringify(input.metadata)}::jsonb,
+        ${input.reuseKey ?? null},
         ${createdAt},
         ${updatedAt}
       )
@@ -1038,6 +1071,7 @@ class PostgresCompileArtifactRepository implements CompileArtifactRepository {
         target_page_id = excluded.target_page_id,
         change_set_id = excluded.change_set_id,
         metadata = excluded.metadata,
+        reuse_key = excluded.reuse_key,
         updated_at = excluded.updated_at
       returning *
     `.execute(this.db);
@@ -1068,6 +1102,21 @@ class PostgresCompileArtifactRepository implements CompileArtifactRepository {
     `.execute(this.db);
 
     return result.rows[0] === undefined ? null : toWikiDraftCandidateRecord(result.rows[0]);
+  }
+
+  async listReusableDraftCandidates(input: {
+    knowledgeBaseId: string;
+    reuseKey: string;
+  }): Promise<WikiDraftCandidateRecord[]> {
+    const result = await sql<WikiDraftCandidateRow>`
+      select *
+      from wiki_draft_candidates
+      where knowledge_base_id = ${input.knowledgeBaseId}
+        and reuse_key = ${input.reuseKey}
+      order by created_at asc, id asc
+    `.execute(this.db);
+
+    return result.rows.map(toWikiDraftCandidateRecord);
   }
 
   async listDraftCandidatesByJob(jobId: string): Promise<WikiDraftCandidateRecord[]> {
@@ -1237,6 +1286,7 @@ interface WikiAnalysisResultRow {
   relationships: unknown;
   source_refs: unknown;
   locator_refs: unknown;
+  reuse_key: string | null;
   metadata: unknown;
   created_at: string | Date;
   updated_at: string | Date;
@@ -1263,6 +1313,7 @@ interface WikiDraftCandidateRow {
   status: string;
   target_page_id: string | null;
   change_set_id: string | null;
+  reuse_key: string | null;
   metadata: unknown;
   created_at: string | Date;
   updated_at: string | Date;
@@ -1329,6 +1380,7 @@ function toWikiAnalysisResultRecord(row: WikiAnalysisResultRow): WikiAnalysisRes
     relationships: normalizeJsonObjectArray(row.relationships),
     sourceRefs: normalizeJsonObjectArray(row.source_refs),
     locatorRefs: normalizeJsonObjectArray(row.locator_refs),
+    reuseKey: row.reuse_key,
     metadata: normalizeJsonObject(row.metadata),
     createdAt: normalizeDate(row.created_at),
     updatedAt: normalizeDate(row.updated_at),
@@ -1357,6 +1409,7 @@ function toWikiDraftCandidateRecord(row: WikiDraftCandidateRow): WikiDraftCandid
     status: row.status,
     targetPageId: row.target_page_id,
     changeSetId: row.change_set_id,
+    reuseKey: row.reuse_key,
     metadata: normalizeJsonObject(row.metadata),
     createdAt: normalizeDate(row.created_at),
     updatedAt: normalizeDate(row.updated_at),

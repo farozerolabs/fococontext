@@ -19,7 +19,6 @@ import {
 } from "@fococontext/parsers";
 import type { ObjectStorageAdapter } from "@fococontext/storage";
 import type {
-  WorkerJobGuardReason,
   WorkerJobProgressWriter,
   WorkerJobStateGuard,
 } from "./job-progress.postgres-writer.js";
@@ -39,8 +38,8 @@ import type {
   WikiAnalyzeQueue,
 } from "./wiki-compile.worker.js";
 import { runSourceThreatScan, type SourceThreatScanner } from "./source-threat-scan.js";
-
-export type { SourceThreatScanner } from "./source-threat-scan.js";
+import { resumeSourceParseCheckpoint } from "./source-parse-checkpoint-resume.js";
+import { createOcrRequiredError, createSkippedParseError } from "./source-parse-errors.js";
 
 export const sourceParseQueueName = "source.parse";
 export const sourceParseJobName = "source.parse.document";
@@ -245,6 +244,14 @@ export class SourceParseProcessor {
       const parsedContentId = readString(completedCheckpoint.summary.parsed_content_id);
 
       if (parsedContentId !== null) {
+        await resumeSourceParseCheckpoint({
+          checkpointSummary: completedCheckpoint.summary,
+          compileQueue: this.compileQueue,
+          jobProgress: this.jobProgress,
+          parsedContentId,
+          payload,
+        });
+
         return {
           status: "completed",
           should_continue: true,
@@ -1038,26 +1045,6 @@ function createNormalizedMarkdownObjectKey(payload: SourceParsePayload): string 
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
-}
-
-function createSkippedParseError(reason: WorkerJobGuardReason | undefined): ParserFatalError {
-  return {
-    kind: "parser_failed",
-    message: `Source parse skipped because the ingest job is not runnable: ${reason ?? "unknown"}.`,
-    retryable: false,
-  };
-}
-
-function createOcrRequiredError(reason: "disabled" | "no_candidate_pages"): ParserFatalError {
-  return {
-    kind: "parser_output_empty",
-    message: `OCR is required to produce usable PDF text, but OCR was skipped: ${reason}.`,
-    retryable: reason !== "disabled",
-    parserName: "ts-pdf-parse",
-    parserVersion: "0.1.0",
-    mimeType: "application/pdf",
-    fileExtension: ".pdf",
-  };
 }
 
 function sanitizeObjectKeySegment(value: string): string {

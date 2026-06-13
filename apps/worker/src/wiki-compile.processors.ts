@@ -1,7 +1,12 @@
 import { createHash } from "node:crypto";
 import { sql, type Kysely, type Transaction } from "kysely";
 import type { CompilePromptLimits, RuntimeConfig } from "@fococontext/core";
-import type { CompileArtifactRepository, DatabaseSchema } from "@fococontext/db";
+import type {
+  CompileArtifactRepository,
+  DatabaseSchema,
+  WikiAnalysisResultRecord,
+  WikiDraftCandidateRecord,
+} from "@fococontext/db";
 import type {
   ChatMessage,
   ChatProvider,
@@ -65,9 +70,17 @@ import {
   type WikiMergeProcessorResult,
   type WikiMergeQueue,
 } from "./wiki-compile.worker.js";
+import {
+  createCompileStageReuseKey,
+  createContentHash,
+  createRuntimeConfigHash,
+  createStableJsonHash,
+} from "./compile-stage-reuse.js";
 
 const analysisStructuredOutputRepairAttempts = 2;
 const generationStructuredOutputRepairAttempts = 3;
+const analysisStageImplementationVersion = "analysis-stage-v2";
+const generationStageImplementationVersion = "generation-stage-v2";
 const sourceFrontmatterMetadataKey = "source_frontmatter";
 const sourceDocumentMetadataKey = "source_document_metadata";
 const systemPageLogMaxEntries = 200;
@@ -928,6 +941,81 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
       prompt.template,
     );
     const model = resolveChatModel(this.chatProvider.profile, prompt.modelPurpose);
+    const analysisReuseKey = createAnalysisStageReuseKey({
+      datasetConfigurationSnapshot,
+      knowledgeBaseId: payload.knowledge_base_id,
+      markdown,
+      maxParsedMarkdownBytes: this.maxParsedMarkdownBytes,
+      model,
+      payload,
+      promptHash: resolvedPrompt.metadata.effective_prompt_hash,
+      promptLimits: this.promptLimits,
+      promptVersionId: prompt.id,
+      providerName: this.chatProvider.profile.providerName,
+    });
+    const reusableAnalysis = await this.artifactRepository.findReusableAnalysisResult({
+      knowledgeBaseId: payload.knowledge_base_id,
+      reuseKey: analysisReuseKey,
+    });
+
+    if (reusableAnalysis !== null) {
+      await this.artifactRepository.updateStageExecution(stageExecutionId, {
+        status: "completed",
+        analysisResultId: reusableAnalysis.id,
+        metadata: {
+          analysis_result_id: reusableAnalysis.id,
+          compile_reuse: {
+            reused_analysis_result_id: reusableAnalysis.id,
+            reuse_key: analysisReuseKey,
+            status: "hit",
+          },
+          model_call_id: reusableAnalysis.modelCallId,
+          prompt_template: resolvedPrompt.metadata,
+        },
+        finishedAt: this.now(),
+      });
+      await this.generateQueue.enqueueWikiGenerateJob({
+        job_id: payload.job_id,
+        tenant_id: payload.tenant_id,
+        project_id: payload.project_id,
+        knowledge_base_id: payload.knowledge_base_id,
+        analysis_result_id: reusableAnalysis.id,
+        source_document_ids: [payload.document_id],
+        current_knowledge_version_id: context.currentKnowledgeVersionId,
+        dataset_configuration_snapshot: datasetConfigurationSnapshot,
+        purpose: context.purpose,
+        schema: context.schema,
+        input_snapshot_id: payload.input_snapshot_id,
+      });
+      await this.jobProgress?.updateJobProgress({
+        jobId: payload.job_id,
+        knowledgeBaseId: payload.knowledge_base_id,
+        inputSnapshotId: payload.input_snapshot_id,
+        stage: "generating",
+        status: "running",
+        progress: 50,
+        message: "Generating wiki drafts...",
+        parsedContentId: payload.parsed_content_id,
+        metadata: {
+          analysis_result_id: reusableAnalysis.id,
+          compile_reuse: {
+            reused_analysis_result_id: reusableAnalysis.id,
+            reuse_key: analysisReuseKey,
+            status: "hit",
+          },
+          model_call_id: reusableAnalysis.modelCallId,
+          prompt_template: resolvedPrompt.metadata,
+        },
+      });
+
+      return toWikiAnalyzeProcessorResultFromAnalysisResult({
+        analysisResult: reusableAnalysis,
+        documentId: payload.document_id,
+        knowledgeBaseId: payload.knowledge_base_id,
+        parsedContentId: payload.parsed_content_id,
+        promptVersionId: prompt.id,
+      });
+    }
 
     try {
       const analysis = await completeAnalysisWithStructuredOutputRepair({
@@ -984,7 +1072,12 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
         relationships: output.relationships.map(toRecord),
         sourceRefs: collectAnalysisSourceRefs(output),
         locatorRefs: collectAnalysisLocatorRefs(output),
+        reuseKey: analysisReuseKey,
         metadata: {
+          compile_reuse: {
+            reuse_key: analysisReuseKey,
+            status: "miss",
+          },
           dataset_configuration_snapshot: datasetConfigurationSnapshot,
           document_name: context.documentName,
           prompt_template: resolvedPrompt.metadata,
@@ -998,6 +1091,10 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
         analysisResultId: analysisResult.id,
         metadata: {
           analysis_result_id: analysisResult.id,
+          compile_reuse: {
+            reuse_key: analysisReuseKey,
+            status: "miss",
+          },
           model_call_id: modelCall.id,
           structured_output_attempt_count: analysis.attemptCount,
           structured_output_final_status: "succeeded",
@@ -1033,6 +1130,10 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
         parsedContentId: payload.parsed_content_id,
         metadata: {
           analysis_result_id: analysisResult.id,
+          compile_reuse: {
+            reuse_key: analysisReuseKey,
+            status: "miss",
+          },
           model_call_id: modelCall.id,
           entity_count: output.entities.length,
           concept_count: output.concepts.length,
@@ -1185,7 +1286,12 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
           relationships: output.relationships.map(toRecord),
           sourceRefs: collectAnalysisSourceRefs(output),
           locatorRefs: collectAnalysisLocatorRefs(output),
+          reuseKey: analysisReuseKey,
           metadata: {
+            compile_reuse: {
+              reuse_key: analysisReuseKey,
+              status: "miss",
+            },
             dataset_configuration_snapshot: datasetConfigurationSnapshot,
             document_name: context.documentName,
             prompt_template: resolvedPrompt.metadata,
@@ -1200,6 +1306,10 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
           analysisResultId: analysisResult.id,
           metadata: {
             analysis_result_id: analysisResult.id,
+            compile_reuse: {
+              reuse_key: analysisReuseKey,
+              status: "miss",
+            },
             failure_category: failureCategory,
             model_call_id: modelCall.id,
             prompt_template: resolvedPrompt.metadata,
@@ -1237,6 +1347,10 @@ export class WikiAnalyzeProcessorService implements WikiAnalyzeProcessor {
           parsedContentId: payload.parsed_content_id,
           metadata: {
             analysis_result_id: analysisResult.id,
+            compile_reuse: {
+              reuse_key: analysisReuseKey,
+              status: "miss",
+            },
             entity_count: output.entities.length,
             concept_count: output.concepts.length,
             failure_category: failureCategory,
@@ -1528,6 +1642,124 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
     });
 
     const model = resolveChatModel(this.chatProvider.profile, prompt.modelPurpose);
+    const generationReuseKey = createGenerationStageReuseKey({
+      analysis,
+      datasetConfigurationSnapshot: payload.dataset_configuration_snapshot,
+      knowledgeBaseId: payload.knowledge_base_id,
+      model,
+      payload,
+      promptHash: resolvedPrompt.metadata.effective_prompt_hash,
+      promptLimits: this.promptLimits,
+      promptVersionId: prompt.id,
+      providerName: this.chatProvider.profile.providerName,
+    });
+    const reusableDrafts = (
+      await this.artifactRepository.listReusableDraftCandidates({
+        knowledgeBaseId: payload.knowledge_base_id,
+        reuseKey: generationReuseKey,
+      })
+    ).filter((draft) => draft.status === "ready_for_merge" || draft.status === "applied");
+
+    if (reusableDrafts.length > 0) {
+      const selectedDrafts: WikiDraftCandidateRecord[] = [];
+
+      for (const reusableDraft of reusableDrafts) {
+        const selectedDraft =
+          reusableDraft.jobId === payload.job_id && reusableDraft.status === "ready_for_merge"
+            ? reusableDraft
+            : await this.artifactRepository.saveDraftCandidate({
+                id: this.idFactory("draft"),
+                knowledgeBaseId: payload.knowledge_base_id,
+                analysisResultId: payload.analysis_result_id,
+                jobId: payload.job_id,
+                modelCallId: reusableDraft.modelCallId,
+                promptVersionId: prompt.id,
+                inputSnapshotId: payload.input_snapshot_id,
+                sourceDocumentIds: payload.source_document_ids,
+                pageType: reusableDraft.pageType,
+                title: reusableDraft.title,
+                slug: reusableDraft.slug,
+                markdown: reusableDraft.markdown,
+                frontmatter: reusableDraft.frontmatter,
+                sourceRefs: reusableDraft.sourceRefs,
+                locatorRefs: reusableDraft.locatorRefs,
+                relationshipCandidates: reusableDraft.relationshipCandidates,
+                confidence: reusableDraft.confidence,
+                status: "ready_for_merge",
+                targetPageId: null,
+                changeSetId: null,
+                reuseKey: generationReuseKey,
+                metadata: {
+                  ...reusableDraft.metadata,
+                  compile_reuse: {
+                    reused_draft_candidate_id: reusableDraft.id,
+                    reuse_key: generationReuseKey,
+                    status: "hit",
+                  },
+                  prompt_template: resolvedPrompt.metadata,
+                },
+              });
+
+        selectedDrafts.push(selectedDraft);
+
+        await this.mergeQueue.enqueueWikiMergeJob({
+          job_id: payload.job_id,
+          tenant_id: payload.tenant_id,
+          project_id: payload.project_id,
+          knowledge_base_id: payload.knowledge_base_id,
+          wiki_draft_id: selectedDraft.id,
+          target_page_id: null,
+          current_knowledge_version_id: payload.current_knowledge_version_id,
+          dataset_configuration_snapshot: payload.dataset_configuration_snapshot ?? null,
+          input_snapshot_id: payload.input_snapshot_id,
+          merge_candidate_count: reusableDrafts.length,
+          merge_candidate_index: selectedDrafts.length - 1,
+        });
+      }
+
+      await this.artifactRepository.updateStageExecution(stageExecutionId, {
+        status: "completed",
+        draftCandidateId: selectedDrafts[0]?.id ?? null,
+        metadata: {
+          compile_reuse: {
+            reused_draft_candidate_ids: reusableDrafts.map((draft) => draft.id),
+            reuse_key: generationReuseKey,
+            status: "hit",
+          },
+          draft_ids: selectedDrafts.map((draft) => draft.id),
+          prompt_template: resolvedPrompt.metadata,
+        },
+        finishedAt: this.now(),
+      });
+      await this.jobProgress?.updateJobProgress({
+        jobId: payload.job_id,
+        knowledgeBaseId: payload.knowledge_base_id,
+        inputSnapshotId: payload.input_snapshot_id,
+        stage: "merging",
+        status: "running",
+        progress: 70,
+        message: "Merging reusable wiki drafts...",
+        metadata: {
+          compile_reuse: {
+            reused_draft_candidate_ids: reusableDrafts.map((draft) => draft.id),
+            reuse_key: generationReuseKey,
+            status: "hit",
+          },
+          draft_count: selectedDrafts.length,
+          prompt_template: resolvedPrompt.metadata,
+        },
+      });
+
+      return {
+        status: "completed",
+        should_continue: selectedDrafts.length > 0,
+        knowledge_base_id: payload.knowledge_base_id,
+        analysis_result_id: payload.analysis_result_id,
+        wiki_draft_ids: selectedDrafts.map((draft) => draft.id),
+        prompt_version_id: prompt.id,
+        model_call_id: selectedDrafts[0]?.modelCallId ?? null,
+      };
+    }
 
     try {
       const generation = await completeGenerationWithStructuredOutputRepair({
@@ -1600,7 +1832,12 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
           status: "ready_for_merge",
           targetPageId: null,
           changeSetId: null,
+          reuseKey: generationReuseKey,
           metadata: {
+            compile_reuse: {
+              reuse_key: generationReuseKey,
+              status: "miss",
+            },
             ...(enrichedDraft.page_type === "source"
               ? {
                   generation_mode: "source_anchor",
@@ -1639,6 +1876,10 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
         status: "completed",
         draftCandidateId: savedDrafts[0]?.id ?? null,
         metadata: {
+          compile_reuse: {
+            reuse_key: generationReuseKey,
+            status: "miss",
+          },
           draft_ids: savedDrafts.map((draft) => draft.id),
           source_anchor_created: sourceAnchorDraft !== null,
           model_call_id: modelCall.id,
@@ -1661,6 +1902,10 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
         progress: 70,
         message: "Merging generated wiki drafts...",
         metadata: {
+          compile_reuse: {
+            reuse_key: generationReuseKey,
+            status: "miss",
+          },
           draft_count: savedDrafts.length,
           source_anchor_created: sourceAnchorDraft !== null,
           structured_output_attempt_count: generation.attemptCount,
@@ -1731,6 +1976,7 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
             payload,
             promptMetadata: resolvedPrompt,
             promptVersionId: prompt.id,
+            reuseKey: generationReuseKey,
             stageExecutionId,
             structuredOutputAttemptCount,
             structuredOutputMode,
@@ -1815,6 +2061,7 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
     payload: WikiGeneratePayload;
     promptMetadata: ResolvedDatasetPromptTemplate;
     promptVersionId: string;
+    reuseKey: string;
     stageExecutionId: string;
     structuredOutputAttemptCount: number;
     structuredOutputMode: StructuredOutputMode;
@@ -1887,7 +2134,12 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
       status: "ready_for_merge",
       targetPageId: null,
       changeSetId: null,
+      reuseKey: input.reuseKey,
       metadata: {
+        compile_reuse: {
+          reuse_key: input.reuseKey,
+          status: "miss",
+        },
         generation_mode: "source_fallback",
         merge_risk: {
           confidence: enrichedFallbackDraft.confidence,
@@ -1918,6 +2170,10 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
       draftCandidateId: saved.id,
       metadata: {
         draft_ids: [saved.id],
+        compile_reuse: {
+          reuse_key: input.reuseKey,
+          status: "miss",
+        },
         fallback_mode: "source_fallback",
         failure_category: input.failureCategory,
         model_call_id: modelCall.id,
@@ -1941,6 +2197,10 @@ export class WikiGenerateProcessorService implements WikiGenerateProcessor {
       message: "Merging source-backed fallback wiki draft...",
       metadata: {
         draft_count: 1,
+        compile_reuse: {
+          reuse_key: input.reuseKey,
+          status: "miss",
+        },
         fallback_mode: "source_fallback",
         failure_category: input.failureCategory,
         model_call_id: modelCall.id,
@@ -5711,6 +5971,141 @@ function isGenerationStructuredOutputRepairExhausted(error: unknown): boolean {
     error instanceof StructuredOutputValidationError &&
     readStructuredOutputRepairAttempts(error) >= generationStructuredOutputRepairAttempts
   );
+}
+
+function createAnalysisStageReuseKey(input: {
+  datasetConfigurationSnapshot: DatasetConfigurationSnapshotPayload | null;
+  knowledgeBaseId: string;
+  markdown: string;
+  maxParsedMarkdownBytes: number;
+  model: string;
+  payload: WikiAnalyzePayload;
+  promptHash: string;
+  promptLimits: CompilePromptLimits;
+  promptVersionId: string;
+  providerName: string;
+}): string {
+  return createCompileStageReuseKey({
+    contentHash: input.payload.content_hash,
+    datasetConfigurationSnapshotId: input.datasetConfigurationSnapshot?.id ?? null,
+    datasetConfigurationSnapshotVersion: input.datasetConfigurationSnapshot?.version ?? null,
+    knowledgeBaseId: input.knowledgeBaseId,
+    model: input.model,
+    normalizedContentHash: createContentHash(input.markdown),
+    parsedContentId: input.payload.parsed_content_id,
+    promptHash: input.promptHash,
+    promptVersionId: input.promptVersionId,
+    providerName: input.providerName,
+    runtimeConfigHash: createRuntimeConfigHash({
+      maxParsedMarkdownBytes: input.maxParsedMarkdownBytes,
+      promptLimits: input.promptLimits,
+    }),
+    sourceDocumentId: input.payload.document_id,
+    stage: "analysis",
+    stageImplementationVersion: analysisStageImplementationVersion,
+    tenantId: input.payload.tenant_id,
+  });
+}
+
+function createGenerationStageReuseKey(input: {
+  analysis: WikiAnalysisResultRecord;
+  datasetConfigurationSnapshot: DatasetConfigurationSnapshotPayload | null | undefined;
+  knowledgeBaseId: string;
+  model: string;
+  payload: WikiGeneratePayload;
+  promptHash: string;
+  promptLimits: CompilePromptLimits;
+  promptVersionId: string;
+  providerName: string;
+}): string {
+  return createCompileStageReuseKey({
+    contentHash: input.analysis.contentHash ?? createStableJsonHash(input.analysis.metadata),
+    datasetConfigurationSnapshotId: input.datasetConfigurationSnapshot?.id ?? null,
+    datasetConfigurationSnapshotVersion: input.datasetConfigurationSnapshot?.version ?? null,
+    knowledgeBaseId: input.knowledgeBaseId,
+    model: input.model,
+    normalizedContentHash: createStableJsonHash({
+      claims: input.analysis.claims,
+      concepts: input.analysis.concepts,
+      contradictions: input.analysis.contradictions,
+      entities: input.analysis.entities,
+      locator_refs: input.analysis.locatorRefs,
+      relationships: input.analysis.relationships,
+      source_refs: input.analysis.sourceRefs,
+    }),
+    parsedContentId: input.analysis.parsedContentId,
+    promptHash: input.promptHash,
+    promptVersionId: input.promptVersionId,
+    providerName: input.providerName,
+    runtimeConfigHash: createRuntimeConfigHash({
+      promptLimits: input.promptLimits,
+    }),
+    sourceDocumentId: input.payload.source_document_ids[0] ?? input.analysis.sourceDocumentId,
+    stage: "generation",
+    stageImplementationVersion: generationStageImplementationVersion,
+    tenantId: input.payload.tenant_id,
+  });
+}
+
+function toWikiAnalyzeProcessorResultFromAnalysisResult(input: {
+  analysisResult: WikiAnalysisResultRecord;
+  documentId: string;
+  knowledgeBaseId: string;
+  parsedContentId: string;
+  promptVersionId: string;
+}): WikiAnalyzeProcessorResult {
+  return {
+    status: "completed",
+    should_continue: true,
+    knowledge_base_id: input.knowledgeBaseId,
+    document_id: input.documentId,
+    parsed_content_id: input.parsedContentId,
+    analysis_result_id: input.analysisResult.id,
+    prompt_version_id: input.promptVersionId,
+    model_call_id: input.analysisResult.modelCallId,
+    entities: input.analysisResult.entities.map(toAnalysisSummaryItem),
+    concepts: input.analysisResult.concepts.map(toAnalysisSummaryItem),
+    contradictions: input.analysisResult.contradictions.map(toRecord),
+    relationships: input.analysisResult.relationships.map(toRelationshipSummaryItem),
+  };
+}
+
+function toAnalysisSummaryItem(item: Record<string, unknown>): {
+  evidence_locator: string;
+  title: string;
+} {
+  return {
+    title: readString(item.title) ?? "Untitled",
+    evidence_locator: readFirstEvidenceLocator(item),
+  };
+}
+
+function toRelationshipSummaryItem(item: Record<string, unknown>): {
+  evidence_locator: string;
+  from_title: string;
+  relation_type: string;
+  to_title: string;
+} {
+  return {
+    from_title: readString(item.from_title) ?? "",
+    to_title: readString(item.to_title) ?? "",
+    relation_type: readString(item.relation_type) ?? "",
+    evidence_locator: readFirstEvidenceLocator(item),
+  };
+}
+
+function readFirstEvidenceLocator(item: Record<string, unknown>): string {
+  const locatorRefs = Array.isArray(item.locator_refs) ? item.locator_refs : [];
+  const firstLocatorRef = readString(locatorRefs[0]);
+
+  if (firstLocatorRef !== null) {
+    return firstLocatorRef;
+  }
+
+  const sourceRefs = Array.isArray(item.source_refs) ? item.source_refs : [];
+  const firstSourceRef = normalizeRecord(sourceRefs[0]);
+
+  return readString(firstSourceRef?.locator) ?? "";
 }
 
 function readPurposeText(value: unknown): string | null {
